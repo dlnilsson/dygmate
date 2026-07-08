@@ -1,0 +1,18 @@
+.{
+    .name = .dygma_battery,
+    .version = "0.1.0",
+    .fingerprint = 0xaf771e097e3289c2,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .serial = .{
+            .url = "https://github.com/ZigEmbeddedGroup/serial/archive/refs/heads/master.tar.gz",
+            .hash = "serial-0.0.1-PoeRzD66AACCQUHzsIssi6bOcEtnQFPebT6WLvno0I_p",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "README.md",
+    },
+}

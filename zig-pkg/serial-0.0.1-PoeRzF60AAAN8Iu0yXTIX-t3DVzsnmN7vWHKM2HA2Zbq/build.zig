@@ -1,0 +1,58 @@
+const std = @import("std");
+
+const example_files = [_][]const u8{
+    "echo",
+    "list",
+    "list_port_info",
+};
+
+pub fn build(b: *std.Build) void {
+    const optimize = b.standardOptimizeOption(.{});
+    const target = b.standardTargetOptions(.{});
+
+    const serial_mod = b.addModule("serial", .{
+        .root_source_file = b.path("src/serial.zig"),
+    });
+
+    const unit_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/serial.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_unit_tests = b.addRunArtifact(unit_tests);
+    const test_step = b.step("test", "Run unit tests");
+    test_step.dependOn(&run_unit_tests.step);
+
+    const example_step = b.step("examples", "Build examples");
+    {
+        for (example_files) |example_name| {
+            const example = b.addExecutable(.{
+                .name = example_name,
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path(
+                        b.fmt("examples/{s}.zig", .{example_name}),
+                    ),
+                    .target = target,
+                    .optimize = optimize,
+                }),
+            });
+
+            // port info only works on Windows!
+            // TODO: Linux and MacOS port info support
+            example.root_module.addImport("serial", serial_mod);
+            const install_example = b.addInstallArtifact(example, .{});
+            example_step.dependOn(&example.step);
+            example_step.dependOn(&install_example.step);
+        }
+    }
+    const docs_step = b.step("docs", "Emit documentation");
+
+    const docs_install = b.addInstallDirectory(.{
+        .install_dir = .prefix,
+        .install_subdir = "docs",
+        .source_dir = unit_tests.getEmittedDocs(),
+    });
+    docs_step.dependOn(&docs_install.step);
+}
