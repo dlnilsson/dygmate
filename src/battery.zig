@@ -5,6 +5,7 @@
 //! polling loop, flash write cycles are finite.
 
 const std = @import("std");
+
 const focus = @import("focus.zig");
 
 pub const Status = enum {
@@ -45,10 +46,8 @@ pub const force_read_settle_s: u64 = 2;
 
 /// Issue the four battery read commands. Parse failures degrade to
 /// null/.unknown; only transport errors propagate (they mean the
-/// connection is gone and the caller should reconnect).
-///
-/// TODO: Bazecor retries transient status 4 (side disconnected) a few
-/// times after wake; the poll cadence self-heals so v1 just reports it.
+/// connection is gone and the caller should reconnect). Reads the neuron's
+/// cached values — callers should use `read` for the disconnected-side retry.
 pub fn readAll(f: *focus.Focus) focus.Error!Reading {
     var buf: [256]u8 = undefined;
     return .{
@@ -61,6 +60,38 @@ pub fn readAll(f: *focus.Focus) focus.Error!Reading {
             .status = parseStatus(try f.request("wireless.battery.right.status", &buf)),
         },
     };
+}
+
+/// One poll of both halves, with Bazecor's single retry: if either side comes
+/// back "disconnected" (status 4) the RF link to that half briefly dropped, so
+/// wait 500ms and read once more. Deliberately NO forceRead here — the neuron
+/// serves cached values on a plain read, and forcing a re-poll every cycle
+/// blanks those values mid-refresh (empty responses) and hammers the sleeping
+/// sides' RF link. Mirrors battery.Read in the Go tray; forceRead is a manual,
+/// user-triggered action only (see forceRead below).
+pub fn read(f: *focus.Focus) focus.Error!Reading {
+    const r = try readAll(f);
+    if (r.left.status != .disconnected and r.right.status != .disconnected) return r;
+    sleepMs(f.io, 500);
+    // Keep the first reading if the retry itself errors out.
+    return readAll(f) catch r;
+}
+
+/// Ask the neuron to re-poll both sides over RF (Bazecor's "Force read"
+/// button). Argument-less, so it writes no EEPROM, but it generates RF traffic
+/// and briefly blanks the cached values — call it only on an explicit user
+/// refresh, never in the poll loop. Mirrors battery.ForceRead in the Go tray.
+pub fn forceRead(f: *focus.Focus) void {
+    var buf: [64]u8 = undefined;
+    _ = f.request("wireless.battery.forceRead", &buf) catch {};
+}
+
+fn sleepMs(io: std.Io, ms: u64) void {
+    const dur: std.Io.Clock.Duration = .{
+        .clock = .awake,
+        .raw = std.Io.Duration.fromMilliseconds(@intCast(ms)),
+    };
+    dur.sleep(io) catch {};
 }
 
 pub fn suggestedPollIntervalSeconds(r: Reading) u64 {

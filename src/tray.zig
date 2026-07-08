@@ -211,9 +211,13 @@ const ID_TOGGLE: i32 = 3;
 
 const icon_size: i32 = 16;
 const low_threshold: u8 = 20;
-const announce_retry_initial_ms: u64 = 2 * 1000;
-const announce_retry_max_ms: u64 = 32 * 1000;
-const announce_retry_attempts_max: u8 = 5;
+// Poll cadence. The wireless halves sleep and the neuron only serves a cached
+// value once a side has reported, so a plain read right after connect is often
+// empty. Polling frequently (like the Go tray's default 5s) catches a real
+// reading within a few seconds; last-known-good then keeps it across the empty
+// reads that follow. Plain reads hit the USB-powered neuron only — they never
+// wake the sides or wear flash, so a tight interval is cheap.
+const poll_interval_ms: u64 = 5 * 1000;
 
 // Status colors, COLORREF (0x00BBGGRR).
 fn rgb(r: u8, g: u8, b: u8) COLORREF {
@@ -271,10 +275,11 @@ var g_nid: NOTIFYICONDATAW = undefined;
 var g_io: std.Io = undefined;
 
 // Last-known-good reading, per side (UI thread only). The wireless halves
-// sleep and report a null level between the (now 15-60 min) polls; rather than
-// show "?%", we keep the last real value for each side. Persists across sleep
-// and disconnect — the battery hasn't changed — so hovering always reveals a
-// real number. `level == null` means that side has never reported yet.
+// sleep and report a null level and/or empty status between the (now 15-60 min)
+// polls; rather than show "?%" or "(?)", we keep the last real value for each
+// field independently (see updateTray). Persists across sleep and disconnect —
+// the battery hasn't changed — so hovering always reveals a real number.
+// `level == null` / `status == .unknown` means that field has never reported yet.
 var g_last_left: battery.SideReading = .{ .level = null, .status = .unknown };
 var g_last_right: battery.SideReading = .{ .level = null, .status = .unknown };
 
@@ -441,16 +446,26 @@ fn updateTray() void {
     // Refresh each side's last-known snapshot from a live reading, and run the
     // notification logic. Tooltip + icon below render from the snapshots, so
     // they always show a real per-side value even while a half is asleep.
+    // Level and status are kept independently: a sleeping half often answers
+    // one field (e.g. level=100) while the other comes back empty/unknown, and
+    // clobbering a real "charging" with that "?" is exactly the stale-status bug.
     if (!paused and connected and reading != null) {
         const r = reading.?;
-        if (r.left.level != null) g_last_left = r.left;
-        if (r.right.level != null) g_last_right = r.right;
+        if (r.left.level != null) g_last_left.level = r.left.level;
+        if (r.left.status != .unknown) g_last_left.status = r.left.status;
+        if (r.right.level != null) g_last_right.level = r.right.level;
+        if (r.right.status != .unknown) g_last_right.status = r.right.status;
 
+        // Drive notifications from the merged snapshot, not the raw reading: a
+        // charging side that momentarily reports an empty status would otherwise
+        // look ".unknown" (i.e. "not charging") and fire a false low-battery
+        // warning. The snapshot carries the last real status per side.
+        const snapshot: battery.Reading = .{ .left = g_last_left, .right = g_last_right };
         if (announce_connection) {
-            showBatteryStatusBalloon(r);
-            latchLowBatteryNotifications(r);
+            showBatteryStatusBalloon(snapshot);
+            latchLowBatteryNotifications(snapshot);
         } else if (!pending_connection_announcement) {
-            checkLowBattery(r);
+            checkLowBattery(snapshot);
         }
     } else {
         g_state.notified_low = .{ false, false };
@@ -610,18 +625,6 @@ fn canNotifyBatteryStatus(r: battery.Reading) bool {
     return r.left.level != null and r.right.level != null;
 }
 
-fn readMissingLevels(f: *focus.Focus, r: battery.Reading) focus.Error!battery.Reading {
-    var next = r;
-    var buf: [256]u8 = undefined;
-    if (next.left.level == null) {
-        next.left.level = battery.parseLevel(try f.request("wireless.battery.left.level", &buf));
-    }
-    if (next.right.level == null) {
-        next.right.level = battery.parseLevel(try f.request("wireless.battery.right.level", &buf));
-    }
-    return next;
-}
-
 fn hasLowBattery(r: battery.Reading) bool {
     const sides = [_]battery.SideReading{ r.left, r.right };
     for (sides) |s| {
@@ -728,67 +731,36 @@ fn pollLoop(ctx: *PollCtx) void {
         };
         defer dev.close();
 
-        // PRIME
-        var prime_buf: [64]u8 = undefined;
-        _ = dev.request("wireless.battery.forceRead", &prime_buf) catch {};
-        sleepMs(io, st, battery.force_read_settle_s * 1000);
-
-        // POLL
-        var announce_retry_ms = announce_retry_initial_ms;
-        var announce_retry_attempts: u8 = 0;
-        var retry_missing_levels = false;
-        var latest_reading: ?battery.Reading = null;
+        // POLL. No forceRead on connect: the neuron serves cached values on a
+        // plain read, and forcing a re-poll every cycle blanks them mid-refresh
+        // (empty "?"/no-reading responses). forceRead runs only when the user
+        // asks to refresh (below). Mirrors the Go tray's pollLoop.
         while (!st.stop.load(.acquire)) {
             // User asked to release the port: close and drop back to idle.
             if (st.paused.load(.acquire)) {
                 setConnected(ctx, false);
                 break;
             }
-            const r = if (retry_missing_levels)
-                readMissingLevels(&dev, latest_reading.?) catch {
-                    setConnected(ctx, false);
-                    break;
-                }
-            else
-                battery.readAll(&dev) catch {
-                    setConnected(ctx, false);
-                    break;
-                };
-            latest_reading = r;
+            const r = battery.read(&dev) catch {
+                setConnected(ctx, false);
+                break;
+            };
             st.mutex.lockUncancelable(g_io);
             const announce_connection = !st.connected;
-            if (announce_connection) {
-                announce_retry_ms = announce_retry_initial_ms;
-                announce_retry_attempts = 0;
-                retry_missing_levels = false;
-            }
             st.reading = r;
             st.connected = true;
             if (announce_connection) st.announce_connection = true;
-            var retry_connection_announcement = st.announce_connection and !canNotifyBatteryStatus(r);
-            if (retry_connection_announcement and announce_retry_attempts >= announce_retry_attempts_max) {
-                st.announce_connection = false;
-                retry_connection_announcement = false;
-            }
             st.mutex.unlock(g_io);
             _ = PostMessageW(ctx.hwnd, WM_BATTERY_UPDATE, 0, 0);
 
-            if (retry_connection_announcement) {
-                _ = dev.request("wireless.battery.forceRead", &prime_buf) catch {};
-                waitForNextPoll(io, st, announce_retry_ms);
-                announce_retry_ms = @min(announce_retry_ms * 2, announce_retry_max_ms);
-                announce_retry_attempts += 1;
-                retry_missing_levels = true;
-            } else {
-                retry_missing_levels = false;
-                // Both sides asleep -> nudge the neuron to refresh before the
-                // next normal poll. forceRead is argument-less, not a flash setter.
-                if (r.left.level == null and r.right.level == null) {
-                    _ = dev.request("wireless.battery.forceRead", &prime_buf) catch {};
-                }
-
-                // Wait out the interval, but stay responsive to stop/refresh.
-                waitForNextPoll(io, st, battery.suggestedPollIntervalSeconds(r) * 1000);
+            // Wait out the interval, staying responsive to stop/refresh/pause.
+            // A user refresh (menu "Refresh battery now" or double-click) wakes
+            // us early: forceRead to re-poll the sides over RF, let it settle,
+            // then loop to re-read the freshly-updated cached values.
+            const refreshed = waitForNextPoll(io, st, poll_interval_ms);
+            if (refreshed) {
+                battery.forceRead(&dev);
+                sleepMs(io, st, battery.force_read_settle_s * 1000);
             }
         }
     }
@@ -816,18 +788,22 @@ fn sleepMs(io: std.Io, st: *State, ms: u64) void {
     dur.sleep(io) catch {};
 }
 
-fn waitForNextPoll(io: std.Io, st: *State, interval_ms: u64) void {
+/// Sleep out the poll interval, waking early on stop/pause/refresh. Returns
+/// true only when a user refresh triggered the early wake, so the caller can
+/// forceRead before the next read (stop/pause return false).
+fn waitForNextPoll(io: std.Io, st: *State, interval_ms: u64) bool {
     var waited: u64 = 0;
     const quantum_ms: u64 = 1000;
     while (waited < interval_ms) {
-        if (st.stop.load(.acquire)) break;
-        if (st.paused.load(.acquire)) break;
-        if (st.refresh.swap(false, .acq_rel)) break;
+        if (st.stop.load(.acquire)) return false;
+        if (st.paused.load(.acquire)) return false;
+        if (st.refresh.swap(false, .acq_rel)) return true;
         const remaining = interval_ms - waited;
         const sleep_ms = @min(remaining, quantum_ms);
         sleepMs(io, st, sleep_ms);
         waited += sleep_ms;
     }
+    return false;
 }
 
 comptime {

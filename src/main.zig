@@ -84,14 +84,11 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print("connected to {s}\n", .{path});
         defer dev.close();
 
-        // PRIME: ask the neuron to refresh side readings, once per connect.
-        var prime_buf: [64]u8 = undefined;
-        _ = dev.request("wireless.battery.forceRead", &prime_buf) catch {};
-        sleepSeconds(io, battery.force_read_settle_s);
-
-        // POLL
+        // POLL. No forceRead: the neuron serves cached values on a plain read
+        // (Bazecor only forceReads on an explicit button press). battery.read
+        // retries once when a side momentarily reports "disconnected".
         while (true) {
-            const reading = battery.readAll(&dev) catch |err| {
+            const reading = battery.read(&dev) catch |err| {
                 if (opts.once) {
                     std.debug.print("dygma-battery: communication failed: {s}\n", .{@errorName(err)});
                     return 1;
