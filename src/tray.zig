@@ -590,6 +590,7 @@ fn pollLoop(ctx: *PollCtx) void {
         // PRIME
         var prime_buf: [64]u8 = undefined;
         _ = dev.request("wireless.battery.forceRead", &prime_buf) catch {};
+        sleepMs(io, st, battery.force_read_settle_s * 1000);
 
         // POLL
         while (!st.stop.load(.acquire)) {
@@ -617,15 +618,7 @@ fn pollLoop(ctx: *PollCtx) void {
             _ = PostMessageW(ctx.hwnd, WM_BATTERY_UPDATE, 0, 0);
 
             // Wait out the interval, but stay responsive to stop/refresh.
-            var waited: u64 = 0;
-            const interval_ms: u64 = 5000;
-            while (waited < interval_ms) {
-                if (st.stop.load(.acquire)) break;
-                if (st.paused.load(.acquire)) break;
-                if (st.refresh.swap(false, .acq_rel)) break;
-                sleepMs(io, st, 200);
-                waited += 200;
-            }
+            waitForNextPoll(io, st, battery.suggestedPollIntervalSeconds(r) * 1000);
         }
     }
 }
@@ -647,6 +640,20 @@ fn sleepMs(io: std.Io, st: *State, ms: u64) void {
         .raw = std.Io.Duration.fromMilliseconds(@intCast(ms)),
     };
     dur.sleep(io) catch {};
+}
+
+fn waitForNextPoll(io: std.Io, st: *State, interval_ms: u64) void {
+    var waited: u64 = 0;
+    const quantum_ms: u64 = 1000;
+    while (waited < interval_ms) {
+        if (st.stop.load(.acquire)) break;
+        if (st.paused.load(.acquire)) break;
+        if (st.refresh.swap(false, .acq_rel)) break;
+        const remaining = interval_ms - waited;
+        const sleep_ms = @min(remaining, quantum_ms);
+        sleepMs(io, st, sleep_ms);
+        waited += sleep_ms;
+    }
 }
 
 comptime {

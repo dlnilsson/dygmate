@@ -16,7 +16,8 @@ const usage =
     \\Options:
     \\  --port <name>      Serial port (e.g. COM5 or /dev/ttyACM0).
     \\                     Default: auto-detect by USB VID/PID 35EF:0012.
-    \\  --interval <secs>  Poll interval in seconds (default: 5).
+    \\  --interval <secs>  Fixed poll interval in seconds (minimum: 900).
+    \\                     Default: adaptive 15-60 minutes.
     \\  --once             Print one reading and exit.
     \\  -h, --help         Show this help.
     \\
@@ -24,7 +25,7 @@ const usage =
 
 const Options = struct {
     port: ?[]const u8 = null,
-    interval_s: u32 = 5,
+    fixed_interval_s: ?u64 = null,
     once: bool = false,
 };
 
@@ -85,6 +86,7 @@ pub fn main(init: std.process.Init) !u8 {
         // PRIME: ask the neuron to refresh side readings, once per connect.
         var prime_buf: [64]u8 = undefined;
         _ = dev.request("wireless.battery.forceRead", &prime_buf) catch {};
+        sleepSeconds(io, battery.force_read_settle_s);
 
         // POLL
         while (true) {
@@ -102,7 +104,8 @@ pub fn main(init: std.process.Init) !u8 {
                 dev.close();
                 return 0;
             }
-            sleepSeconds(io, opts.interval_s);
+            const interval_s = opts.fixed_interval_s orelse battery.suggestedPollIntervalSeconds(reading);
+            sleepSeconds(io, interval_s);
         }
     }
 }
@@ -128,8 +131,9 @@ fn parseArgs(args: []const [:0]const u8) error{ Help, InvalidArgs }!Options {
         } else if (std.mem.eql(u8, arg, "--interval")) {
             i += 1;
             if (i >= args.len) return error.InvalidArgs;
-            opts.interval_s = std.fmt.parseInt(u32, args[i], 10) catch return error.InvalidArgs;
-            if (opts.interval_s == 0) return error.InvalidArgs;
+            const interval_s = std.fmt.parseInt(u64, args[i], 10) catch return error.InvalidArgs;
+            if (interval_s < battery.min_poll_interval_s) return error.InvalidArgs;
+            opts.fixed_interval_s = interval_s;
         } else if (std.mem.eql(u8, arg, "--once")) {
             opts.once = true;
         } else if (std.mem.eql(u8, arg, "--debug")) {

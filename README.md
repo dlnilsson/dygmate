@@ -7,7 +7,8 @@ cross-platform console tool and a Windows system-tray indicator.
 
 It talks the line-oriented ASCII [Focus API](https://github.com/Dygmalab/Bazecor/blob/development/FOCUS_API.md)
 directly over the keyboard's USB CDC-ACM serial port (115200 baud) and
-polls `wireless.battery.{left,right}.{level,status}`.
+polls `wireless.battery.{left,right}.{level,status}` on an adaptive
+cadence.
 
 ## Build
 
@@ -26,9 +27,9 @@ Binaries land in `zig-out/bin/`:
 ## Usage
 
 ```
-dygma-battery                 # auto-detect, poll every 5s
+dygma-battery                 # auto-detect, adaptive 15-60 min polling
 dygma-battery --once          # single reading, then exit
-dygma-battery --interval 30   # poll every 30s
+dygma-battery --interval 900  # fixed 15 min polling (minimum)
 dygma-battery --port COM5     # skip auto-detection
 ```
 
@@ -54,9 +55,9 @@ zig build run-tray        # or run zig-out/bin/dygma-battery-tray.exe
 `dygma-battery-tray` runs in the background with no console window. The tray
 icon shows the **lower** of the two sides' battery percentage, colored by
 level (green ≥ 50, amber ≥ 20, red below, blue while charging). Hover for a
-tooltip with both sides in full; right-click for **Refresh now** / **Quit**;
-double-click to force an immediate re-read. It drops below 20% on a side
-raises a one-off balloon notification.
+tooltip with both sides in full; right-click for **Refresh now** /
+**Disconnect** / **Quit**; double-click to force an immediate re-read.
+Dropping below 20% on a side raises a one-off balloon notification.
 
 A background thread owns the serial connection and runs the same
 discover → connect → poll loop as the CLI, so the tray auto-reconnects when
@@ -80,5 +81,9 @@ makes a second copy pointless). New tray icons default to Windows' hidden
   are setters that write the keyboard's flash memory, which has a finite
   write lifespan. This tool only ever sends bare read commands, and the
   transport layer asserts that no command carries data.
+- **Poll cadence**: the default cadence is adaptive based on the lower valid
+  side percentage: 15 min below 50% or when unreadable, 30 min at 50%+,
+  45 min at 80%+, and 1 hour near full. `--interval` can set a fixed CLI
+  cadence, but values below 900 seconds are rejected.
 - Dependency: [ZigEmbeddedGroup/serial](https://github.com/ZigEmbeddedGroup/serial)
   (master, which targets Zig 0.16). Pinned by hash in `build.zig.zon`.

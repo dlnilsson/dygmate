@@ -37,6 +37,12 @@ pub const Reading = struct {
     right: SideReading,
 };
 
+pub const min_poll_interval_s: u64 = 15 * 60;
+pub const poll_interval_50_s: u64 = 30 * 60;
+pub const poll_interval_80_s: u64 = 45 * 60;
+pub const max_poll_interval_s: u64 = 60 * 60;
+pub const force_read_settle_s: u64 = 2;
+
 /// Issue the four battery read commands. Parse failures degrade to
 /// null/.unknown; only transport errors propagate (they mean the
 /// connection is gone and the caller should reconnect).
@@ -55,6 +61,23 @@ pub fn readAll(f: *focus.Focus) focus.Error!Reading {
             .status = parseStatus(try f.request("wireless.battery.right.status", &buf)),
         },
     };
+}
+
+pub fn suggestedPollIntervalSeconds(r: Reading) u64 {
+    const lvl = lowestLevel(r) orelse return min_poll_interval_s;
+    if (lvl >= 95) return max_poll_interval_s;
+    if (lvl >= 80) return poll_interval_80_s;
+    if (lvl >= 50) return poll_interval_50_s;
+    return min_poll_interval_s;
+}
+
+fn lowestLevel(r: Reading) ?u8 {
+    var lvl: ?u8 = null;
+    if (r.left.level) |left| lvl = left;
+    if (r.right.level) |right| {
+        if (lvl == null or right < lvl.?) lvl = right;
+    }
+    return lvl;
 }
 
 pub fn parseLevel(payload: []const u8) ?u8 {
@@ -102,4 +125,35 @@ test "parseStatus maps firmware codes" {
     try std.testing.expectEqual(Status.disconnected, parseStatus("4"));
     try std.testing.expectEqual(Status.unknown, parseStatus("9"));
     try std.testing.expectEqual(Status.unknown, parseStatus("x"));
+}
+
+test "suggestedPollIntervalSeconds uses the lower valid side level" {
+    try std.testing.expectEqual(
+        min_poll_interval_s,
+        suggestedPollIntervalSeconds(.{
+            .left = .{ .level = null, .status = .unknown },
+            .right = .{ .level = null, .status = .unknown },
+        }),
+    );
+    try std.testing.expectEqual(
+        max_poll_interval_s,
+        suggestedPollIntervalSeconds(.{
+            .left = .{ .level = 100, .status = .charged },
+            .right = .{ .level = 98, .status = .charged },
+        }),
+    );
+    try std.testing.expectEqual(
+        poll_interval_50_s,
+        suggestedPollIntervalSeconds(.{
+            .left = .{ .level = 100, .status = .charged },
+            .right = .{ .level = 55, .status = .discharging },
+        }),
+    );
+    try std.testing.expectEqual(
+        min_poll_interval_s,
+        suggestedPollIntervalSeconds(.{
+            .left = .{ .level = 49, .status = .discharging },
+            .right = .{ .level = 100, .status = .charged },
+        }),
+    );
 }
