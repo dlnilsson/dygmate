@@ -181,6 +181,8 @@ const NIF_MESSAGE: UINT = 0x01;
 const NIF_ICON: UINT = 0x02;
 const NIF_TIP: UINT = 0x04;
 const NIF_INFO: UINT = 0x10;
+// Required with NOTIFYICON_VERSION_4 to keep the standard Shell tooltip.
+const NIF_SHOWTIP: UINT = 0x80;
 const NOTIFYICON_VERSION_4: UINT = 4;
 const NIIF_INFO_ICON: DWORD = 0x01;
 const NIIF_WARNING: DWORD = 0x02;
@@ -264,12 +266,13 @@ var g_nid: NOTIFYICONDATAW = undefined;
 /// thread-safe). Stashed globally so the UI thread can lock the state mutex.
 var g_io: std.Io = undefined;
 
-// Last-known-good icon value (UI thread only). The wireless halves sleep and
-// briefly report a null level; rather than flicker the icon to "--", we keep
-// showing the last real percentage while still connected. Cleared on
-// disconnect so a truly-gone keyboard does show "--".
-var g_last_level: ?u8 = null;
-var g_last_status: battery.Status = .unknown;
+// Last-known-good reading, per side (UI thread only). The wireless halves
+// sleep and report a null level between the (now 15-60 min) polls; rather than
+// show "?%", we keep the last real value for each side. Persists across sleep
+// and disconnect — the battery hasn't changed — so hovering always reveals a
+// real number. `level == null` means that side has never reported yet.
+var g_last_left: battery.SideReading = .{ .level = null, .status = .unknown };
+var g_last_right: battery.SideReading = .{ .level = null, .status = .unknown };
 
 pub fn main(init: std.process.Init) void {
     g_io = init.io;
@@ -298,13 +301,15 @@ pub fn main(init: std.process.Init) void {
     g_nid.cbSize = @sizeOf(NOTIFYICONDATAW);
     g_nid.hWnd = hwnd;
     g_nid.uID = 1;
-    g_nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    g_nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
     g_nid.uCallbackMessage = WM_TRAYICON;
     g_nid.hIcon = makeTextIcon("--", col_gray);
     setUtf16(g_nid.szTip[0..], "dygma-battery: starting\u{2026}");
     _ = Shell_NotifyIconW(NIM_ADD, &g_nid);
     g_nid.uVersion = NOTIFYICON_VERSION_4;
     _ = Shell_NotifyIconW(NIM_SETVERSION, &g_nid);
+    g_nid.uFlags = NIF_TIP | NIF_SHOWTIP;
+    _ = Shell_NotifyIconW(NIM_MODIFY, &g_nid);
 
     var ctx = PollCtx{ .io = init.io, .gpa = init.gpa, .hwnd = hwnd, .state = &g_state };
     const thread = std.Thread.spawn(.{}, pollLoop, .{&ctx}) catch {
@@ -404,45 +409,13 @@ fn updateTray() void {
     var color: COLORREF = col_gray;
     var num_buf: [4]u8 = undefined;
 
-    if (paused) {
-        // Port released for Bazecor: keep showing the last known percentage.
-        var tip_buf: [80]u8 = undefined;
-        const tip = if (g_last_level) |lvl|
-            (std.fmt.bufPrint(&tip_buf, "dygma-battery: paused — port free for Bazecor (last known {d}%)", .{lvl}) catch "dygma-battery: paused — port free for Bazecor")
-        else
-            "dygma-battery: paused — port free for Bazecor";
-        setUtf16(g_nid.szTip[0..], tip);
-        g_state.notified_low = .{ false, false };
-    } else if (connected and reading != null) {
+    // Refresh each side's last-known snapshot from a live reading, and run the
+    // notification logic. Tooltip + icon below render from the snapshots, so
+    // they always show a real per-side value even while a half is asleep.
+    if (!paused and connected and reading != null) {
         const r = reading.?;
-        // Display the lower of the two valid side levels — the one at risk.
-        var disp_level: ?u8 = null;
-        var disp_status: battery.Status = .unknown;
-        if (r.left.level) |ll| {
-            disp_level = ll;
-            disp_status = r.left.status;
-        }
-        if (r.right.level) |rl| {
-            if (disp_level == null or rl < disp_level.?) {
-                disp_level = rl;
-                disp_status = r.right.status;
-            }
-        }
-        // Remember the latest real reading. A side often briefly sleeps and
-        // reports null; we keep showing the last known value, never a blank.
-        if (disp_level) |lvl| {
-            g_last_level = lvl;
-            g_last_status = disp_status;
-        }
-
-        var lb: [32]u8 = undefined;
-        var rb: [32]u8 = undefined;
-        var tip_buf: [96]u8 = undefined;
-        const tip = std.fmt.bufPrint(&tip_buf, "Left: {s}\nRight: {s}", .{
-            fmtSide(&lb, r.left),
-            fmtSide(&rb, r.right),
-        }) catch "dygma-battery";
-        setUtf16(g_nid.szTip[0..], tip);
+        if (r.left.level != null) g_last_left = r.left;
+        if (r.right.level != null) g_last_right = r.right;
 
         if (announce_connection) {
             showBatteryStatusBalloon(r);
@@ -451,25 +424,49 @@ fn updateTray() void {
             checkLowBattery(r);
         }
     } else {
-        // Disconnected: keep displaying the last known percentage (the battery
-        // hasn't changed) — just flag the offline state in the tooltip.
-        var tip_buf: [64]u8 = undefined;
-        const tip = if (g_last_level) |lvl|
-            (std.fmt.bufPrint(&tip_buf, "dygma-battery: not connected (last known {d}%)", .{lvl}) catch "dygma-battery: not connected")
-        else
-            "dygma-battery: not connected";
-        setUtf16(g_nid.szTip[0..], tip);
         g_state.notified_low = .{ false, false };
     }
 
-    // Render from the last known level. Dim to gray while offline or paused so
-    // a stale value reads as such; "--" shows only before the first reading.
+    // Tooltip: last-known value for each side, in every state, with a short
+    // header when the reading isn't live.
+    {
+        var lb: [40]u8 = undefined;
+        var rb: [40]u8 = undefined;
+        var tip_buf: [128]u8 = undefined;
+        const header: []const u8 = if (paused)
+            "Paused (port free for Bazecor):\n"
+        else if (!connected)
+            "Not connected — last known:\n"
+        else
+            "";
+        const tip = std.fmt.bufPrint(&tip_buf, "{s}Left: {s}\nRight: {s}", .{
+            header,
+            fmtKnownSide(&lb, g_last_left),
+            fmtKnownSide(&rb, g_last_right),
+        }) catch "dygma-battery";
+        setUtf16(g_nid.szTip[0..], tip);
+    }
+
+    // Icon: the lower of the two last-known side levels. Dim to gray while
+    // offline or paused; "--" only before either side has ever reported.
     const live = connected and !paused;
-    if (g_last_level) |lvl| {
+    var disp_level: ?u8 = null;
+    var disp_status: battery.Status = .unknown;
+    if (g_last_left.level) |l| {
+        disp_level = l;
+        disp_status = g_last_left.status;
+    }
+    if (g_last_right.level) |rl| {
+        if (disp_level == null or rl < disp_level.?) {
+            disp_level = rl;
+            disp_status = g_last_right.status;
+        }
+    }
+    if (disp_level) |lvl| {
         icon_text = std.fmt.bufPrint(&num_buf, "{d}", .{lvl}) catch "?";
         color = if (!live)
             col_gray
-        else if (g_last_status == .charging)
+        else if (disp_status == .charging)
             col_blue
         else if (lvl >= 50)
             col_green
@@ -482,7 +479,7 @@ fn updateTray() void {
     const new_icon = makeTextIcon(icon_text, color);
     const old_icon = g_nid.hIcon;
     g_nid.hIcon = new_icon;
-    g_nid.uFlags = NIF_ICON | NIF_TIP;
+    g_nid.uFlags = NIF_ICON | NIF_TIP | NIF_SHOWTIP;
     _ = Shell_NotifyIconW(NIM_MODIFY, &g_nid);
     if (old_icon) |icon| _ = DestroyIcon(icon);
 }
@@ -492,6 +489,15 @@ fn fmtSide(buf: []u8, s: battery.SideReading) []const u8 {
         return std.fmt.bufPrint(buf, "{d}% ({s})", .{ lvl, s.status.label() }) catch buf[0..0];
     }
     return std.fmt.bufPrint(buf, "?% ({s})", .{s.status.label()}) catch buf[0..0];
+}
+
+/// Tooltip form of a last-known side snapshot: the real value if the side has
+/// ever reported, else a plain "no reading yet".
+fn fmtKnownSide(buf: []u8, s: battery.SideReading) []const u8 {
+    if (s.level) |lvl| {
+        return std.fmt.bufPrint(buf, "{d}% ({s})", .{ lvl, s.status.label() }) catch buf[0..0];
+    }
+    return "no reading yet";
 }
 
 fn checkLowBattery(r: battery.Reading) void {
@@ -575,7 +581,7 @@ fn showBalloon(title: []const u8, text: []const u8, flags: DWORD) void {
     g_nid.dwInfoFlags = flags;
     g_nid.uFlags = NIF_INFO;
     _ = Shell_NotifyIconW(NIM_MODIFY, &g_nid);
-    g_nid.uFlags = NIF_ICON | NIF_TIP; // restore for the next icon/tip update
+    g_nid.uFlags = NIF_ICON | NIF_TIP | NIF_SHOWTIP; // restore for the next icon/tip update
 }
 
 /// Render `text` centered on a solid `color` 16x16 icon. Caller owns the
