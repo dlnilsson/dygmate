@@ -122,6 +122,7 @@ extern "user32" fn CreatePopupMenu() callconv(.winapi) ?HMENU;
 extern "user32" fn AppendMenuW(hMenu: HMENU, uFlags: UINT, uIDNewItem: usize, lpNewItem: ?[*:0]const u16) callconv(.winapi) BOOL;
 extern "user32" fn TrackPopupMenu(hMenu: HMENU, uFlags: UINT, x: i32, y: i32, nReserved: i32, hWnd: HWND, prcRect: ?*const RECT) callconv(.winapi) i32;
 extern "user32" fn DestroyMenu(hMenu: HMENU) callconv(.winapi) BOOL;
+extern "user32" fn SetMenuDefaultItem(hMenu: HMENU, uItem: UINT, fByPos: UINT) callconv(.winapi) BOOL;
 extern "user32" fn SetForegroundWindow(hWnd: HWND) callconv(.winapi) BOOL;
 extern "user32" fn GetCursorPos(lpPoint: *POINT) callconv(.winapi) BOOL;
 extern "user32" fn DestroyIcon(hIcon: HICON) callconv(.winapi) BOOL;
@@ -188,6 +189,9 @@ const NIIF_INFO_ICON: DWORD = 0x01;
 const NIIF_WARNING: DWORD = 0x02;
 
 const MF_STRING: UINT = 0x0000;
+const MF_GRAYED: UINT = 0x0001; // disabled + dimmed (non-selectable label)
+const MF_SEPARATOR: UINT = 0x0800;
+const MF_BYCOMMAND: UINT = 0x0000;
 const TPM_RIGHTBUTTON: UINT = 0x0002;
 const TPM_RETURNCMD: UINT = 0x0100;
 
@@ -230,7 +234,7 @@ const notification_title_low = "Dygma Defy battery low";
 
 const class_name = std.unicode.utf8ToUtf16LeStringLiteral("DygmaBatteryTrayWnd");
 const window_title = std.unicode.utf8ToUtf16LeStringLiteral("dygma-battery");
-const menu_refresh = std.unicode.utf8ToUtf16LeStringLiteral("Refresh now");
+const menu_refresh = std.unicode.utf8ToUtf16LeStringLiteral("Refresh battery now");
 const menu_disconnect = std.unicode.utf8ToUtf16LeStringLiteral("Disconnect (release port for Bazecor)");
 const menu_reconnect = std.unicode.utf8ToUtf16LeStringLiteral("Reconnect");
 const menu_quit = std.unicode.utf8ToUtf16LeStringLiteral("Quit");
@@ -358,9 +362,34 @@ fn showMenu(hwnd: HWND) void {
     const paused = g_state.paused.load(.acquire);
     const menu = CreatePopupMenu() orelse return;
     defer _ = DestroyMenu(menu);
+
+    // Informational (grayed, non-clickable) status header, mirroring the
+    // tooltip: connection state + last-known level per side. g_last_* are
+    // UI-thread-only, so no lock is needed for them; connected needs the mutex.
+    g_state.mutex.lockUncancelable(g_io);
+    const connected = g_state.connected;
+    g_state.mutex.unlock(g_io);
+
+    const conn_text: []const u8 = if (paused)
+        "Paused (port free for Bazecor)"
+    else if (connected)
+        "Connected"
+    else
+        "Not connected";
+
+    var lb: [48]u8 = undefined;
+    var rb: [48]u8 = undefined;
+    var sb: [24]u8 = undefined;
+    appendMenuText(menu, MF_GRAYED, 0, conn_text);
+    appendMenuText(menu, MF_GRAYED, 0, std.fmt.bufPrint(&lb, "Left: {s}", .{fmtMenuSide(&sb, g_last_left)}) catch "Left: ?");
+    appendMenuText(menu, MF_GRAYED, 0, std.fmt.bufPrint(&rb, "Right: {s}", .{fmtMenuSide(&sb, g_last_right)}) catch "Right: ?");
+    _ = AppendMenuW(menu, MF_SEPARATOR, 0, null);
+
     _ = AppendMenuW(menu, MF_STRING, @intCast(ID_REFRESH), menu_refresh);
     _ = AppendMenuW(menu, MF_STRING, @intCast(ID_TOGGLE), if (paused) menu_reconnect else menu_disconnect);
     _ = AppendMenuW(menu, MF_STRING, @intCast(ID_QUIT), menu_quit);
+    // Bold "Refresh battery now" as the default (also the double-click action).
+    _ = SetMenuDefaultItem(menu, @intCast(ID_REFRESH), MF_BYCOMMAND);
 
     var pt: POINT = undefined;
     _ = GetCursorPos(&pt);
@@ -482,6 +511,34 @@ fn updateTray() void {
     g_nid.uFlags = NIF_ICON | NIF_TIP | NIF_SHOWTIP;
     _ = Shell_NotifyIconW(NIM_MODIFY, &g_nid);
     if (old_icon) |icon| _ = DestroyIcon(icon);
+}
+
+/// Append a runtime-built string as a menu item. AppendMenuW needs a
+/// null-terminated UTF-16 string, so convert into a local buffer first (same
+/// conversion as setUtf16). AppendMenuW copies the text, so the buffer is
+/// free to be reused after the call.
+fn appendMenuText(menu: HMENU, flags: UINT, id: usize, text: []const u8) void {
+    var wbuf: [64]u16 = undefined;
+    const max = wbuf.len - 1;
+    const src = if (text.len > max) text[0..max] else text;
+    const n = std.unicode.utf8ToUtf16Le(wbuf[0..max], src) catch 0;
+    wbuf[n] = 0;
+    _ = AppendMenuW(menu, flags, id, wbuf[0..n :0].ptr);
+}
+
+/// Menu form of a last-known side snapshot: "{d}% (Status)" with a capitalized
+/// status word to match the menu styling; "no reading yet" if never reported.
+/// Status.label() stays lowercase for the CLI/tooltip.
+fn fmtMenuSide(buf: []u8, s: battery.SideReading) []const u8 {
+    const lvl = s.level orelse return "no reading yet";
+    const word = s.status.label();
+    var cap: [16]u8 = undefined;
+    const w = if (word.len > 0 and word.len <= cap.len) blk: {
+        std.mem.copyForwards(u8, cap[0..word.len], word);
+        cap[0] = std.ascii.toUpper(word[0]);
+        break :blk cap[0..word.len];
+    } else word;
+    return std.fmt.bufPrint(buf, "{d}% ({s})", .{ lvl, w }) catch buf[0..0];
 }
 
 fn fmtSide(buf: []u8, s: battery.SideReading) []const u8 {
