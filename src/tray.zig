@@ -182,6 +182,7 @@ const NIF_ICON: UINT = 0x02;
 const NIF_TIP: UINT = 0x04;
 const NIF_INFO: UINT = 0x10;
 const NOTIFYICON_VERSION_4: UINT = 4;
+const NIIF_INFO_ICON: DWORD = 0x01;
 const NIIF_WARNING: DWORD = 0x02;
 
 const MF_STRING: UINT = 0x0000;
@@ -204,6 +205,9 @@ const ID_TOGGLE: i32 = 3;
 
 const icon_size: i32 = 16;
 const low_threshold: u8 = 20;
+const announce_retry_initial_ms: u64 = 2 * 1000;
+const announce_retry_max_ms: u64 = 32 * 1000;
+const announce_retry_attempts_max: u8 = 5;
 
 // Status colors, COLORREF (0x00BBGGRR).
 fn rgb(r: u8, g: u8, b: u8) COLORREF {
@@ -219,6 +223,9 @@ const col_text = rgb(255, 255, 255);
 const ERROR_ALREADY_EXISTS: DWORD = 183;
 const singleton_name = std.unicode.utf8ToUtf16LeStringLiteral("Local\\DygmaBatteryTraySingleton");
 
+const notification_title_battery = "Dygma Defy battery level";
+const notification_title_low = "Dygma Defy battery low";
+
 const class_name = std.unicode.utf8ToUtf16LeStringLiteral("DygmaBatteryTrayWnd");
 const window_title = std.unicode.utf8ToUtf16LeStringLiteral("dygma-battery");
 const menu_refresh = std.unicode.utf8ToUtf16LeStringLiteral("Refresh now");
@@ -233,6 +240,7 @@ const State = struct {
     mutex: std.Io.Mutex = .init,
     reading: ?battery.Reading = null,
     connected: bool = false,
+    announce_connection: bool = false,
     stop: std.atomic.Value(bool) = .init(false),
     refresh: std.atomic.Value(bool) = .init(false),
     /// User asked us to release the port (so Bazecor can use it). The poll
@@ -378,6 +386,15 @@ fn updateTray() void {
     g_state.mutex.lockUncancelable(g_io);
     const reading = g_state.reading;
     const connected = g_state.connected;
+    var pending_connection_announcement = false;
+    var announce_connection = false;
+    if (g_state.announce_connection and connected) {
+        if (reading) |r| {
+            pending_connection_announcement = true;
+            announce_connection = canNotifyBatteryStatus(r);
+        }
+    }
+    if (announce_connection) g_state.announce_connection = false;
     g_state.mutex.unlock(g_io);
     const paused = g_state.paused.load(.acquire);
 
@@ -425,7 +442,12 @@ fn updateTray() void {
         }) catch "dygma-battery";
         setUtf16(g_nid.szTip[0..], tip);
 
-        checkLowBattery(r);
+        if (announce_connection) {
+            showBatteryStatusBalloon(r);
+            latchLowBatteryNotifications(r);
+        } else if (!pending_connection_announcement) {
+            checkLowBattery(r);
+        }
     } else {
         // Disconnected: keep displaying the last known percentage (the battery
         // hasn't changed) — just flag the offline state in the tooltip.
@@ -484,7 +506,7 @@ fn checkLowBattery(r: battery.Reading) void {
                 g_state.notified_low[i] = true;
                 var tb: [64]u8 = undefined;
                 const text = std.fmt.bufPrint(&tb, "{s} side at {d}%", .{ names[i], lvl }) catch "battery low";
-                showBalloon("Dygma battery low", text);
+                showBalloon(notification_title_low, text, NIIF_WARNING);
             }
         } else {
             g_state.notified_low[i] = false;
@@ -492,10 +514,51 @@ fn checkLowBattery(r: battery.Reading) void {
     }
 }
 
-fn showBalloon(title: []const u8, text: []const u8) void {
+fn latchLowBatteryNotifications(r: battery.Reading) void {
+    const sides = [_]battery.SideReading{ r.left, r.right };
+    for (sides, 0..) |s, i| {
+        if (s.status == .charging) {
+            g_state.notified_low[i] = false;
+            continue;
+        }
+        const lvl = s.level orelse {
+            g_state.notified_low[i] = false;
+            continue;
+        };
+        g_state.notified_low[i] = lvl < low_threshold;
+    }
+}
+
+fn showBatteryStatusBalloon(r: battery.Reading) void {
+    var lb: [32]u8 = undefined;
+    var rb: [32]u8 = undefined;
+    var text_buf: [96]u8 = undefined;
+    const text = std.fmt.bufPrint(&text_buf, "Left: {s}\nRight: {s}", .{
+        fmtSide(&lb, r.left),
+        fmtSide(&rb, r.right),
+    }) catch "Battery status available";
+    const flags: DWORD = if (hasLowBattery(r)) NIIF_WARNING else NIIF_INFO_ICON;
+    showBalloon(notification_title_battery, text, flags);
+}
+
+fn canNotifyBatteryStatus(r: battery.Reading) bool {
+    return r.left.level != null and r.right.level != null;
+}
+
+fn hasLowBattery(r: battery.Reading) bool {
+    const sides = [_]battery.SideReading{ r.left, r.right };
+    for (sides) |s| {
+        if (s.status == .charging) continue;
+        const lvl = s.level orelse continue;
+        if (lvl < low_threshold) return true;
+    }
+    return false;
+}
+
+fn showBalloon(title: []const u8, text: []const u8, flags: DWORD) void {
     setUtf16(g_nid.szInfoTitle[0..], title);
     setUtf16(g_nid.szInfo[0..], text);
-    g_nid.dwInfoFlags = NIIF_WARNING;
+    g_nid.dwInfoFlags = flags;
     g_nid.uFlags = NIF_INFO;
     _ = Shell_NotifyIconW(NIM_MODIFY, &g_nid);
     g_nid.uFlags = NIF_ICON | NIF_TIP; // restore for the next icon/tip update
@@ -593,6 +656,8 @@ fn pollLoop(ctx: *PollCtx) void {
         sleepMs(io, st, battery.force_read_settle_s * 1000);
 
         // POLL
+        var announce_retry_ms = announce_retry_initial_ms;
+        var announce_retry_attempts: u8 = 0;
         while (!st.stop.load(.acquire)) {
             // User asked to release the port: close and drop back to idle.
             if (st.paused.load(.acquire)) {
@@ -605,20 +670,38 @@ fn pollLoop(ctx: *PollCtx) void {
                 setConnected(ctx, false);
                 break;
             };
-            // Both sides asleep -> nudge the neuron to refresh before the next
-            // poll. forceRead is an argument-less command (a read, not a flash
-            // setter), so it is safe to repeat.
-            if (r.left.level == null and r.right.level == null) {
-                _ = dev.request("wireless.battery.forceRead", &prime_buf) catch {};
-            }
             st.mutex.lockUncancelable(g_io);
+            const announce_connection = !st.connected;
+            if (announce_connection) {
+                announce_retry_ms = announce_retry_initial_ms;
+                announce_retry_attempts = 0;
+            }
             st.reading = r;
             st.connected = true;
+            if (announce_connection) st.announce_connection = true;
+            var retry_connection_announcement = st.announce_connection and !canNotifyBatteryStatus(r);
+            if (retry_connection_announcement and announce_retry_attempts >= announce_retry_attempts_max) {
+                st.announce_connection = false;
+                retry_connection_announcement = false;
+            }
             st.mutex.unlock(g_io);
             _ = PostMessageW(ctx.hwnd, WM_BATTERY_UPDATE, 0, 0);
 
-            // Wait out the interval, but stay responsive to stop/refresh.
-            waitForNextPoll(io, st, battery.suggestedPollIntervalSeconds(r) * 1000);
+            if (retry_connection_announcement) {
+                _ = dev.request("wireless.battery.forceRead", &prime_buf) catch {};
+                waitForNextPoll(io, st, announce_retry_ms);
+                announce_retry_ms = @min(announce_retry_ms * 2, announce_retry_max_ms);
+                announce_retry_attempts += 1;
+            } else {
+                // Both sides asleep -> nudge the neuron to refresh before the
+                // next normal poll. forceRead is argument-less, not a flash setter.
+                if (r.left.level == null and r.right.level == null) {
+                    _ = dev.request("wireless.battery.forceRead", &prime_buf) catch {};
+                }
+
+                // Wait out the interval, but stay responsive to stop/refresh.
+                waitForNextPoll(io, st, battery.suggestedPollIntervalSeconds(r) * 1000);
+            }
         }
     }
 }
@@ -628,7 +711,10 @@ fn setConnected(ctx: *PollCtx, connected: bool) void {
     st.mutex.lockUncancelable(g_io);
     const changed = st.connected != connected;
     st.connected = connected;
-    if (!connected) st.reading = null;
+    if (!connected) {
+        st.reading = null;
+        st.announce_connection = false;
+    }
     st.mutex.unlock(g_io);
     if (changed) _ = PostMessageW(ctx.hwnd, WM_BATTERY_UPDATE, 0, 0);
 }
