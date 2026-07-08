@@ -82,6 +82,7 @@ pub fn main(init: std.process.Init) !u8 {
             continue;
         };
         std.debug.print("connected to {s}\n", .{path});
+        defer dev.close();
 
         // PRIME: ask the neuron to refresh side readings, once per connect.
         var prime_buf: [64]u8 = undefined;
@@ -91,7 +92,6 @@ pub fn main(init: std.process.Init) !u8 {
         // POLL
         while (true) {
             const reading = battery.readAll(&dev) catch |err| {
-                dev.close();
                 if (opts.once) {
                     std.debug.print("dygma-battery: communication failed: {s}\n", .{@errorName(err)});
                     return 1;
@@ -101,7 +101,6 @@ pub fn main(init: std.process.Init) !u8 {
             };
             try printReading(out, reading);
             if (opts.once) {
-                dev.close();
                 return 0;
             }
             const interval_s = opts.fixed_interval_s orelse battery.suggestedPollIntervalSeconds(reading);

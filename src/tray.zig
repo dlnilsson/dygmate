@@ -341,6 +341,7 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
             return 0;
         },
         WM_DESTROY => {
+            g_state.stop.store(true, .release);
             PostQuitMessage(0);
             return 0;
         },
@@ -374,6 +375,7 @@ fn showMenu(hwnd: HWND) void {
             _ = PostMessageW(hwnd, WM_BATTERY_UPDATE, 0, 0);
         },
         ID_QUIT => {
+            g_state.stop.store(true, .release);
             _ = Shell_NotifyIconW(NIM_DELETE, &g_nid);
             PostQuitMessage(0);
         },
@@ -661,6 +663,7 @@ fn pollLoop(ctx: *PollCtx) void {
             sleepMs(io, st, 3000);
             continue;
         };
+        defer dev.close();
 
         // PRIME
         var prime_buf: [64]u8 = undefined;
@@ -675,19 +678,16 @@ fn pollLoop(ctx: *PollCtx) void {
         while (!st.stop.load(.acquire)) {
             // User asked to release the port: close and drop back to idle.
             if (st.paused.load(.acquire)) {
-                dev.close();
                 setConnected(ctx, false);
                 break;
             }
             const r = if (retry_missing_levels)
                 readMissingLevels(&dev, latest_reading.?) catch {
-                    dev.close();
                     setConnected(ctx, false);
                     break;
                 }
             else
                 battery.readAll(&dev) catch {
-                    dev.close();
                     setConnected(ctx, false);
                     break;
                 };
