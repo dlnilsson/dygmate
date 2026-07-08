@@ -545,6 +545,18 @@ fn canNotifyBatteryStatus(r: battery.Reading) bool {
     return r.left.level != null and r.right.level != null;
 }
 
+fn readMissingLevels(f: *focus.Focus, r: battery.Reading) focus.Error!battery.Reading {
+    var next = r;
+    var buf: [256]u8 = undefined;
+    if (next.left.level == null) {
+        next.left.level = battery.parseLevel(try f.request("wireless.battery.left.level", &buf));
+    }
+    if (next.right.level == null) {
+        next.right.level = battery.parseLevel(try f.request("wireless.battery.right.level", &buf));
+    }
+    return next;
+}
+
 fn hasLowBattery(r: battery.Reading) bool {
     const sides = [_]battery.SideReading{ r.left, r.right };
     for (sides) |s| {
@@ -658,6 +670,8 @@ fn pollLoop(ctx: *PollCtx) void {
         // POLL
         var announce_retry_ms = announce_retry_initial_ms;
         var announce_retry_attempts: u8 = 0;
+        var retry_missing_levels = false;
+        var latest_reading: ?battery.Reading = null;
         while (!st.stop.load(.acquire)) {
             // User asked to release the port: close and drop back to idle.
             if (st.paused.load(.acquire)) {
@@ -665,16 +679,25 @@ fn pollLoop(ctx: *PollCtx) void {
                 setConnected(ctx, false);
                 break;
             }
-            const r = battery.readAll(&dev) catch {
-                dev.close();
-                setConnected(ctx, false);
-                break;
-            };
+            const r = if (retry_missing_levels)
+                readMissingLevels(&dev, latest_reading.?) catch {
+                    dev.close();
+                    setConnected(ctx, false);
+                    break;
+                }
+            else
+                battery.readAll(&dev) catch {
+                    dev.close();
+                    setConnected(ctx, false);
+                    break;
+                };
+            latest_reading = r;
             st.mutex.lockUncancelable(g_io);
             const announce_connection = !st.connected;
             if (announce_connection) {
                 announce_retry_ms = announce_retry_initial_ms;
                 announce_retry_attempts = 0;
+                retry_missing_levels = false;
             }
             st.reading = r;
             st.connected = true;
@@ -692,7 +715,9 @@ fn pollLoop(ctx: *PollCtx) void {
                 waitForNextPoll(io, st, announce_retry_ms);
                 announce_retry_ms = @min(announce_retry_ms * 2, announce_retry_max_ms);
                 announce_retry_attempts += 1;
+                retry_missing_levels = true;
             } else {
+                retry_missing_levels = false;
                 // Both sides asleep -> nudge the neuron to refresh before the
                 // next normal poll. forceRead is argument-less, not a flash setter.
                 if (r.left.level == null and r.right.level == null) {

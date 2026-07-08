@@ -60,8 +60,8 @@ tooltip with both sides in full; right-click for **Refresh now** /
 Startup and reconnect show a desktop notification with the current battery
 status once both sides have numeric battery levels. If either side reports
 `?`, the tray retries with capped exponential backoff instead of showing a
-partial notification. Dropping below 20% on a side raises a one-off balloon
-notification.
+partial notification; retries read only the missing level value(s). Dropping
+below 20% on a side raises a one-off balloon notification.
 
 A background thread owns the serial connection and runs the same
 discover → connect → poll loop as the CLI, so the tray auto-reconnects when
