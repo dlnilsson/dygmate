@@ -10,7 +10,7 @@ const serial = @import("serial");
 const windows = std.os.windows;
 const Io = std.Io;
 
-pub const Error = error{ Timeout, ResponseTooLong, PortError };
+pub const Error = error{ Timeout, ResponseTooLong, PortError, InvalidCommand };
 
 /// When true, every exchange is dumped to stderr (--debug).
 pub var debug = false;
@@ -49,7 +49,7 @@ pub const Focus = struct {
     /// `<command> <data>` is a setter that writes the keyboard's flash and
     /// wears out the chip — this client is read-only by design.
     pub fn request(self: *Focus, cmd: []const u8, out: []u8) Error![]const u8 {
-        std.debug.assert(std.mem.indexOfScalar(u8, cmd, ' ') == null);
+        if (!isReadOnlyCommand(cmd)) return error.InvalidCommand;
         self.scanner.reset();
         self.writeAllPort(cmd) catch return error.PortError;
         self.writeAllPort("\n") catch return error.PortError;
@@ -114,6 +114,14 @@ pub const Focus = struct {
         }
     }
 };
+
+pub fn isReadOnlyCommand(cmd: []const u8) bool {
+    return std.mem.eql(u8, cmd, "wireless.battery.left.level") or
+        std.mem.eql(u8, cmd, "wireless.battery.left.status") or
+        std.mem.eql(u8, cmd, "wireless.battery.right.level") or
+        std.mem.eql(u8, cmd, "wireless.battery.right.status") or
+        std.mem.eql(u8, cmd, "wireless.battery.forceRead");
+}
 
 /// Incremental splitter for the response byte stream. Read into
 /// `freeSpace()`, `commit()` the byte count, then drain `nextLine()`;
@@ -240,4 +248,19 @@ test "scanner: compact reclaims consumed space" {
     try std.testing.expectEqualStrings("hello", s.nextLine().?);
     s.compact();
     try std.testing.expectEqual(s.buf.len, s.freeSpace().len);
+}
+
+test "isReadOnlyCommand only allows battery read commands" {
+    try std.testing.expect(isReadOnlyCommand("wireless.battery.left.level"));
+    try std.testing.expect(isReadOnlyCommand("wireless.battery.left.status"));
+    try std.testing.expect(isReadOnlyCommand("wireless.battery.right.level"));
+    try std.testing.expect(isReadOnlyCommand("wireless.battery.right.status"));
+    try std.testing.expect(isReadOnlyCommand("wireless.battery.forceRead"));
+
+    try std.testing.expect(!isReadOnlyCommand("wireless.battery.savingMode"));
+    try std.testing.expect(!isReadOnlyCommand("wireless.battery.savingMode 1"));
+    try std.testing.expect(!isReadOnlyCommand("wireless.battery.left.level "));
+    try std.testing.expect(!isReadOnlyCommand("wireless.battery.left.level\t1"));
+    try std.testing.expect(!isReadOnlyCommand("wireless.battery.left.level\nwireless.battery.savingMode 1"));
+    try std.testing.expect(!isReadOnlyCommand("keymap.custom"));
 }

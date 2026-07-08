@@ -84,7 +84,8 @@ makes a second copy pointless). New tray icons default to Windows' hidden
 - **Flash wear**: Focus commands with an argument (`<command> <data>`)
   are setters that write the keyboard's flash memory, which has a finite
   write lifespan. This tool only ever sends bare read commands, and the
-  transport layer asserts that no command carries data.
+  transport layer rejects anything outside its read-only battery command
+  safelist.
 - **Poll cadence**: the default cadence is adaptive based on the lower valid
   side percentage: 15 min below 50% or when unreadable, 30 min at 50%+,
   45 min at 80%+, and 1 hour near full. `--interval` can set a fixed CLI
