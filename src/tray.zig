@@ -272,7 +272,8 @@ const osd_duration_ms: UINT = 900;
 const osd_width: i32 = 156;
 const osd_height: i32 = 56;
 const osd_bottom_margin: i32 = 124;
-const osd_alpha: u8 = 235;
+const osd_alpha: u8 = 250;
+const osd_corner_diameter: i32 = 26;
 
 // Status colors, COLORREF (0x00BBGGRR).
 fn rgb(r: u8, g: u8, b: u8) COLORREF {
@@ -810,11 +811,24 @@ fn paintOsd(hwnd: HWND) void {
     var rect: RECT = undefined;
     if (GetClientRect(hwnd, &rect) == .FALSE) return;
 
+    if (CreateSolidBrush(col_osd_transparent)) |brush| {
+        _ = FillRect(hdc, &rect, brush);
+        _ = DeleteObject(@ptrCast(brush));
+    }
+
     if (CreateSolidBrush(col_osd_bg)) |brush| {
         const prev_brush = SelectObject(hdc, @ptrCast(brush));
         const pen = CreatePen(PS_SOLID, 2, col_osd_border);
         const prev_pen = if (pen) |p| SelectObject(hdc, @ptrCast(p)) else null;
-        _ = RoundRect(hdc, 1, 1, osd_width - 1, osd_height - 1, 18, 18);
+        _ = RoundRect(
+            hdc,
+            1,
+            1,
+            osd_width - 1,
+            osd_height - 1,
+            osd_corner_diameter,
+            osd_corner_diameter,
+        );
         if (prev_pen) |pp| _ = SelectObject(hdc, pp);
         if (pen) |p| _ = DeleteObject(@ptrCast(p));
         if (prev_brush) |pb| _ = SelectObject(hdc, pb);
