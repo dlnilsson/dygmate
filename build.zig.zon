@@ -1,7 +1,7 @@
 .{
-    .name = .dygma_battery,
+    .name = .dygmate,
     .version = "0.1.0",
-    .fingerprint = 0xaf771e097e3289c2,
+    .fingerprint = 0x1378e7301a1c844a,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .serial = .{
