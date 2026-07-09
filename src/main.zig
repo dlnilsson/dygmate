@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const focus = @import("focus.zig");
 const battery = @import("battery.zig");
 const device = @import("device.zig");
+const porthint = @import("porthint.zig");
 
 const rescan_delay_s = 3;
 
@@ -69,10 +70,7 @@ pub fn main(init: std.process.Init) !u8 {
 
         // CONNECT
         var dev = focus.Focus.open(io, path) catch |err| {
-            const hint: []const u8 = if (err == error.AccessDenied or err == error.PermissionDenied)
-                " (port busy: close Bazecor or another dygmate instance)"
-            else
-                "";
+            const hint = porthint.forOpenError(err);
             if (opts.once) {
                 std.debug.print("dygmate: failed to open {s}: {s}{s}\n", .{ path, @errorName(err), hint });
                 return 1;
@@ -164,4 +162,5 @@ test {
     _ = @import("battery.zig");
     _ = @import("device.zig");
     _ = @import("layer.zig");
+    _ = @import("porthint.zig");
 }

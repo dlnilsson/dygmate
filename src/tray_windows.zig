@@ -12,6 +12,7 @@ const focus = @import("focus.zig");
 const battery = @import("battery.zig");
 const layer = @import("layer.zig");
 const device = @import("device.zig");
+const common = @import("tray_common.zig");
 const windows = std.os.windows;
 
 // ---------------------------------------------------------------------------
@@ -259,15 +260,7 @@ const ID_OSD_TOGGLE: i32 = 4;
 const ID_OSD_HIDE: usize = 1;
 
 const icon_size: i32 = 16;
-const low_threshold: u8 = 20;
-// Poll cadence. The wireless halves sleep and the neuron only serves a cached
-// value once a side has reported, so a plain read right after connect is often
-// empty. Polling frequently (like the Go tray's default 5s) catches a real
-// reading within a few seconds; last-known-good then keeps it across the empty
-// reads that follow. Plain reads hit the USB-powered neuron only — they never
-// wake the sides or wear flash, so a tight interval is cheap.
-const poll_interval_ms: u64 = 5 * 1000;
-const layer_poll_interval_ms: u64 = 250;
+const low_threshold = common.low_threshold;
 const osd_duration_ms: UINT = 900;
 const osd_width: i32 = 156;
 const osd_height: i32 = 56;
@@ -279,11 +272,10 @@ const osd_corner_diameter: i32 = 26;
 fn rgb(r: u8, g: u8, b: u8) COLORREF {
     return @as(COLORREF, r) | (@as(COLORREF, g) << 8) | (@as(COLORREF, b) << 16);
 }
-const col_green = rgb(46, 160, 67);
-const col_amber = rgb(200, 140, 0);
-const col_red = rgb(220, 50, 47);
-const col_blue = rgb(41, 128, 185);
-const col_gray = rgb(110, 110, 110);
+fn toColorRef(c: common.Rgb) COLORREF {
+    return rgb(c.r, c.g, c.b);
+}
+const col_gray = toColorRef(common.palette.gray);
 const col_osd_transparent = rgb(255, 0, 255);
 const col_osd_bg = rgb(18, 20, 24);
 const col_osd_border = rgb(92, 101, 116);
@@ -306,26 +298,10 @@ const menu_osd = std.unicode.utf8ToUtf16LeStringLiteral("Show layer overlay");
 const menu_quit = std.unicode.utf8ToUtf16LeStringLiteral("Quit");
 
 // ---------------------------------------------------------------------------
-// Shared state between the UI thread and the polling thread.
+// Shared state between the UI thread and the polling thread. Defined in
+// tray_common.zig so tray_linux.zig shares it.
 // ---------------------------------------------------------------------------
-const State = struct {
-    mutex: std.Io.Mutex = .init,
-    reading: ?battery.Reading = null,
-    connected: bool = false,
-    announce_connection: bool = false,
-    stop: std.atomic.Value(bool) = .init(false),
-    refresh: std.atomic.Value(bool) = .init(false),
-    /// User asked us to release the port (so Bazecor can use it). The poll
-    /// thread closes the connection and idles until this clears.
-    paused: std.atomic.Value(bool) = .init(false),
-    layer_change: std.atomic.Value(i32) = .init(-1),
-    /// When false, the poll thread skips the layer read and the UI thread
-    /// suppresses the OSD. Toggled from the tray menu; defaults on.
-    osd_enabled: std.atomic.Value(bool) = .init(true),
-    /// UI-thread-only: latched per side (0=left, 1=right) so a low-battery
-    /// balloon fires once per crossing, not every poll.
-    notified_low: [2]bool = .{ false, false },
-};
+const State = common.State;
 
 const PollCtx = struct {
     io: std.Io,
@@ -343,14 +319,8 @@ var g_osd_text_len: usize = 0;
 /// thread-safe). Stashed globally so the UI thread can lock the state mutex.
 var g_io: std.Io = undefined;
 
-// Last-known-good reading, per side (UI thread only). The wireless halves
-// sleep and report a null level and/or empty status between the (now 15-60 min)
-// polls; rather than show "?%" or "(?)", we keep the last real value for each
-// field independently (see updateTray). Persists across sleep and disconnect —
-// the battery hasn't changed — so hovering always reveals a real number.
-// `level == null` / `status == .unknown` means that field has never reported yet.
-var g_last_left: battery.SideReading = .{ .level = null, .status = .unknown };
-var g_last_right: battery.SideReading = .{ .level = null, .status = .unknown };
+// Last-known-good reading, per side (UI thread only). See common.LastKnown.
+var g_last: common.LastKnown = .{};
 
 pub fn main(init: std.process.Init) void {
     g_io = init.io;
@@ -498,8 +468,8 @@ fn showMenu(hwnd: HWND) void {
     var rb: [48]u8 = undefined;
     var sb: [24]u8 = undefined;
     appendMenuText(menu, MF_GRAYED, 0, conn_text);
-    appendMenuText(menu, MF_GRAYED, 0, std.fmt.bufPrint(&lb, "Left: {s}", .{fmtMenuSide(&sb, g_last_left)}) catch "Left: ?");
-    appendMenuText(menu, MF_GRAYED, 0, std.fmt.bufPrint(&rb, "Right: {s}", .{fmtMenuSide(&sb, g_last_right)}) catch "Right: ?");
+    appendMenuText(menu, MF_GRAYED, 0, std.fmt.bufPrint(&lb, "Left: {s}", .{common.fmtMenuSide(&sb, g_last.left)}) catch "Left: ?");
+    appendMenuText(menu, MF_GRAYED, 0, std.fmt.bufPrint(&rb, "Right: {s}", .{common.fmtMenuSide(&sb, g_last.right)}) catch "Right: ?");
     _ = AppendMenuW(menu, MF_SEPARATOR, 0, null);
 
     _ = AppendMenuW(menu, MF_STRING, @intCast(ID_REFRESH), menu_refresh);
@@ -579,16 +549,13 @@ fn updateTray() void {
     // clobbering a real "charging" with that "?" is exactly the stale-status bug.
     if (!paused and connected and reading != null) {
         const r = reading.?;
-        if (r.left.level != null) g_last_left.level = r.left.level;
-        if (r.left.status != .unknown) g_last_left.status = r.left.status;
-        if (r.right.level != null) g_last_right.level = r.right.level;
-        if (r.right.status != .unknown) g_last_right.status = r.right.status;
+        g_last.merge(r);
 
         // Drive notifications from the merged snapshot, not the raw reading: a
         // charging side that momentarily reports an empty status would otherwise
         // look ".unknown" (i.e. "not charging") and fire a false low-battery
         // warning. The snapshot carries the last real status per side.
-        const snapshot: battery.Reading = .{ .left = g_last_left, .right = g_last_right };
+        const snapshot: battery.Reading = .{ .left = g_last.left, .right = g_last.right };
         if (announce_connection) {
             showBatteryStatusBalloon(snapshot);
             latchLowBatteryNotifications(snapshot);
@@ -613,8 +580,8 @@ fn updateTray() void {
             "";
         const tip = std.fmt.bufPrint(&tip_buf, "{s}Left: {s}\nRight: {s}", .{
             header,
-            fmtKnownSide(&lb, g_last_left),
-            fmtKnownSide(&rb, g_last_right),
+            common.fmtKnownSide(&lb, g_last.left),
+            common.fmtKnownSide(&rb, g_last.right),
         }) catch "dygmate";
         setUtf16(g_nid.szTip[0..], tip);
     }
@@ -622,30 +589,10 @@ fn updateTray() void {
     // Icon: the lower of the two last-known side levels. Dim to gray while
     // offline or paused; "--" only before either side has ever reported.
     const live = connected and !paused;
-    var disp_level: ?u8 = null;
-    var disp_status: battery.Status = .unknown;
-    if (g_last_left.level) |l| {
-        disp_level = l;
-        disp_status = g_last_left.status;
-    }
-    if (g_last_right.level) |rl| {
-        if (disp_level == null or rl < disp_level.?) {
-            disp_level = rl;
-            disp_status = g_last_right.status;
-        }
-    }
-    if (disp_level) |lvl| {
+    const disp = g_last.display();
+    if (disp.level) |lvl| {
         icon_text = std.fmt.bufPrint(&num_buf, "{d}", .{lvl}) catch "?";
-        color = if (!live)
-            col_gray
-        else if (disp_status == .charging)
-            col_blue
-        else if (lvl >= 50)
-            col_green
-        else if (lvl >= low_threshold)
-            col_amber
-        else
-            col_red;
+        color = toColorRef(common.iconColor(live, lvl, disp.status));
     }
 
     const new_icon = makeTextIcon(icon_text, color);
@@ -667,37 +614,6 @@ fn appendMenuText(menu: HMENU, flags: UINT, id: usize, text: []const u8) void {
     const n = std.unicode.utf8ToUtf16Le(wbuf[0..max], src) catch 0;
     wbuf[n] = 0;
     _ = AppendMenuW(menu, flags, id, wbuf[0..n :0].ptr);
-}
-
-/// Menu form of a last-known side snapshot: "{d}% (Status)" with a capitalized
-/// status word to match the menu styling; "no reading yet" if never reported.
-/// Status.label() stays lowercase for the CLI/tooltip.
-fn fmtMenuSide(buf: []u8, s: battery.SideReading) []const u8 {
-    const lvl = s.level orelse return "no reading yet";
-    const word = s.status.label();
-    var cap: [16]u8 = undefined;
-    const w = if (word.len > 0 and word.len <= cap.len) blk: {
-        std.mem.copyForwards(u8, cap[0..word.len], word);
-        cap[0] = std.ascii.toUpper(word[0]);
-        break :blk cap[0..word.len];
-    } else word;
-    return std.fmt.bufPrint(buf, "{d}% ({s})", .{ lvl, w }) catch buf[0..0];
-}
-
-fn fmtSide(buf: []u8, s: battery.SideReading) []const u8 {
-    if (s.level) |lvl| {
-        return std.fmt.bufPrint(buf, "{d}% ({s})", .{ lvl, s.status.label() }) catch buf[0..0];
-    }
-    return std.fmt.bufPrint(buf, "?% ({s})", .{s.status.label()}) catch buf[0..0];
-}
-
-/// Tooltip form of a last-known side snapshot: the real value if the side has
-/// ever reported, else a plain "no reading yet".
-fn fmtKnownSide(buf: []u8, s: battery.SideReading) []const u8 {
-    if (s.level) |lvl| {
-        return std.fmt.bufPrint(buf, "{d}% ({s})", .{ lvl, s.status.label() }) catch buf[0..0];
-    }
-    return "no reading yet";
 }
 
 fn checkLowBattery(r: battery.Reading) void {
@@ -742,8 +658,8 @@ fn showBatteryStatusBalloon(r: battery.Reading) void {
     var rb: [32]u8 = undefined;
     var text_buf: [96]u8 = undefined;
     const text = std.fmt.bufPrint(&text_buf, "Left: {s}\nRight: {s}", .{
-        fmtSide(&lb, r.left),
-        fmtSide(&rb, r.right),
+        common.fmtSide(&lb, r.left),
+        common.fmtSide(&rb, r.right),
     }) catch "Battery status available";
     const flags: DWORD = if (hasLowBattery(r)) NIIF_WARNING else NIIF_INFO_ICON;
     showBalloon(notification_title_battery, text, flags);
@@ -905,152 +821,17 @@ fn setUtf16(dst: []u16, s: []const u8) void {
 }
 
 // ---------------------------------------------------------------------------
-// Background polling thread: owns the serial connection.
+// Background polling thread: owns the serial connection. The loop itself lives
+// in tray_common.zig; here we only supply the UI-wake callback (a window post).
 // ---------------------------------------------------------------------------
 fn pollLoop(ctx: *PollCtx) void {
-    const io = ctx.io;
-    const st = ctx.state;
-
-    while (!st.stop.load(.acquire)) {
-        // PAUSED: hold no port so Bazecor can use it; idle until resumed.
-        if (st.paused.load(.acquire)) {
-            resetLayerState(st);
-            setConnected(ctx, false);
-            sleepMs(io, st, 300);
-            continue;
-        }
-
-        // DISCOVER
-        const path = (device.findDygmaPort(io, ctx.gpa) catch null) orelse {
-            resetLayerState(st);
-            setConnected(ctx, false);
-            sleepMs(io, st, 3000);
-            continue;
-        };
-        defer ctx.gpa.free(path);
-
-        // CONNECT
-        var dev = focus.Focus.open(io, path) catch {
-            resetLayerState(st);
-            setConnected(ctx, false);
-            sleepMs(io, st, 3000);
-            continue;
-        };
-        defer dev.close();
-        var last_layer: ?u8 = null;
-        var battery_elapsed_ms: u64 = poll_interval_ms;
-
-        // POLL. No forceRead on connect: the neuron serves cached values on a
-        // plain read, and forcing a re-poll every cycle blanks them mid-refresh
-        // (empty "?"/no-reading responses). forceRead runs only when the user
-        // asks to refresh (below). Mirrors the Go tray's pollLoop.
-        while (!st.stop.load(.acquire)) {
-            // User asked to release the port: close and drop back to idle.
-            if (st.paused.load(.acquire)) {
-                resetLayerState(st);
-                setConnected(ctx, false);
-                break;
-            }
-            var should_post = false;
-            if (battery_elapsed_ms >= poll_interval_ms) {
-                const r = battery.read(&dev) catch {
-                    resetLayerState(st);
-                    setConnected(ctx, false);
-                    break;
-                };
-                st.mutex.lockUncancelable(g_io);
-                const announce_connection = !st.connected;
-                st.reading = r;
-                st.connected = true;
-                if (announce_connection) st.announce_connection = true;
-                st.mutex.unlock(g_io);
-                battery_elapsed_ms = 0;
-                should_post = true;
-            }
-
-            if (st.osd_enabled.load(.acquire)) {
-                const active_layer = layer.readActive(&dev) catch {
-                    resetLayerState(st);
-                    setConnected(ctx, false);
-                    break;
-                };
-                if (active_layer) |idx| {
-                    if (last_layer) |prev| {
-                        if (idx != prev) {
-                            st.layer_change.store(idx, .release);
-                            should_post = true;
-                        }
-                    }
-                    last_layer = idx;
-                }
-            } else {
-                // OSD off: skip the layer read entirely, and forget the last
-                // layer so re-enabling seeds silently (show on change only).
-                last_layer = null;
-            }
-
-            if (should_post) _ = PostMessageW(ctx.hwnd, WM_BATTERY_UPDATE, 0, 0);
-
-            // Wait out the interval, staying responsive to stop/refresh/pause.
-            // A user refresh (menu "Refresh battery now" or double-click) wakes
-            // us early: forceRead to re-poll the sides over RF, let it settle,
-            // then loop to re-read the freshly-updated cached values.
-            const refreshed = waitForNextPoll(io, st, layer_poll_interval_ms);
-            if (refreshed) {
-                battery.forceRead(&dev);
-                sleepMs(io, st, battery.force_read_settle_s * 1000);
-                battery_elapsed_ms = poll_interval_ms;
-            } else {
-                battery_elapsed_ms += layer_poll_interval_ms;
-            }
-        }
-    }
+    common.runPollLoop(PollCtx, ctx, ctx.io, ctx.gpa, ctx.state, wakeUi, true);
 }
 
-fn setConnected(ctx: *PollCtx, connected: bool) void {
-    const st = ctx.state;
-    st.mutex.lockUncancelable(g_io);
-    const changed = st.connected != connected;
-    st.connected = connected;
-    if (!connected) {
-        st.reading = null;
-        st.announce_connection = false;
-    }
-    st.mutex.unlock(g_io);
-    if (changed) _ = PostMessageW(ctx.hwnd, WM_BATTERY_UPDATE, 0, 0);
-}
-
-fn resetLayerState(st: *State) void {
-    st.layer_change.store(-1, .release);
-}
-
-fn sleepMs(io: std.Io, st: *State, ms: u64) void {
-    if (st.stop.load(.acquire)) return;
-    const dur: std.Io.Clock.Duration = .{
-        .clock = .awake,
-        .raw = std.Io.Duration.fromMilliseconds(@intCast(ms)),
-    };
-    dur.sleep(io) catch {};
-}
-
-/// Sleep out the poll interval, waking early on stop/pause/refresh. Returns
-/// true only when a user refresh triggered the early wake, so the caller can
-/// forceRead before the next read (stop/pause return false).
-fn waitForNextPoll(io: std.Io, st: *State, interval_ms: u64) bool {
-    var waited: u64 = 0;
-    const quantum_ms: u64 = 1000;
-    while (waited < interval_ms) {
-        if (st.stop.load(.acquire)) return false;
-        if (st.paused.load(.acquire)) return false;
-        if (st.refresh.swap(false, .acq_rel)) return true;
-        const remaining = interval_ms - waited;
-        const sleep_ms = @min(remaining, quantum_ms);
-        sleepMs(io, st, sleep_ms);
-        waited += sleep_ms;
-    }
-    return false;
+fn wakeUi(ctx: *PollCtx) void {
+    _ = PostMessageW(ctx.hwnd, WM_BATTERY_UPDATE, 0, 0);
 }
 
 comptime {
-    if (builtin.os.tag != .windows) @compileError("tray.zig is Windows-only");
+    if (builtin.os.tag != .windows) @compileError("tray_windows.zig is Windows-only");
 }
