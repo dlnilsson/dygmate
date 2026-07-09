@@ -9,7 +9,8 @@ Tiny runtime footprint: about 2.4 MB memory usage and very low CPU usage.
 Shows desktop notifications on startup and when either side reaches a low battery level.
 
 <p align="center">
-  <img src="docs/tray.png" alt="Dygmate tray" width="120">
+   <img src="docs/tray.png" alt="Dygmate tray" width="120">
+   <img src="docs/notification.png" alt="Dygmate tray" width="360">
   <img src="docs/context-menu.png" alt="Dygmate context menu" width="360">
 </p>
 
