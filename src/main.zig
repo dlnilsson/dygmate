@@ -163,4 +163,5 @@ test {
     _ = @import("focus.zig");
     _ = @import("battery.zig");
     _ = @import("device.zig");
+    _ = @import("layer.zig");
 }

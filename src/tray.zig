@@ -10,6 +10,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const focus = @import("focus.zig");
 const battery = @import("battery.zig");
+const layer = @import("layer.zig");
 const device = @import("device.zig");
 const windows = std.os.windows;
 
@@ -32,6 +33,7 @@ const HDC = *opaque {};
 const HBITMAP = *opaque {};
 const HFONT = *opaque {};
 const HBRUSH = *opaque {};
+const HPEN = *opaque {};
 const HCURSOR = HICON;
 const HGDIOBJ = *anyopaque;
 
@@ -39,6 +41,14 @@ const WNDPROC = *const fn (HWND, UINT, WPARAM, LPARAM) callconv(.winapi) LRESULT
 
 const POINT = extern struct { x: i32, y: i32 };
 const RECT = extern struct { left: i32, top: i32, right: i32, bottom: i32 };
+const PAINTSTRUCT = extern struct {
+    hdc: HDC,
+    fErase: BOOL,
+    rcPaint: RECT,
+    fRestore: BOOL,
+    fIncUpdate: BOOL,
+    rgbReserved: [32]u8,
+};
 
 const MSG = extern struct {
     hwnd: ?HWND,
@@ -118,6 +128,8 @@ extern "user32" fn TranslateMessage(lpMsg: *const MSG) callconv(.winapi) BOOL;
 extern "user32" fn DispatchMessageW(lpMsg: *const MSG) callconv(.winapi) LRESULT;
 extern "user32" fn PostQuitMessage(nExitCode: i32) callconv(.winapi) void;
 extern "user32" fn PostMessageW(hWnd: ?HWND, Msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.winapi) BOOL;
+extern "user32" fn BeginPaint(hWnd: HWND, lpPaint: *PAINTSTRUCT) callconv(.winapi) HDC;
+extern "user32" fn EndPaint(hWnd: HWND, lpPaint: *const PAINTSTRUCT) callconv(.winapi) BOOL;
 extern "user32" fn CreatePopupMenu() callconv(.winapi) ?HMENU;
 extern "user32" fn AppendMenuW(hMenu: HMENU, uFlags: UINT, uIDNewItem: usize, lpNewItem: ?[*:0]const u16) callconv(.winapi) BOOL;
 extern "user32" fn TrackPopupMenu(hMenu: HMENU, uFlags: UINT, x: i32, y: i32, nReserved: i32, hWnd: HWND, prcRect: ?*const RECT) callconv(.winapi) i32;
@@ -131,6 +143,16 @@ extern "user32" fn DrawTextW(hdc: HDC, lpchText: [*]const u16, cchText: i32, lpr
 extern "user32" fn FillRect(hDC: HDC, lprc: *const RECT, hbr: HBRUSH) callconv(.winapi) i32;
 extern "user32" fn GetDC(hWnd: ?HWND) callconv(.winapi) ?HDC;
 extern "user32" fn ReleaseDC(hWnd: ?HWND, hDC: HDC) callconv(.winapi) i32;
+extern "user32" fn GetClientRect(hWnd: HWND, lpRect: *RECT) callconv(.winapi) BOOL;
+extern "user32" fn InvalidateRect(hWnd: HWND, lpRect: ?*const RECT, bErase: BOOL) callconv(.winapi) BOOL;
+extern "user32" fn SetLayeredWindowAttributes(hwnd: HWND, crKey: COLORREF, bAlpha: u8, dwFlags: DWORD) callconv(.winapi) BOOL;
+extern "user32" fn SetTimer(hWnd: ?HWND, nIDEvent: usize, uElapse: UINT, lpTimerFunc: ?*const anyopaque) callconv(.winapi) usize;
+extern "user32" fn KillTimer(hWnd: ?HWND, uIDEvent: usize) callconv(.winapi) BOOL;
+extern "user32" fn ShowWindow(hWnd: HWND, nCmdShow: i32) callconv(.winapi) BOOL;
+extern "user32" fn UpdateWindow(hWnd: HWND) callconv(.winapi) BOOL;
+extern "user32" fn SetWindowPos(hWnd: HWND, hWndInsertAfter: ?HWND, X: i32, Y: i32, cx: i32, cy: i32, uFlags: UINT) callconv(.winapi) BOOL;
+extern "user32" fn SetBkColor(hdc: HDC, color: COLORREF) callconv(.winapi) COLORREF;
+extern "user32" fn SystemParametersInfoW(uiAction: UINT, uiParam: UINT, pvParam: ?*anyopaque, fWinIni: UINT) callconv(.winapi) BOOL;
 
 extern "gdi32" fn CreateCompatibleDC(hdc: ?HDC) callconv(.winapi) ?HDC;
 extern "gdi32" fn DeleteDC(hdc: HDC) callconv(.winapi) BOOL;
@@ -141,6 +163,8 @@ extern "gdi32" fn DeleteObject(ho: HGDIOBJ) callconv(.winapi) BOOL;
 extern "gdi32" fn SetBkMode(hdc: HDC, mode: i32) callconv(.winapi) i32;
 extern "gdi32" fn SetTextColor(hdc: HDC, color: COLORREF) callconv(.winapi) COLORREF;
 extern "gdi32" fn CreateSolidBrush(color: COLORREF) callconv(.winapi) ?HBRUSH;
+extern "gdi32" fn CreatePen(iStyle: i32, cWidth: i32, color: COLORREF) callconv(.winapi) ?HPEN;
+extern "gdi32" fn RoundRect(hdc: HDC, left: i32, top: i32, right: i32, bottom: i32, width: i32, height: i32) callconv(.winapi) BOOL;
 extern "gdi32" fn CreateFontW(
     cHeight: i32,
     cWidth: i32,
@@ -169,9 +193,13 @@ const WM_TRAYICON: UINT = WM_APP + 1;
 const WM_BATTERY_UPDATE: UINT = WM_APP + 2;
 const WM_NULL: UINT = 0x0000;
 const WM_DESTROY: UINT = 0x0002;
+const WM_PAINT: UINT = 0x000F;
+const WM_TIMER: UINT = 0x0113;
 const WM_CONTEXTMENU: u16 = 0x007B;
 const WM_RBUTTONUP: u16 = 0x0205;
 const WM_LBUTTONDBLCLK: u16 = 0x0203;
+const WM_ERASEBKGND: UINT = 0x0014;
+const WM_MOUSEACTIVATE: UINT = 0x0021;
 
 const NIM_ADD: DWORD = 0;
 const NIM_MODIFY: DWORD = 1;
@@ -190,6 +218,7 @@ const NIIF_WARNING: DWORD = 0x02;
 
 const MF_STRING: UINT = 0x0000;
 const MF_GRAYED: UINT = 0x0001; // disabled + dimmed (non-selectable label)
+const MF_CHECKED: UINT = 0x0008; // checkmark next to the item
 const MF_SEPARATOR: UINT = 0x0800;
 const MF_BYCOMMAND: UINT = 0x0000;
 const TPM_RIGHTBUTTON: UINT = 0x0002;
@@ -200,14 +229,34 @@ const DT_VCENTER: UINT = 0x04;
 const DT_SINGLELINE: UINT = 0x20;
 const DT_NOCLIP: UINT = 0x100;
 const TRANSPARENT: i32 = 1;
+const WS_POPUP: DWORD = 0x80000000;
 const WS_OVERLAPPED: DWORD = 0x00000000;
+const WS_EX_TOPMOST: DWORD = 0x00000008;
+const WS_EX_TRANSPARENT: DWORD = 0x00000020;
+const WS_EX_TOOLWINDOW: DWORD = 0x00000080;
+const WS_EX_LAYERED: DWORD = 0x00080000;
+const WS_EX_NOACTIVATE: DWORD = 0x08000000;
+const LWA_COLORKEY: DWORD = 0x00000001;
+const LWA_ALPHA: DWORD = 0x00000002;
+const SW_HIDE: i32 = 0;
+const SW_SHOWNOACTIVATE: i32 = 4;
+const SWP_NOACTIVATE: UINT = 0x0010;
+const SWP_SHOWWINDOW: UINT = 0x0040;
+const SPI_GETWORKAREA: UINT = 0x0030;
+const HWND_TOPMOST: HWND = @ptrFromInt(std.math.maxInt(usize));
+const HTTRANSPARENT: LRESULT = -1;
+const MA_NOACTIVATE: LRESULT = 3;
 const IDC_ARROW: usize = 32512;
 const DEFAULT_CHARSET: DWORD = 1;
 const FW_BOLD: i32 = 700;
+const CLEARTYPE_QUALITY: DWORD = 5;
+const PS_SOLID: i32 = 0;
 
 const ID_REFRESH: i32 = 1;
 const ID_QUIT: i32 = 2;
 const ID_TOGGLE: i32 = 3;
+const ID_OSD_TOGGLE: i32 = 4;
+const ID_OSD_HIDE: usize = 1;
 
 const icon_size: i32 = 16;
 const low_threshold: u8 = 20;
@@ -218,6 +267,12 @@ const low_threshold: u8 = 20;
 // reads that follow. Plain reads hit the USB-powered neuron only — they never
 // wake the sides or wear flash, so a tight interval is cheap.
 const poll_interval_ms: u64 = 5 * 1000;
+const layer_poll_interval_ms: u64 = 250;
+const osd_duration_ms: UINT = 900;
+const osd_width: i32 = 156;
+const osd_height: i32 = 56;
+const osd_bottom_margin: i32 = 124;
+const osd_alpha: u8 = 235;
 
 // Status colors, COLORREF (0x00BBGGRR).
 fn rgb(r: u8, g: u8, b: u8) COLORREF {
@@ -228,6 +283,9 @@ const col_amber = rgb(200, 140, 0);
 const col_red = rgb(220, 50, 47);
 const col_blue = rgb(41, 128, 185);
 const col_gray = rgb(110, 110, 110);
+const col_osd_transparent = rgb(255, 0, 255);
+const col_osd_bg = rgb(18, 20, 24);
+const col_osd_border = rgb(92, 101, 116);
 const col_text = rgb(255, 255, 255);
 
 const ERROR_ALREADY_EXISTS: DWORD = 183;
@@ -237,10 +295,13 @@ const notification_title_battery = "Dygma Defy battery level";
 const notification_title_low = "Dygma Defy battery low";
 
 const class_name = std.unicode.utf8ToUtf16LeStringLiteral("DygmaBatteryTrayWnd");
+const osd_class_name = std.unicode.utf8ToUtf16LeStringLiteral("DygmaBatteryOsdWnd");
 const window_title = std.unicode.utf8ToUtf16LeStringLiteral("dygma-battery");
+const osd_window_title = std.unicode.utf8ToUtf16LeStringLiteral("dygma layer");
 const menu_refresh = std.unicode.utf8ToUtf16LeStringLiteral("Refresh battery now");
 const menu_disconnect = std.unicode.utf8ToUtf16LeStringLiteral("Disconnect (release port for Bazecor)");
 const menu_reconnect = std.unicode.utf8ToUtf16LeStringLiteral("Reconnect");
+const menu_osd = std.unicode.utf8ToUtf16LeStringLiteral("Show layer overlay");
 const menu_quit = std.unicode.utf8ToUtf16LeStringLiteral("Quit");
 
 // ---------------------------------------------------------------------------
@@ -256,6 +317,10 @@ const State = struct {
     /// User asked us to release the port (so Bazecor can use it). The poll
     /// thread closes the connection and idles until this clears.
     paused: std.atomic.Value(bool) = .init(false),
+    layer_change: std.atomic.Value(i32) = .init(-1),
+    /// When false, the poll thread skips the layer read and the UI thread
+    /// suppresses the OSD. Toggled from the tray menu; defaults on.
+    osd_enabled: std.atomic.Value(bool) = .init(true),
     /// UI-thread-only: latched per side (0=left, 1=right) so a low-battery
     /// balloon fires once per crossing, not every poll.
     notified_low: [2]bool = .{ false, false },
@@ -270,6 +335,9 @@ const PollCtx = struct {
 
 var g_state: State = .{};
 var g_nid: NOTIFYICONDATAW = undefined;
+var g_osd_hwnd: ?HWND = null;
+var g_osd_text: [32]u16 = [_]u16{0} ** 32;
+var g_osd_text_len: usize = 0;
 /// The process Io, shared by the UI and polling threads (Threaded io is
 /// thread-safe). Stashed globally so the UI thread can lock the state mutex.
 var g_io: std.Io = undefined;
@@ -302,9 +370,32 @@ pub fn main(init: std.process.Init) void {
     wc.lpszClassName = class_name;
     _ = RegisterClassExW(&wc);
 
+    var osd_wc = std.mem.zeroes(WNDCLASSEXW);
+    osd_wc.cbSize = @sizeOf(WNDCLASSEXW);
+    osd_wc.lpfnWndProc = osdWndProc;
+    osd_wc.hInstance = hinst;
+    osd_wc.hCursor = LoadCursorW(null, @ptrFromInt(IDC_ARROW));
+    osd_wc.lpszClassName = osd_class_name;
+    _ = RegisterClassExW(&osd_wc);
+
     // A normal (never-shown) window rather than message-only, so
     // SetForegroundWindow works and the context menu dismisses on click-away.
     const hwnd = CreateWindowExW(0, class_name, window_title, WS_OVERLAPPED, 0, 0, 0, 0, null, null, hinst, null) orelse return;
+    g_osd_hwnd = CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
+        osd_class_name,
+        osd_window_title,
+        WS_POPUP,
+        0,
+        0,
+        osd_width,
+        osd_height,
+        hwnd,
+        null,
+        hinst,
+        null,
+    );
+    if (g_osd_hwnd) |osd| _ = SetLayeredWindowAttributes(osd, col_osd_transparent, osd_alpha, LWA_ALPHA | LWA_COLORKEY);
 
     g_nid = std.mem.zeroes(NOTIFYICONDATAW);
     g_nid.cbSize = @sizeOf(NOTIFYICONDATAW);
@@ -352,6 +443,7 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
         },
         WM_BATTERY_UPDATE => {
             updateTray();
+            drainLayerChanges();
             return 0;
         },
         WM_DESTROY => {
@@ -359,6 +451,25 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
             PostQuitMessage(0);
             return 0;
         },
+        else => return DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+fn osdWndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.winapi) LRESULT {
+    switch (msg) {
+        WM_PAINT => {
+            paintOsd(hwnd);
+            return 0;
+        },
+        WM_TIMER => {
+            if (wparam == ID_OSD_HIDE) {
+                _ = KillTimer(hwnd, ID_OSD_HIDE);
+                _ = ShowWindow(hwnd, SW_HIDE);
+            }
+            return 0;
+        },
+        WM_ERASEBKGND => return 1,
+        WM_MOUSEACTIVATE => return MA_NOACTIVATE,
         else => return DefWindowProcW(hwnd, msg, wparam, lparam),
     }
 }
@@ -392,6 +503,9 @@ fn showMenu(hwnd: HWND) void {
 
     _ = AppendMenuW(menu, MF_STRING, @intCast(ID_REFRESH), menu_refresh);
     _ = AppendMenuW(menu, MF_STRING, @intCast(ID_TOGGLE), if (paused) menu_reconnect else menu_disconnect);
+    var osd_flags: UINT = MF_STRING;
+    if (g_state.osd_enabled.load(.acquire)) osd_flags |= MF_CHECKED;
+    _ = AppendMenuW(menu, osd_flags, @intCast(ID_OSD_TOGGLE), menu_osd);
     _ = AppendMenuW(menu, MF_STRING, @intCast(ID_QUIT), menu_quit);
     // Bold "Refresh battery now" as the default (also the double-click action).
     _ = SetMenuDefaultItem(menu, @intCast(ID_REFRESH), MF_BYCOMMAND);
@@ -405,6 +519,19 @@ fn showMenu(hwnd: HWND) void {
 
     switch (cmd) {
         ID_REFRESH => g_state.refresh.store(true, .release),
+        ID_OSD_TOGGLE => {
+            const now_on = !g_state.osd_enabled.load(.acquire);
+            g_state.osd_enabled.store(now_on, .release);
+            // Turning it off: drop any queued change and hide a live OSD so
+            // nothing lingers or pops after the user opts out.
+            if (!now_on) {
+                g_state.layer_change.store(-1, .release);
+                if (g_osd_hwnd) |osd| {
+                    _ = KillTimer(osd, ID_OSD_HIDE);
+                    _ = ShowWindow(osd, SW_HIDE);
+                }
+            }
+        },
         ID_TOGGLE => {
             const now_paused = !paused;
             g_state.paused.store(now_paused, .release);
@@ -644,6 +771,69 @@ fn showBalloon(title: []const u8, text: []const u8, flags: DWORD) void {
     g_nid.uFlags = NIF_ICON | NIF_TIP | NIF_SHOWTIP; // restore for the next icon/tip update
 }
 
+fn drainLayerChanges() void {
+    const layer_idx = g_state.layer_change.swap(-1, .acq_rel);
+    if (layer_idx < 0) return;
+    if (!g_state.osd_enabled.load(.acquire)) return;
+    showLayerOsd(@intCast(layer_idx));
+}
+
+fn showLayerOsd(layer_idx: u8) void {
+    const hwnd = g_osd_hwnd orelse return;
+
+    var label_buf: [16]u8 = undefined;
+    const label = std.fmt.bufPrint(&label_buf, "Layer {d}", .{layer.displayNumber(layer_idx)}) catch return;
+    g_osd_text_len = std.unicode.utf8ToUtf16Le(g_osd_text[0 .. g_osd_text.len - 1], label) catch return;
+    g_osd_text[g_osd_text_len] = 0;
+
+    var work = RECT{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+    const work_ptr: *anyopaque = @ptrCast(&work);
+    if (SystemParametersInfoW(SPI_GETWORKAREA, 0, work_ptr, 0) == .FALSE) {
+        work = .{ .left = 0, .top = 0, .right = 1920, .bottom = 1080 };
+    }
+    const x = work.left + @divTrunc((work.right - work.left) - osd_width, 2);
+    const y = work.bottom - osd_height - osd_bottom_margin;
+
+    _ = SetWindowPos(hwnd, HWND_TOPMOST, x, y, osd_width, osd_height, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    _ = InvalidateRect(hwnd, null, .TRUE);
+    _ = UpdateWindow(hwnd);
+    _ = KillTimer(hwnd, ID_OSD_HIDE);
+    _ = SetTimer(hwnd, ID_OSD_HIDE, osd_duration_ms, null);
+}
+
+fn paintOsd(hwnd: HWND) void {
+    var ps: PAINTSTRUCT = undefined;
+    const hdc = BeginPaint(hwnd, &ps);
+    defer _ = EndPaint(hwnd, &ps);
+
+    var rect: RECT = undefined;
+    if (GetClientRect(hwnd, &rect) == .FALSE) return;
+
+    if (CreateSolidBrush(col_osd_bg)) |brush| {
+        const prev_brush = SelectObject(hdc, @ptrCast(brush));
+        const pen = CreatePen(PS_SOLID, 2, col_osd_border);
+        const prev_pen = if (pen) |p| SelectObject(hdc, @ptrCast(p)) else null;
+        _ = RoundRect(hdc, 1, 1, osd_width - 1, osd_height - 1, 18, 18);
+        if (prev_pen) |pp| _ = SelectObject(hdc, pp);
+        if (pen) |p| _ = DeleteObject(@ptrCast(p));
+        if (prev_brush) |pb| _ = SelectObject(hdc, pb);
+        _ = DeleteObject(@ptrCast(brush));
+    }
+
+    _ = SetBkColor(hdc, col_osd_bg);
+    const font = CreateFontW(-22, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, null);
+    const prev_font = if (font) |f| SelectObject(hdc, @ptrCast(f)) else null;
+    _ = SetBkMode(hdc, TRANSPARENT);
+    _ = SetTextColor(hdc, col_text);
+    var text_rect = RECT{ .left = 18, .top = 4, .right = osd_width - 18, .bottom = osd_height - 4 };
+    _ = DrawTextW(hdc, &g_osd_text, @intCast(g_osd_text_len), &text_rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    if (font) |f| {
+        if (prev_font) |pf| _ = SelectObject(hdc, pf);
+        _ = DeleteObject(@ptrCast(f));
+    }
+}
+
 /// Render `text` centered on a solid `color` 16x16 icon. Caller owns the
 /// returned HICON (DestroyIcon). Returns null on any GDI failure.
 fn makeTextIcon(text: []const u8, color: COLORREF) ?HICON {
@@ -710,6 +900,7 @@ fn pollLoop(ctx: *PollCtx) void {
     while (!st.stop.load(.acquire)) {
         // PAUSED: hold no port so Bazecor can use it; idle until resumed.
         if (st.paused.load(.acquire)) {
+            resetLayerState(st);
             setConnected(ctx, false);
             sleepMs(io, st, 300);
             continue;
@@ -717,6 +908,7 @@ fn pollLoop(ctx: *PollCtx) void {
 
         // DISCOVER
         const path = (device.findDygmaPort(io, ctx.gpa) catch null) orelse {
+            resetLayerState(st);
             setConnected(ctx, false);
             sleepMs(io, st, 3000);
             continue;
@@ -725,11 +917,14 @@ fn pollLoop(ctx: *PollCtx) void {
 
         // CONNECT
         var dev = focus.Focus.open(io, path) catch {
+            resetLayerState(st);
             setConnected(ctx, false);
             sleepMs(io, st, 3000);
             continue;
         };
         defer dev.close();
+        var last_layer: ?u8 = null;
+        var battery_elapsed_ms: u64 = poll_interval_ms;
 
         // POLL. No forceRead on connect: the neuron serves cached values on a
         // plain read, and forcing a re-poll every cycle blanks them mid-refresh
@@ -738,29 +933,61 @@ fn pollLoop(ctx: *PollCtx) void {
         while (!st.stop.load(.acquire)) {
             // User asked to release the port: close and drop back to idle.
             if (st.paused.load(.acquire)) {
+                resetLayerState(st);
                 setConnected(ctx, false);
                 break;
             }
-            const r = battery.read(&dev) catch {
-                setConnected(ctx, false);
-                break;
-            };
-            st.mutex.lockUncancelable(g_io);
-            const announce_connection = !st.connected;
-            st.reading = r;
-            st.connected = true;
-            if (announce_connection) st.announce_connection = true;
-            st.mutex.unlock(g_io);
-            _ = PostMessageW(ctx.hwnd, WM_BATTERY_UPDATE, 0, 0);
+            var should_post = false;
+            if (battery_elapsed_ms >= poll_interval_ms) {
+                const r = battery.read(&dev) catch {
+                    resetLayerState(st);
+                    setConnected(ctx, false);
+                    break;
+                };
+                st.mutex.lockUncancelable(g_io);
+                const announce_connection = !st.connected;
+                st.reading = r;
+                st.connected = true;
+                if (announce_connection) st.announce_connection = true;
+                st.mutex.unlock(g_io);
+                battery_elapsed_ms = 0;
+                should_post = true;
+            }
+
+            if (st.osd_enabled.load(.acquire)) {
+                const active_layer = layer.readActive(&dev) catch {
+                    resetLayerState(st);
+                    setConnected(ctx, false);
+                    break;
+                };
+                if (active_layer) |idx| {
+                    if (last_layer) |prev| {
+                        if (idx != prev) {
+                            st.layer_change.store(idx, .release);
+                            should_post = true;
+                        }
+                    }
+                    last_layer = idx;
+                }
+            } else {
+                // OSD off: skip the layer read entirely, and forget the last
+                // layer so re-enabling seeds silently (show on change only).
+                last_layer = null;
+            }
+
+            if (should_post) _ = PostMessageW(ctx.hwnd, WM_BATTERY_UPDATE, 0, 0);
 
             // Wait out the interval, staying responsive to stop/refresh/pause.
             // A user refresh (menu "Refresh battery now" or double-click) wakes
             // us early: forceRead to re-poll the sides over RF, let it settle,
             // then loop to re-read the freshly-updated cached values.
-            const refreshed = waitForNextPoll(io, st, poll_interval_ms);
+            const refreshed = waitForNextPoll(io, st, layer_poll_interval_ms);
             if (refreshed) {
                 battery.forceRead(&dev);
                 sleepMs(io, st, battery.force_read_settle_s * 1000);
+                battery_elapsed_ms = poll_interval_ms;
+            } else {
+                battery_elapsed_ms += layer_poll_interval_ms;
             }
         }
     }
@@ -777,6 +1004,10 @@ fn setConnected(ctx: *PollCtx, connected: bool) void {
     }
     st.mutex.unlock(g_io);
     if (changed) _ = PostMessageW(ctx.hwnd, WM_BATTERY_UPDATE, 0, 0);
+}
+
+fn resetLayerState(st: *State) void {
+    st.layer_change.store(-1, .release);
 }
 
 fn sleepMs(io: std.Io, st: *State, ms: u64) void {

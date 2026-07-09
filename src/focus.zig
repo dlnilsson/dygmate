@@ -120,7 +120,8 @@ pub fn isReadOnlyCommand(cmd: []const u8) bool {
         std.mem.eql(u8, cmd, "wireless.battery.left.status") or
         std.mem.eql(u8, cmd, "wireless.battery.right.level") or
         std.mem.eql(u8, cmd, "wireless.battery.right.status") or
-        std.mem.eql(u8, cmd, "wireless.battery.forceRead");
+        std.mem.eql(u8, cmd, "wireless.battery.forceRead") or
+        std.mem.eql(u8, cmd, "layer.state");
 }
 
 /// Incremental splitter for the response byte stream. Read into
@@ -250,17 +251,23 @@ test "scanner: compact reclaims consumed space" {
     try std.testing.expectEqual(s.buf.len, s.freeSpace().len);
 }
 
-test "isReadOnlyCommand only allows battery read commands" {
+test "isReadOnlyCommand only allows known read commands" {
     try std.testing.expect(isReadOnlyCommand("wireless.battery.left.level"));
     try std.testing.expect(isReadOnlyCommand("wireless.battery.left.status"));
     try std.testing.expect(isReadOnlyCommand("wireless.battery.right.level"));
     try std.testing.expect(isReadOnlyCommand("wireless.battery.right.status"));
     try std.testing.expect(isReadOnlyCommand("wireless.battery.forceRead"));
+    try std.testing.expect(isReadOnlyCommand("layer.state"));
 
     try std.testing.expect(!isReadOnlyCommand("wireless.battery.savingMode"));
     try std.testing.expect(!isReadOnlyCommand("wireless.battery.savingMode 1"));
     try std.testing.expect(!isReadOnlyCommand("wireless.battery.left.level "));
     try std.testing.expect(!isReadOnlyCommand("wireless.battery.left.level\t1"));
     try std.testing.expect(!isReadOnlyCommand("wireless.battery.left.level\nwireless.battery.savingMode 1"));
+    try std.testing.expect(!isReadOnlyCommand("layer.state "));
+    // `layer.state` with arguments is a setter: it rewrites the active layers.
+    try std.testing.expect(!isReadOnlyCommand("layer.state 1 0 0"));
+    // Bare layer.isActive is useless (empty reply) — keep it off the safelist.
+    try std.testing.expect(!isReadOnlyCommand("layer.isActive"));
     try std.testing.expect(!isReadOnlyCommand("keymap.custom"));
 }

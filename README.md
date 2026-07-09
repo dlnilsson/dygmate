@@ -57,6 +57,8 @@ icon shows the **lower** of the two sides' battery percentage, colored by
 level (green ≥ 50, amber ≥ 20, red below, blue while charging). Hover for a
 tooltip with both sides in full; right-click for **Refresh now** /
 **Disconnect** / **Quit**; double-click to force an immediate re-read.
+When the active keyboard layer changes, a centered translucent OSD briefly
+shows the user-facing layer number.
 Startup and reconnect show a desktop notification with the current battery
 status once both sides have numeric battery levels. If either side reports
 `?`, the tray retries with capped exponential backoff instead of showing a
@@ -84,7 +86,7 @@ makes a second copy pointless). New tray icons default to Windows' hidden
 - **Flash wear**: Focus commands with an argument (`<command> <data>`)
   are setters that write the keyboard's flash memory, which has a finite
   write lifespan. This tool only ever sends bare read commands, and the
-  transport layer rejects anything outside its read-only battery command
+  transport layer rejects anything outside its read-only battery/layer command
   safelist.
 - **Poll cadence**: the default cadence is adaptive based on the lower valid
   side percentage: 15 min below 50% or when unreadable, 30 min at 50%+,
