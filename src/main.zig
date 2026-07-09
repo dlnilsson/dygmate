@@ -7,7 +7,7 @@ const device = @import("device.zig");
 const rescan_delay_s = 3;
 
 const usage =
-    \\Usage: dygma-battery [options]
+    \\Usage: dygmate [options]
     \\
     \\Reports battery level and charging status of both halves of a
     \\Dygma Defy wireless keyboard. Close Bazecor first: the serial
@@ -58,7 +58,7 @@ pub fn main(init: std.process.Init) !u8 {
             if (opts.port) |p| break :blk try device.normalizePortPath(alloc, p);
             if (device.findDygmaPort(io, alloc) catch null) |p| break :blk p;
             if (opts.once) {
-                std.debug.print("dygma-battery: no Dygma Defy wireless (35EF:0012) serial port found\n", .{});
+                std.debug.print("dygmate: no Dygma Defy wireless (35EF:0012) serial port found\n", .{});
                 return 1;
             }
             std.debug.print("waiting for keyboard (no 35EF:0012 serial port found), rescanning in 3s...\n", .{});
@@ -70,11 +70,11 @@ pub fn main(init: std.process.Init) !u8 {
         // CONNECT
         var dev = focus.Focus.open(io, path) catch |err| {
             const hint: []const u8 = if (err == error.AccessDenied or err == error.PermissionDenied)
-                " (port busy: close Bazecor or another dygma-battery instance)"
+                " (port busy: close Bazecor or another dygmate instance)"
             else
                 "";
             if (opts.once) {
-                std.debug.print("dygma-battery: failed to open {s}: {s}{s}\n", .{ path, @errorName(err), hint });
+                std.debug.print("dygmate: failed to open {s}: {s}{s}\n", .{ path, @errorName(err), hint });
                 return 1;
             }
             std.debug.print("failed to open {s} ({s}){s}, retrying in 3s...\n", .{ path, @errorName(err), hint });
@@ -90,7 +90,7 @@ pub fn main(init: std.process.Init) !u8 {
         while (true) {
             const reading = battery.read(&dev) catch |err| {
                 if (opts.once) {
-                    std.debug.print("dygma-battery: communication failed: {s}\n", .{@errorName(err)});
+                    std.debug.print("dygmate: communication failed: {s}\n", .{@errorName(err)});
                     return 1;
                 }
                 std.debug.print("connection lost ({s}), rescanning...\n", .{@errorName(err)});

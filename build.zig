@@ -7,9 +7,9 @@ pub fn build(b: *std.Build) void {
     const serial_dep = b.dependency("serial", .{});
     const serial_mod = serial_dep.module("serial");
 
-    // CLI: dygma-battery
+    // CLI: dygmate
     const exe = b.addExecutable(.{
-        .name = "dygma-battery",
+        .name = "dygmate",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
@@ -24,13 +24,13 @@ pub fn build(b: *std.Build) void {
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_cmd.addArgs(args);
-    const run_step = b.step("run", "Run dygma-battery");
+    const run_step = b.step("run", "Run dygmate");
     run_step.dependOn(&run_cmd.step);
 
-    // Tray app: dygma-battery-tray (Windows only, GUI subsystem — no console).
+    // Tray app: dygmate-tray (Windows only, GUI subsystem — no console).
     if (target.result.os.tag == .windows) {
         const tray = b.addExecutable(.{
-            .name = "dygma-battery-tray",
+            .name = "dygmate-tray",
             .root_module = b.createModule(.{
                 .root_source_file = b.path("src/tray.zig"),
                 .target = target,
@@ -48,7 +48,7 @@ pub fn build(b: *std.Build) void {
 
         const run_tray = b.addRunArtifact(tray);
         run_tray.step.dependOn(b.getInstallStep());
-        const run_tray_step = b.step("run-tray", "Run dygma-battery-tray");
+        const run_tray_step = b.step("run-tray", "Run dygmate-tray");
         run_tray_step.dependOn(&run_tray.step);
     }
 

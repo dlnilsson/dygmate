@@ -297,7 +297,7 @@ const notification_title_low = "Dygma Defy battery low";
 
 const class_name = std.unicode.utf8ToUtf16LeStringLiteral("DygmaBatteryTrayWnd");
 const osd_class_name = std.unicode.utf8ToUtf16LeStringLiteral("DygmaBatteryOsdWnd");
-const window_title = std.unicode.utf8ToUtf16LeStringLiteral("dygma-battery");
+const window_title = std.unicode.utf8ToUtf16LeStringLiteral("dygmate");
 const osd_window_title = std.unicode.utf8ToUtf16LeStringLiteral("dygma layer");
 const menu_refresh = std.unicode.utf8ToUtf16LeStringLiteral("Refresh battery now");
 const menu_disconnect = std.unicode.utf8ToUtf16LeStringLiteral("Disconnect (release port for Bazecor)");
@@ -405,7 +405,7 @@ pub fn main(init: std.process.Init) void {
     g_nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
     g_nid.uCallbackMessage = WM_TRAYICON;
     g_nid.hIcon = makeTextIcon("--", col_gray);
-    setUtf16(g_nid.szTip[0..], "dygma-battery: starting\u{2026}");
+    setUtf16(g_nid.szTip[0..], "dygmate: starting\u{2026}");
     _ = Shell_NotifyIconW(NIM_ADD, &g_nid);
     g_nid.uVersion = NOTIFYICON_VERSION_4;
     _ = Shell_NotifyIconW(NIM_SETVERSION, &g_nid);
@@ -615,7 +615,7 @@ fn updateTray() void {
             header,
             fmtKnownSide(&lb, g_last_left),
             fmtKnownSide(&rb, g_last_right),
-        }) catch "dygma-battery";
+        }) catch "dygmate";
         setUtf16(g_nid.szTip[0..], tip);
     }
 
