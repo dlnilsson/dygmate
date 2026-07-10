@@ -930,7 +930,11 @@ fn menuEvent(app: *App, msg: dbus.Message) !void {
 /// EventGroup(events a(isvu)) -> (idErrors ai). Waybar's libdbusmenu client
 /// delivers menu clicks through this batched form, never plain Event.
 fn menuEventGroup(app: *App, msg: dbus.Message) !void {
-    try applyEventGroup(app, msg.body);
+    applyEventGroup(app, msg.body) catch {
+        // Reply something: a swallowed parse error would leave the caller
+        // waiting for its timeout.
+        return app.conn.replyError(msg, "org.freedesktop.DBus.Error.InvalidArgs", "malformed event group");
+    };
     var body = std.ArrayList(u8).empty;
     defer body.deinit(app.gpa);
     var w = dbus.Writer.init(&body, app.gpa);
@@ -943,6 +947,7 @@ fn menuEventGroup(app: *App, msg: dbus.Message) !void {
 fn applyEventGroup(app: *App, body: []const u8) !void {
     var r = dbus.Reader{ .data = body };
     const end = try r.arrayEnd(8);
+    if (end > body.len) return error.Malformed;
     while (r.pos < end) {
         r.readAlign(8); // struct boundary
         const id = @as(i32, @bitCast(try r.uint32()));
@@ -969,7 +974,10 @@ fn skipVariant(r: *dbus.Reader) !void {
 }
 
 fn applyClicked(app: *App, id: i32) void {
-    switch (@as(MenuId, @enumFromInt(id))) {
+    // A host is free to send any id; an out-of-range @enumFromInt would be
+    // safety-checked illegal behavior, so reject unknown ids explicitly.
+    const menu_id = std.enums.fromInt(MenuId, id) orelse return;
+    switch (menu_id) {
         .refresh => app.state.refresh.store(true, .release),
         .toggle => {
             const now_paused = !app.state.paused.load(.acquire);
@@ -1140,6 +1148,67 @@ test "EventGroup with two events applies both" {
     try applyEventGroup(&app, body.items);
     try std.testing.expect(state.refresh.load(.acquire));
     try std.testing.expect(state.paused.load(.acquire));
+}
+
+test "EventGroup with a truncated body errors instead of misreading" {
+    var state: tray_common.State = .{};
+    var app = App{
+        .io = undefined,
+        .gpa = undefined,
+        .conn = undefined,
+        .environ = undefined,
+        .state = &state,
+        .event_fd = -1,
+        .item_name = "",
+    };
+
+    var body = std.ArrayList(u8).empty;
+    defer body.deinit(std.testing.allocator);
+    var w = dbus.Writer.init(&body, std.testing.allocator);
+    const tok = try w.beginArray(8);
+    try w.beginStruct();
+    try w.int32(@intFromEnum(MenuId.toggle));
+    try w.string("clicked");
+    try w.signature("i");
+    try w.int32(0);
+    try w.uint32(1);
+    w.endArray(tok);
+
+    // Cut the marshalled batch short: the declared array length now points
+    // past the available bytes.
+    const truncated = body.items[0 .. body.items.len - 6];
+    try std.testing.expectError(error.Malformed, applyEventGroup(&app, truncated));
+    try std.testing.expect(!state.paused.load(.acquire));
+}
+
+test "EventGroup with an unknown menu id is ignored without crashing" {
+    var state: tray_common.State = .{};
+    var app = App{
+        .io = undefined,
+        .gpa = undefined,
+        .conn = undefined,
+        .environ = undefined,
+        .state = &state,
+        .event_fd = -1,
+        .item_name = "",
+    };
+
+    var body = std.ArrayList(u8).empty;
+    defer body.deinit(std.testing.allocator);
+    var w = dbus.Writer.init(&body, std.testing.allocator);
+    const tok = try w.beginArray(8);
+    try w.beginStruct();
+    try w.int32(99);
+    try w.string("clicked");
+    try w.signature("i");
+    try w.int32(0);
+    try w.uint32(1);
+    w.endArray(tok);
+
+    try applyEventGroup(&app, body.items);
+    try std.testing.expect(!state.paused.load(.acquire));
+    try std.testing.expect(!state.refresh.load(.acquire));
+    try std.testing.expect(!state.stop.load(.acquire));
 }
 
 test "missing menu header is exact" {
