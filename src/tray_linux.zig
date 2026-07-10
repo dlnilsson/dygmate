@@ -49,6 +49,7 @@ fn glyph(c: u8) [glyph_h]u8 {
         '8' => .{ 0b111, 0b101, 0b111, 0b101, 0b111 },
         '9' => .{ 0b111, 0b101, 0b111, 0b001, 0b111 },
         '-' => .{ 0b000, 0b000, 0b111, 0b000, 0b000 },
+        '?' => .{ 0b111, 0b001, 0b011, 0b000, 0b010 },
         else => .{ 0, 0, 0, 0, 0 },
     };
 }
@@ -127,7 +128,7 @@ const App = struct {
 
     // Current display snapshot (UI thread only).
     last: tray_common.LastKnown = .{},
-    connected: bool = false,
+    status: tray_common.DeviceStatus = .missing,
     paused: bool = false,
     icon_buf: IconBuf = undefined,
     tip_body: [128]u8 = undefined,
@@ -173,8 +174,12 @@ fn run(init: std.process.Init) !void {
     };
     // deinit the *current* connection (reconnect swaps app.conn).
     defer app.conn.deinit();
-    renderIcon(&app.icon_buf, "--", tray_common.palette.gray);
-    const start_tip = std.fmt.bufPrint(&app.tip_body, "starting\u{2026}", .{}) catch app.tip_body[0..0];
+    renderIcon(&app.icon_buf, "?", tray_common.palette.gray);
+    const start_tip = std.fmt.bufPrint(&app.tip_body, "{s}Left: {s}\nRight: {s}", .{
+        tray_common.tooltipHeader(.missing, false),
+        "no reading yet",
+        "no reading yet",
+    }) catch app.tip_body[0..0];
     app.tip_body_len = start_tip.len;
 
     // Watch the watcher: re-register if waybar (etc.) restarts.
@@ -311,22 +316,25 @@ fn reconnect(app: *App) void {
 fn rebuildAndNotify(app: *App) void {
     app.state.mutex.lockUncancelable(app.io);
     const reading = app.state.reading;
-    const connected = app.state.connected;
+    const status = app.state.status;
     app.state.mutex.unlock(app.io);
     const paused = app.state.paused.load(.acquire);
 
-    if (connected and !paused) {
+    if (tray_common.isLive(status, paused)) {
         if (reading) |r| app.last.merge(r);
     }
-    app.connected = connected;
+    app.status = status;
     app.paused = paused;
 
-    // Icon: lower of the two last-known levels; gray when offline/paused.
-    const live = connected and !paused;
+    // Icon: show '?' only for true USB absence. Available/paused keep the
+    // gray last-known display, with '--' reserved for "no reading yet".
+    const live = tray_common.isLive(status, paused);
     const disp = app.last.display();
-    var num_buf: [4]u8 = undefined;
-    if (disp.level) |lvl| {
-        const txt = std.fmt.bufPrint(&num_buf, "{d}", .{lvl}) catch "?";
+    if (!paused and status == .missing) {
+        renderIcon(&app.icon_buf, "?", tray_common.palette.gray);
+    } else if (disp.level) |lvl| {
+        var num_buf: [4]u8 = undefined;
+        const txt = std.fmt.bufPrint(&num_buf, "{d}", .{lvl}) catch "--";
         renderIcon(&app.icon_buf, txt, tray_common.iconColor(live, lvl, disp.status));
     } else {
         renderIcon(&app.icon_buf, "--", tray_common.palette.gray);
@@ -572,12 +580,7 @@ const MenuItem = struct {
 };
 
 fn buildMenuItems(app: *App, buf: *[3][48]u8) [7]MenuItem {
-    const header: []const u8 = if (app.paused)
-        "Paused (port free for Bazecor)"
-    else if (app.connected)
-        "Connected"
-    else
-        "Not connected";
+    const header = tray_common.menuHeader(app.status, app.paused);
 
     var sb: [24]u8 = undefined;
     const left_label: []const u8 = std.fmt.bufPrint(&buf[0], "Left: {s}", .{tray_common.fmtMenuSide(&sb, app.last.left)}) catch "Left: ?";
@@ -759,4 +762,32 @@ test "renderIcon draws at least one white text pixel for a digit" {
         if (buf[i + 1] == 255 and buf[i + 2] == 255 and buf[i + 3] == 255) found_white = true;
     }
     try std.testing.expect(found_white);
+}
+
+test "renderIcon draws at least one white text pixel for question mark" {
+    var buf: IconBuf = undefined;
+    renderIcon(&buf, "?", tray_common.Rgb{ .r = 110, .g = 110, .b = 110 });
+    var found_white = false;
+    var i: usize = 0;
+    while (i < buf.len) : (i += 4) {
+        if (buf[i + 1] == 255 and buf[i + 2] == 255 and buf[i + 3] == 255) found_white = true;
+    }
+    try std.testing.expect(found_white);
+}
+
+test "missing menu header is exact" {
+    var app = App{
+        .io = undefined,
+        .gpa = undefined,
+        .conn = undefined,
+        .environ = undefined,
+        .state = undefined,
+        .event_fd = -1,
+        .item_name = "",
+    };
+    app.status = .missing;
+    app.paused = false;
+    var buf: [3][48]u8 = undefined;
+    const items = buildMenuItems(&app, &buf);
+    try std.testing.expectEqualStrings("No keyboard discovered", items[0].label);
 }

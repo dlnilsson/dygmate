@@ -374,8 +374,8 @@ pub fn main(init: std.process.Init) void {
     g_nid.uID = 1;
     g_nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
     g_nid.uCallbackMessage = WM_TRAYICON;
-    g_nid.hIcon = makeTextIcon("--", col_gray);
-    setUtf16(g_nid.szTip[0..], "dygmate: starting\u{2026}");
+    g_nid.hIcon = makeTextIcon("?", col_gray);
+    setUtf16(g_nid.szTip[0..], "No keyboard discovered - last known:\nLeft: no reading yet\nRight: no reading yet");
     _ = Shell_NotifyIconW(NIM_ADD, &g_nid);
     g_nid.uVersion = NOTIFYICON_VERSION_4;
     _ = Shell_NotifyIconW(NIM_SETVERSION, &g_nid);
@@ -452,17 +452,12 @@ fn showMenu(hwnd: HWND) void {
 
     // Informational (grayed, non-clickable) status header, mirroring the
     // tooltip: connection state + last-known level per side. g_last_* are
-    // UI-thread-only, so no lock is needed for them; connected needs the mutex.
+    // UI-thread-only, so no lock is needed for them; status needs the mutex.
     g_state.mutex.lockUncancelable(g_io);
-    const connected = g_state.connected;
+    const status = g_state.status;
     g_state.mutex.unlock(g_io);
 
-    const conn_text: []const u8 = if (paused)
-        "Paused (port free for Bazecor)"
-    else if (connected)
-        "Connected"
-    else
-        "Not connected";
+    const conn_text = common.menuHeader(status, paused);
 
     var lb: [48]u8 = undefined;
     var rb: [48]u8 = undefined;
@@ -524,10 +519,10 @@ fn showMenu(hwnd: HWND) void {
 fn updateTray() void {
     g_state.mutex.lockUncancelable(g_io);
     const reading = g_state.reading;
-    const connected = g_state.connected;
+    const status = g_state.status;
     var pending_connection_announcement = false;
     var announce_connection = false;
-    if (g_state.announce_connection and connected) {
+    if (g_state.announce_connection and status == .connected) {
         if (reading) |r| {
             pending_connection_announcement = true;
             announce_connection = canNotifyBatteryStatus(r);
@@ -547,7 +542,7 @@ fn updateTray() void {
     // Level and status are kept independently: a sleeping half often answers
     // one field (e.g. level=100) while the other comes back empty/unknown, and
     // clobbering a real "charging" with that "?" is exactly the stale-status bug.
-    if (!paused and connected and reading != null) {
+    if (common.isLive(status, paused) and reading != null) {
         const r = reading.?;
         g_last.merge(r);
 
@@ -572,12 +567,7 @@ fn updateTray() void {
         var lb: [40]u8 = undefined;
         var rb: [40]u8 = undefined;
         var tip_buf: [128]u8 = undefined;
-        const header: []const u8 = if (paused)
-            "Paused (port free for Bazecor):\n"
-        else if (!connected)
-            "Not connected — last known:\n"
-        else
-            "";
+        const header = common.tooltipHeader(status, paused);
         const tip = std.fmt.bufPrint(&tip_buf, "{s}Left: {s}\nRight: {s}", .{
             header,
             common.fmtKnownSide(&lb, g_last.left),
@@ -588,9 +578,11 @@ fn updateTray() void {
 
     // Icon: the lower of the two last-known side levels. Dim to gray while
     // offline or paused; "--" only before either side has ever reported.
-    const live = connected and !paused;
+    const live = common.isLive(status, paused);
     const disp = g_last.display();
-    if (disp.level) |lvl| {
+    if (!paused and status == .missing) {
+        icon_text = "?";
+    } else if (disp.level) |lvl| {
         icon_text = std.fmt.bufPrint(&num_buf, "{d}", .{lvl}) catch "?";
         color = toColorRef(common.iconColor(live, lvl, disp.status));
     }

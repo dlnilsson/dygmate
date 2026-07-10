@@ -51,7 +51,7 @@ pub fn iconColor(live: bool, level: u8, status: battery.Status) Rgb {
 pub const State = struct {
     mutex: std.Io.Mutex = .init,
     reading: ?battery.Reading = null,
-    connected: bool = false,
+    status: DeviceStatus = .missing,
     announce_connection: bool = false,
     stop: std.atomic.Value(bool) = .init(false),
     refresh: std.atomic.Value(bool) = .init(false),
@@ -67,6 +67,38 @@ pub const State = struct {
     /// notification fires once per crossing, not every poll. Windows only.
     notified_low: [2]bool = .{ false, false },
 };
+
+pub const DeviceStatus = enum {
+    missing,
+    available,
+    connected,
+};
+
+pub fn offlineStatus(present: bool) DeviceStatus {
+    return if (present) .available else .missing;
+}
+
+pub fn isLive(status: DeviceStatus, paused: bool) bool {
+    return status == .connected and !paused;
+}
+
+pub fn menuHeader(status: DeviceStatus, paused: bool) []const u8 {
+    if (paused) return "Paused (port free for Bazecor)";
+    return switch (status) {
+        .missing => "No keyboard discovered",
+        .available => "Keyboard discovered, not connected",
+        .connected => "Connected",
+    };
+}
+
+pub fn tooltipHeader(status: DeviceStatus, paused: bool) []const u8 {
+    if (paused) return "Paused (port free for Bazecor):\n";
+    return switch (status) {
+        .missing => "No keyboard discovered - last known:\n",
+        .available => "Keyboard discovered, not connected - last known:\n",
+        .connected => "",
+    };
+}
 
 // ---------------------------------------------------------------------------
 // Last-known-good per-side snapshot (UI thread only).
@@ -162,16 +194,28 @@ pub fn runPollLoop(
     while (!st.stop.load(.acquire)) {
         // PAUSED: hold no port so Bazecor can use it; idle until resumed.
         if (st.paused.load(.acquire)) {
+            const present = device.isDygmaPresent(io) catch false;
             resetLayerState(st);
-            setConnected(Ctx, ctx, io, st, wake, false);
+            setStatus(Ctx, ctx, io, st, wake, offlineStatus(present));
             sleepMs(io, st, 300);
             continue;
         }
 
-        // DISCOVER
-        const path = (device.findDygmaPort(io, gpa) catch null) orelse {
+        // DISCOVER. One pass yields both presence and port: Windows scans the
+        // serial layer once; Linux draws presence from sysfs and the port from
+        // the serial layer (a plugged-in keyboard with no serial node yet is
+        // present-without-port).
+        const found = device.discoverDygma(io, gpa) catch device.Discovery{ .present = false };
+        if (!found.present) {
+            if (found.port) |p| gpa.free(p);
             resetLayerState(st);
-            setConnected(Ctx, ctx, io, st, wake, false);
+            setStatus(Ctx, ctx, io, st, wake, .missing);
+            sleepMs(io, st, 3000);
+            continue;
+        }
+        const path = found.port orelse {
+            resetLayerState(st);
+            setStatus(Ctx, ctx, io, st, wake, .available);
             sleepMs(io, st, 3000);
             continue;
         };
@@ -179,8 +223,9 @@ pub fn runPollLoop(
 
         // CONNECT
         var dev = focus.Focus.open(io, path) catch {
+            const still_present = device.isDygmaPresent(io) catch true;
             resetLayerState(st);
-            setConnected(Ctx, ctx, io, st, wake, false);
+            setStatus(Ctx, ctx, io, st, wake, offlineStatus(still_present));
             sleepMs(io, st, 3000);
             continue;
         };
@@ -193,21 +238,23 @@ pub fn runPollLoop(
         // forceRead runs only when the user asks to refresh (below).
         while (!st.stop.load(.acquire)) {
             if (st.paused.load(.acquire)) {
+                const still_present = device.isDygmaPresent(io) catch true;
                 resetLayerState(st);
-                setConnected(Ctx, ctx, io, st, wake, false);
+                setStatus(Ctx, ctx, io, st, wake, offlineStatus(still_present));
                 break;
             }
             var should_post = false;
             if (battery_elapsed_ms >= poll_interval_ms) {
                 const r = battery.read(&dev) catch {
+                    const still_present = device.isDygmaPresent(io) catch false;
                     resetLayerState(st);
-                    setConnected(Ctx, ctx, io, st, wake, false);
+                    setStatus(Ctx, ctx, io, st, wake, offlineStatus(still_present));
                     break;
                 };
                 st.mutex.lockUncancelable(io);
-                const announce_connection = !st.connected;
+                const announce_connection = st.status != .connected;
                 st.reading = r;
-                st.connected = true;
+                st.status = .connected;
                 if (announce_connection) st.announce_connection = true;
                 st.mutex.unlock(io);
                 battery_elapsed_ms = 0;
@@ -216,8 +263,9 @@ pub fn runPollLoop(
 
             if (osd_enabled and st.osd_enabled.load(.acquire)) {
                 const active_layer = layer.readActive(&dev) catch {
+                    const still_present = device.isDygmaPresent(io) catch false;
                     resetLayerState(st);
-                    setConnected(Ctx, ctx, io, st, wake, false);
+                    setStatus(Ctx, ctx, io, st, wake, offlineStatus(still_present));
                     break;
                 };
                 if (active_layer) |idx| {
@@ -248,18 +296,18 @@ pub fn runPollLoop(
     }
 }
 
-fn setConnected(
+fn setStatus(
     comptime Ctx: type,
     ctx: *Ctx,
     io: std.Io,
     st: *State,
     comptime wake: fn (*Ctx) void,
-    connected: bool,
+    status: DeviceStatus,
 ) void {
     st.mutex.lockUncancelable(io);
-    const changed = st.connected != connected;
-    st.connected = connected;
-    if (!connected) {
+    const changed = st.status != status;
+    st.status = status;
+    if (status != .connected) {
         st.reading = null;
         st.announce_connection = false;
     }
@@ -296,4 +344,24 @@ fn waitForNextPoll(io: std.Io, st: *State, interval_ms: u64) bool {
         waited += sleep_ms;
     }
     return false;
+}
+
+test "offlineStatus maps USB absence to missing" {
+    try std.testing.expectEqual(DeviceStatus.missing, offlineStatus(false));
+}
+
+test "offlineStatus maps USB presence without port to available" {
+    try std.testing.expectEqual(DeviceStatus.available, offlineStatus(true));
+}
+
+test "menuHeader distinguishes missing and available" {
+    try std.testing.expectEqualStrings("No keyboard discovered", menuHeader(.missing, false));
+    try std.testing.expectEqualStrings("Keyboard discovered, not connected", menuHeader(.available, false));
+    try std.testing.expectEqualStrings("Connected", menuHeader(.connected, false));
+}
+
+test "tooltipHeader keeps paused wording and missing wording distinct" {
+    try std.testing.expectEqualStrings("Paused (port free for Bazecor):\n", tooltipHeader(.missing, true));
+    try std.testing.expectEqualStrings("No keyboard discovered - last known:\n", tooltipHeader(.missing, false));
+    try std.testing.expectEqualStrings("Keyboard discovered, not connected - last known:\n", tooltipHeader(.available, false));
 }
