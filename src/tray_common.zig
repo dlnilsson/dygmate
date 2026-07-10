@@ -14,10 +14,12 @@ const layer = @import("layer.zig");
 pub const low_threshold: u8 = 20;
 // Poll cadence. The wireless halves sleep and the neuron only serves a cached
 // value once a side has reported, so a plain read right after connect is often
-// empty. Polling frequently catches a real reading within a few seconds;
-// last-known-good then keeps it across the empty reads that follow. Plain reads
-// hit the USB-powered neuron only — they never wake the sides or wear flash.
-pub const poll_interval_ms: u64 = 5 * 1000;
+// empty. Poll fast until a side reports a real level (populates the tray within
+// a few seconds of connect), then back off to battery.suggestedPollIntervalSeconds
+// (15–60 min by level). Once a side has reported, a later empty read keeps the
+// current cadence — last-known-good covers the display. Plain reads hit the
+// USB-powered neuron only; they never wake the sides or wear flash.
+pub const initial_poll_interval_ms: u64 = 5 * 1000;
 pub const layer_poll_interval_ms: u64 = 250;
 
 // ---------------------------------------------------------------------------
@@ -64,7 +66,7 @@ pub const State = struct {
     /// comptime so the layer read is compiled out entirely.
     osd_enabled: std.atomic.Value(bool) = .init(true),
     /// UI-thread-only: latched per side (0=left, 1=right) so a low-battery
-    /// notification fires once per crossing, not every poll. Windows only.
+    /// notification fires once per crossing, not every poll.
     notified_low: [2]bool = .{ false, false },
 };
 
@@ -144,6 +146,130 @@ pub fn fmtKnownSide(buf: []u8, s: battery.SideReading) []const u8 {
 }
 
 // ---------------------------------------------------------------------------
+// Notifications: shared trigger/latch logic + text. Both platforms feed a
+// merged snapshot to planNotifications and render the returned events with
+// their own toolkit (Windows balloons, freedesktop Notifications on Linux).
+// ---------------------------------------------------------------------------
+pub const notification_title_status = "Dygma Defy battery level";
+pub const notification_title_low = "Dygma Defy battery low";
+
+/// A single notification to render. `connect_status` carries both-sides detail
+/// (rendered from the snapshot); `low_battery` carries the offending side and
+/// its level. `warning` selects the warning urgency/icon.
+pub const NotifyEvent = struct {
+    kind: enum { connect_status, low_battery },
+    side: ?u1 = null, // low_battery only: 0 = left, 1 = right
+    level: ?u8 = null, // low_battery only
+    warning: bool = false,
+};
+
+pub const NotifyPlan = struct {
+    /// At most one connect_status, or up to two low_battery events.
+    events: [3]?NotifyEvent = .{ null, null, null },
+    /// True when a connect announcement was emitted; the caller then clears
+    /// its `announce_connection` flag under the state mutex.
+    consumed_announce: bool = false,
+};
+
+/// Both sides have a level — the gate for the connect announcement.
+pub fn bothLevelsKnown(r: battery.Reading) bool {
+    return r.left.level != null and r.right.level != null;
+}
+
+/// Any non-charging side below the low threshold — drives warning urgency on
+/// the connect announcement.
+pub fn hasLowBattery(r: battery.Reading) bool {
+    const sides = [_]battery.SideReading{ r.left, r.right };
+    for (sides) |s| {
+        if (s.status == .charging) continue;
+        const lvl = s.level orelse continue;
+        if (lvl < low_threshold) return true;
+    }
+    return false;
+}
+
+/// Body of the connect-status notification: "Left: {s}\nRight: {s}".
+pub fn fmtStatusBody(buf: []u8, r: battery.Reading) []const u8 {
+    var lb: [32]u8 = undefined;
+    var rb: [32]u8 = undefined;
+    return std.fmt.bufPrint(buf, "Left: {s}\nRight: {s}", .{
+        fmtSide(&lb, r.left),
+        fmtSide(&rb, r.right),
+    }) catch buf[0..0];
+}
+
+/// Body of a low-battery notification: "{Left|Right} side at {d}%".
+pub fn fmtLowBody(buf: []u8, side: u1, level: u8) []const u8 {
+    const name: []const u8 = if (side == 0) "Left" else "Right";
+    return std.fmt.bufPrint(buf, "{s} side at {d}%", .{ name, level }) catch buf[0..0];
+}
+
+/// Decide which notifications to fire and mutate the per-side latch. Pure: no
+/// platform calls. Mirrors the Windows updateTray decision flow exactly.
+///
+/// `announce_pending` is the pending connect-announcement flag.
+/// `announce_ready` gates the announcement — it must be computed from the *raw*
+/// reading (both raw levels present), not the merged snapshot, so a stale
+/// last-known value can't fire the announcement early after a reconnect. The
+/// announcement body and latch still render from the merged `snapshot`.
+///
+/// - pending + ready: emit connect_status, latch the lows, report consumed.
+/// - pending + not ready: emit nothing, keep announce pending.
+/// - not pending: per-side low check against the latch (fires once per crossing).
+pub fn planNotifications(
+    latch: *[2]bool,
+    announce_pending: bool,
+    announce_ready: bool,
+    snapshot: battery.Reading,
+) NotifyPlan {
+    var plan = NotifyPlan{};
+    const sides = [_]battery.SideReading{ snapshot.left, snapshot.right };
+
+    if (announce_pending) {
+        // A side hasn't reported a fresh level yet: stay pending, fire nothing.
+        if (!announce_ready) return plan;
+
+        plan.events[0] = .{ .kind = .connect_status, .warning = hasLowBattery(snapshot) };
+        // Latch every side to its current low state so the announcement doesn't
+        // double as a fresh low crossing on the next poll.
+        for (sides, 0..) |s, i| {
+            if (s.status == .charging) {
+                latch[i] = false;
+                continue;
+            }
+            const lvl = s.level orelse {
+                latch[i] = false;
+                continue;
+            };
+            latch[i] = lvl < low_threshold;
+        }
+        plan.consumed_announce = true;
+        return plan;
+    }
+
+    // Per-side low crossing: fire once when a non-charging side drops below the
+    // threshold; reset the latch when it charges or recovers.
+    var idx: usize = 0;
+    for (sides, 0..) |s, i| {
+        if (s.status == .charging) {
+            latch[i] = false;
+            continue;
+        }
+        const lvl = s.level orelse continue;
+        if (lvl < low_threshold) {
+            if (!latch[i]) {
+                latch[i] = true;
+                plan.events[idx] = .{ .kind = .low_battery, .side = @intCast(i), .level = lvl, .warning = true };
+                idx += 1;
+            }
+        } else {
+            latch[i] = false;
+        }
+    }
+    return plan;
+}
+
+// ---------------------------------------------------------------------------
 // Background polling thread: owns the serial connection.
 // ---------------------------------------------------------------------------
 /// Run the discover -> connect -> poll loop. `wake(ctx)` notifies the UI that
@@ -186,7 +312,16 @@ pub fn runPollLoop(
         };
         defer dev.close();
         var last_layer: ?u8 = null;
-        var battery_elapsed_ms: u64 = poll_interval_ms;
+        // Per-connection last-known merge. On a plain read the neuron answers one
+        // side at a time, so a single raw read almost never carries both levels;
+        // merge across this connection so st.reading (and thus the connect
+        // announcement and the backoff) see a complete picture. Fresh per connect
+        // — nothing carries across a reconnect, so the announcement can't fire off
+        // a stale value.
+        var known: LastKnown = .{};
+        // Start fast (immediate first read); back off once both sides report.
+        var battery_interval_ms: u64 = initial_poll_interval_ms;
+        var battery_elapsed_ms: u64 = battery_interval_ms;
 
         // POLL. No forceRead on connect: the neuron serves cached values on a
         // plain read, and forcing a re-poll every cycle blanks them mid-refresh.
@@ -198,18 +333,27 @@ pub fn runPollLoop(
                 break;
             }
             var should_post = false;
-            if (battery_elapsed_ms >= poll_interval_ms) {
+            if (battery_elapsed_ms >= battery_interval_ms) {
                 const r = battery.read(&dev) catch {
                     resetLayerState(st);
                     setConnected(Ctx, ctx, io, st, wake, false);
                     break;
                 };
+                known.merge(r);
+                const merged: battery.Reading = .{ .left = known.left, .right = known.right };
                 st.mutex.lockUncancelable(io);
                 const announce_connection = !st.connected;
-                st.reading = r;
+                st.reading = merged;
                 st.connected = true;
                 if (announce_connection) st.announce_connection = true;
                 st.mutex.unlock(io);
+                // Back off only once BOTH sides have reported this connection —
+                // the same gate as the connect announcement, so slowing down can't
+                // leave the announcement pending for a whole slow interval. Until
+                // then stay fast.
+                if (bothLevelsKnown(merged)) {
+                    battery_interval_ms = battery.suggestedPollIntervalSeconds(merged) * std.time.ms_per_s;
+                }
                 battery_elapsed_ms = 0;
                 should_post = true;
             }
@@ -240,7 +384,7 @@ pub fn runPollLoop(
             if (refreshed) {
                 battery.forceRead(&dev);
                 sleepMs(io, st, battery.force_read_settle_s * 1000);
-                battery_elapsed_ms = poll_interval_ms;
+                battery_elapsed_ms = battery_interval_ms; // force a read next cycle
             } else {
                 battery_elapsed_ms += layer_poll_interval_ms;
             }
@@ -296,4 +440,95 @@ fn waitForNextPoll(io: std.Io, st: *State, interval_ms: u64) bool {
         waited += sleep_ms;
     }
     return false;
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+fn reading(ll: ?u8, ls: battery.Status, rl: ?u8, rs: battery.Status) battery.Reading {
+    return .{ .left = .{ .level = ll, .status = ls }, .right = .{ .level = rl, .status = rs } };
+}
+
+fn countEvents(plan: NotifyPlan) usize {
+    var n: usize = 0;
+    for (plan.events) |e| {
+        if (e != null) n += 1;
+    }
+    return n;
+}
+
+test "planNotifications: low crossing fires once, latched afterwards" {
+    var latch = [2]bool{ false, false };
+    const snap = reading(15, .discharging, 80, .discharging);
+
+    const first = planNotifications(&latch, false, false, snap);
+    try std.testing.expectEqual(@as(usize, 1), countEvents(first));
+    try std.testing.expectEqual(NotifyEvent{ .kind = .low_battery, .side = 0, .level = 15, .warning = true }, first.events[0].?);
+    try std.testing.expect(latch[0]);
+
+    // Same low reading again: latched, no re-fire.
+    const second = planNotifications(&latch, false, false, snap);
+    try std.testing.expectEqual(@as(usize, 0), countEvents(second));
+}
+
+test "planNotifications: recovery above threshold resets the latch" {
+    var latch = [2]bool{ true, false };
+    const plan = planNotifications(&latch, false, false, reading(50, .discharging, 90, .discharging));
+    try std.testing.expectEqual(@as(usize, 0), countEvents(plan));
+    try std.testing.expect(!latch[0]); // latch cleared, so a later drop fires again
+
+    const again = planNotifications(&latch, false, false, reading(10, .discharging, 90, .discharging));
+    try std.testing.expectEqual(@as(usize, 1), countEvents(again));
+}
+
+test "planNotifications: charging side never warns and resets the latch" {
+    var latch = [2]bool{ true, true };
+    const plan = planNotifications(&latch, false, false, reading(5, .charging, 8, .charging));
+    try std.testing.expectEqual(@as(usize, 0), countEvents(plan));
+    try std.testing.expect(!latch[0]);
+    try std.testing.expect(!latch[1]);
+}
+
+test "planNotifications: both low sides fire two events" {
+    var latch = [2]bool{ false, false };
+    const plan = planNotifications(&latch, false, false, reading(10, .discharging, 19, .discharging));
+    try std.testing.expectEqual(@as(usize, 2), countEvents(plan));
+    try std.testing.expectEqual(@as(u1, 0), plan.events[0].?.side.?);
+    try std.testing.expectEqual(@as(u1, 1), plan.events[1].?.side.?);
+}
+
+test "planNotifications: announce with both sides known emits status and latches lows" {
+    var latch = [2]bool{ false, false };
+    const plan = planNotifications(&latch, true, true, reading(15, .discharging, 90, .discharging));
+    try std.testing.expectEqual(@as(usize, 1), countEvents(plan));
+    try std.testing.expect(plan.events[0].?.kind == .connect_status);
+    try std.testing.expect(plan.events[0].?.warning); // a side is low
+    try std.testing.expect(plan.consumed_announce);
+    try std.testing.expect(latch[0]); // low side latched by the announcement
+    try std.testing.expect(!latch[1]);
+}
+
+test "planNotifications: announce with a healthy pair is not a warning" {
+    var latch = [2]bool{ false, false };
+    const plan = planNotifications(&latch, true, true, reading(80, .discharging, 90, .charging));
+    try std.testing.expect(plan.events[0].?.kind == .connect_status);
+    try std.testing.expect(!plan.events[0].?.warning);
+    try std.testing.expect(plan.consumed_announce);
+}
+
+test "planNotifications: announce with a side unknown emits nothing and stays pending" {
+    var latch = [2]bool{ false, false };
+    const plan = planNotifications(&latch, true, false, reading(null, .unknown, 90, .discharging));
+    try std.testing.expectEqual(@as(usize, 0), countEvents(plan));
+    try std.testing.expect(!plan.consumed_announce);
+}
+
+test "planNotifications: announce gates on raw readiness, not the merged snapshot" {
+    // Merged snapshot has both levels (a stale side survived a reconnect), but
+    // the raw reading isn't ready yet: the announcement must stay pending.
+    var latch = [2]bool{ false, false };
+    const merged = reading(50, .discharging, 80, .discharging);
+    const plan = planNotifications(&latch, true, false, merged);
+    try std.testing.expectEqual(@as(usize, 0), countEvents(plan));
+    try std.testing.expect(!plan.consumed_announce);
 }

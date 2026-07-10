@@ -260,7 +260,6 @@ const ID_OSD_TOGGLE: i32 = 4;
 const ID_OSD_HIDE: usize = 1;
 
 const icon_size: i32 = 16;
-const low_threshold = common.low_threshold;
 const osd_duration_ms: UINT = 900;
 const osd_width: i32 = 156;
 const osd_height: i32 = 56;
@@ -283,9 +282,6 @@ const col_text = rgb(255, 255, 255);
 
 const ERROR_ALREADY_EXISTS: DWORD = 183;
 const singleton_name = std.unicode.utf8ToUtf16LeStringLiteral("Local\\DygmaBatteryTraySingleton");
-
-const notification_title_battery = "Dygma Defy battery level";
-const notification_title_low = "Dygma Defy battery low";
 
 const class_name = std.unicode.utf8ToUtf16LeStringLiteral("DygmaBatteryTrayWnd");
 const osd_class_name = std.unicode.utf8ToUtf16LeStringLiteral("DygmaBatteryOsdWnd");
@@ -525,15 +521,7 @@ fn updateTray() void {
     g_state.mutex.lockUncancelable(g_io);
     const reading = g_state.reading;
     const connected = g_state.connected;
-    var pending_connection_announcement = false;
-    var announce_connection = false;
-    if (g_state.announce_connection and connected) {
-        if (reading) |r| {
-            pending_connection_announcement = true;
-            announce_connection = canNotifyBatteryStatus(r);
-        }
-    }
-    if (announce_connection) g_state.announce_connection = false;
+    const announce_pending = g_state.announce_connection and connected and reading != null;
     g_state.mutex.unlock(g_io);
     const paused = g_state.paused.load(.acquire);
 
@@ -556,11 +544,18 @@ fn updateTray() void {
         // look ".unknown" (i.e. "not charging") and fire a false low-battery
         // warning. The snapshot carries the last real status per side.
         const snapshot: battery.Reading = .{ .left = g_last.left, .right = g_last.right };
-        if (announce_connection) {
-            showBatteryStatusBalloon(snapshot);
-            latchLowBatteryNotifications(snapshot);
-        } else if (!pending_connection_announcement) {
-            checkLowBattery(snapshot);
+        // Gate the announcement on the raw reading (both fresh levels present),
+        // but render/latch from the merged snapshot — matches the pre-refactor
+        // behavior and avoids announcing early off a stale last-known value.
+        const announce_ready = common.bothLevelsKnown(r);
+        const plan = common.planNotifications(&g_state.notified_low, announce_pending, announce_ready, snapshot);
+        for (plan.events) |ev_opt| {
+            if (ev_opt) |ev| showEvent(ev, snapshot);
+        }
+        if (plan.consumed_announce) {
+            g_state.mutex.lockUncancelable(g_io);
+            g_state.announce_connection = false;
+            g_state.mutex.unlock(g_io);
         }
     } else {
         g_state.notified_low = .{ false, false };
@@ -616,67 +611,22 @@ fn appendMenuText(menu: HMENU, flags: UINT, id: usize, text: []const u8) void {
     _ = AppendMenuW(menu, flags, id, wbuf[0..n :0].ptr);
 }
 
-fn checkLowBattery(r: battery.Reading) void {
-    const sides = [_]battery.SideReading{ r.left, r.right };
-    const names = [_][]const u8{ "Left", "Right" };
-    for (sides, 0..) |s, i| {
-        if (s.status == .charging) {
-            g_state.notified_low[i] = false;
-            continue;
-        }
-        const lvl = s.level orelse continue;
-        if (lvl < low_threshold) {
-            if (!g_state.notified_low[i]) {
-                g_state.notified_low[i] = true;
-                var tb: [64]u8 = undefined;
-                const text = std.fmt.bufPrint(&tb, "{s} side at {d}%", .{ names[i], lvl }) catch "battery low";
-                showBalloon(notification_title_low, text, NIIF_WARNING);
-            }
-        } else {
-            g_state.notified_low[i] = false;
-        }
+/// Render one planner event as a tray balloon. connect_status shows both-sides
+/// detail; low_battery names the offending side. Warning events use NIIF_WARNING.
+fn showEvent(ev: common.NotifyEvent, snapshot: battery.Reading) void {
+    switch (ev.kind) {
+        .connect_status => {
+            var text_buf: [96]u8 = undefined;
+            const text = common.fmtStatusBody(&text_buf, snapshot);
+            const flags: DWORD = if (ev.warning) NIIF_WARNING else NIIF_INFO_ICON;
+            showBalloon(common.notification_title_status, text, flags);
+        },
+        .low_battery => {
+            var tb: [64]u8 = undefined;
+            const text = common.fmtLowBody(&tb, ev.side.?, ev.level.?);
+            showBalloon(common.notification_title_low, text, NIIF_WARNING);
+        },
     }
-}
-
-fn latchLowBatteryNotifications(r: battery.Reading) void {
-    const sides = [_]battery.SideReading{ r.left, r.right };
-    for (sides, 0..) |s, i| {
-        if (s.status == .charging) {
-            g_state.notified_low[i] = false;
-            continue;
-        }
-        const lvl = s.level orelse {
-            g_state.notified_low[i] = false;
-            continue;
-        };
-        g_state.notified_low[i] = lvl < low_threshold;
-    }
-}
-
-fn showBatteryStatusBalloon(r: battery.Reading) void {
-    var lb: [32]u8 = undefined;
-    var rb: [32]u8 = undefined;
-    var text_buf: [96]u8 = undefined;
-    const text = std.fmt.bufPrint(&text_buf, "Left: {s}\nRight: {s}", .{
-        common.fmtSide(&lb, r.left),
-        common.fmtSide(&rb, r.right),
-    }) catch "Battery status available";
-    const flags: DWORD = if (hasLowBattery(r)) NIIF_WARNING else NIIF_INFO_ICON;
-    showBalloon(notification_title_battery, text, flags);
-}
-
-fn canNotifyBatteryStatus(r: battery.Reading) bool {
-    return r.left.level != null and r.right.level != null;
-}
-
-fn hasLowBattery(r: battery.Reading) bool {
-    const sides = [_]battery.SideReading{ r.left, r.right };
-    for (sides) |s| {
-        if (s.status == .charging) continue;
-        const lvl = s.level orelse continue;
-        if (lvl < low_threshold) return true;
-    }
-    return false;
 }
 
 fn showBalloon(title: []const u8, text: []const u8, flags: DWORD) void {

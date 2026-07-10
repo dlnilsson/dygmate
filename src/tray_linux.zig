@@ -23,6 +23,8 @@ const menu_path = "/MenuBar";
 const props_iface = "org.freedesktop.DBus.Properties";
 const dbus_service = "org.freedesktop.DBus";
 const dbus_path = "/org/freedesktop/DBus";
+const notifications_service = "org.freedesktop.Notifications";
+const notifications_path = "/org/freedesktop/Notifications";
 
 // ---------------------------------------------------------------------------
 // Icon rendering: a battery percentage drawn as an ARGB32 pixmap. SNI's
@@ -124,6 +126,12 @@ const App = struct {
     item_name: []const u8, // owned: "org.kde.StatusNotifierItem-<pid>-1"
     item_registered: bool = false,
     menu_revision: u32 = 1,
+
+    // Notification popup slot. The daemon assigns an id on the first Notify
+    // reply; reusing it as replaces_id updates one popup instead of stacking.
+    // Both are daemon/connection-scoped, so reconnect resets them.
+    notify_id: u32 = 0,
+    pending_notify_serial: ?u32 = null,
 
     // Current display snapshot (UI thread only).
     last: tray_common.LastKnown = .{},
@@ -292,6 +300,9 @@ const watcher_iface = "org.kde.StatusNotifierWatcher";
 fn reconnect(app: *App) void {
     app.conn.deinit();
     app.item_registered = false;
+    // Notification ids are daemon/connection-scoped; a new bus means a new slot.
+    app.notify_id = 0;
+    app.pending_notify_serial = null;
     while (!app.state.stop.load(.acquire)) {
         const conn = dbus.Connection.connectSession(app.io, app.gpa, app.environ, linux.getuid()) catch {
             tray_common.sleepMs(app.io, app.state, 1000);
@@ -312,11 +323,33 @@ fn rebuildAndNotify(app: *App) void {
     app.state.mutex.lockUncancelable(app.io);
     const reading = app.state.reading;
     const connected = app.state.connected;
+    const announce_pending = app.state.announce_connection and connected and reading != null;
     app.state.mutex.unlock(app.io);
     const paused = app.state.paused.load(.acquire);
 
-    if (connected and !paused) {
-        if (reading) |r| app.last.merge(r);
+    if (connected and !paused and reading != null) {
+        const r = reading.?;
+        app.last.merge(r);
+
+        // Notifications run off the merged snapshot (last real per-side status),
+        // not the raw reading, so a momentarily-empty charging status can't fire
+        // a false low-battery warning. Mirrors the Windows tray.
+        const snapshot: battery.Reading = .{ .left = app.last.left, .right = app.last.right };
+        // Gate the announcement on the raw reading (both fresh levels present),
+        // but render/latch from the merged snapshot — a stale last-known value
+        // surviving a reconnect must not fire the announcement early.
+        const announce_ready = tray_common.bothLevelsKnown(r);
+        const plan = tray_common.planNotifications(&app.state.notified_low, announce_pending, announce_ready, snapshot);
+        for (plan.events) |ev_opt| {
+            if (ev_opt) |ev| sendNotification(app, ev, snapshot);
+        }
+        if (plan.consumed_announce) {
+            app.state.mutex.lockUncancelable(app.io);
+            app.state.announce_connection = false;
+            app.state.mutex.unlock(app.io);
+        }
+    } else {
+        app.state.notified_low = .{ false, false };
     }
     app.connected = connected;
     app.paused = paused;
@@ -359,11 +392,84 @@ fn emitLayoutUpdated(app: *App) !void {
 }
 
 // ---------------------------------------------------------------------------
+// Desktop notifications (org.freedesktop.Notifications).
+// ---------------------------------------------------------------------------
+/// Fire-and-forget: a missing/broken daemon must never break the tray, so any
+/// failure is swallowed. The reply (the assigned id) is picked up async in
+/// dispatch; callAndWait would drop concurrent incoming menu calls (dbus.zig).
+fn sendNotification(app: *App, ev: tray_common.NotifyEvent, snapshot: battery.Reading) void {
+    notifyInner(app, ev, snapshot) catch {};
+}
+
+fn notifyInner(app: *App, ev: tray_common.NotifyEvent, snapshot: battery.Reading) !void {
+    var body_buf: [128]u8 = undefined;
+    var title: []const u8 = undefined;
+    var text: []const u8 = undefined;
+    switch (ev.kind) {
+        .connect_status => {
+            title = tray_common.notification_title_status;
+            text = tray_common.fmtStatusBody(&body_buf, snapshot);
+        },
+        .low_battery => {
+            title = tray_common.notification_title_low;
+            text = tray_common.fmtLowBody(&body_buf, ev.side.?, ev.level.?);
+        },
+    }
+    const app_icon: []const u8 = if (ev.warning) "battery-caution" else "battery";
+    const urgency: u8 = if (ev.warning) 2 else 1; // 2 = critical, 1 = normal
+
+    var body = std.ArrayList(u8).empty;
+    defer body.deinit(app.gpa);
+    var w = dbus.Writer.init(&body, app.gpa);
+    // Notify(app_name s, replaces_id u, app_icon s, summary s, body s,
+    //        actions as, hints a{sv}, expire_timeout i)  ->  id u
+    try w.string("dygmate");
+    try w.uint32(app.notify_id);
+    try w.string(app_icon);
+    try w.string(title);
+    try w.string(text);
+    const actions = try w.beginArray(4); // as: no action buttons
+    w.endArray(actions);
+    const hints = try w.beginArray(8); // a{sv}
+    try w.beginStruct(); // dict entry, 8-aligned
+    try w.string("urgency");
+    try w.signature("y");
+    try w.byte(urgency);
+    w.endArray(hints);
+    try w.int32(-1); // expire_timeout: daemon default
+
+    const serial = try app.conn.call(
+        notifications_service,
+        notifications_path,
+        notifications_service, // interface == destination
+        "Notify",
+        "susssasa{sv}i",
+        body.items,
+    );
+    app.pending_notify_serial = serial;
+}
+
+// ---------------------------------------------------------------------------
 // Incoming message dispatch.
 // ---------------------------------------------------------------------------
 fn dispatch(app: *App, msg: dbus.Message) !void {
     if (msg.type == .signal) {
         if (eql(msg.member, "NameOwnerChanged")) handleNameOwnerChanged(app, msg);
+        return;
+    }
+    // The only fire-and-forget call is Notify (all others use callAndWait, which
+    // consumes their reply inline). So a method_return here is a Notify reply:
+    // capture the daemon-assigned id for the next replaces_id.
+    if (msg.type == .method_return or msg.type == .error_reply) {
+        if (app.pending_notify_serial) |serial| {
+            if (msg.reply_serial == serial) {
+                if (msg.type == .method_return) {
+                    var r = dbus.Reader{ .data = msg.body };
+                    if (r.uint32()) |id| app.notify_id = id else |_| {}
+                }
+                app.pending_notify_serial = null;
+            }
+        }
         return;
     }
     if (msg.type != .method_call) return;
@@ -736,8 +842,9 @@ fn menuEvent(app: *App, msg: dbus.Message) !void {
 // Tests
 // ---------------------------------------------------------------------------
 test {
-    // Pull in the D-Bus unit tests when running `zig build test-tray`.
+    // Pull in the D-Bus + shared planner unit tests for `zig build test-tray`.
     _ = @import("dbus.zig");
+    _ = @import("tray_common.zig");
 }
 
 test "renderIcon fills background color at a corner pixel" {
