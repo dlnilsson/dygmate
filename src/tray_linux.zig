@@ -731,7 +731,7 @@ fn dispatchMenu(app: *App, msg: dbus.Message, member: []const u8) !void {
     if (std.mem.eql(u8, member, "GetLayout")) return menuGetLayout(app, msg);
     if (std.mem.eql(u8, member, "GetGroupProperties")) return menuGetGroupProperties(app, msg);
     if (std.mem.eql(u8, member, "Event")) return menuEvent(app, msg);
-    if (std.mem.eql(u8, member, "EventGroup")) return app.conn.reply(msg, null, &.{});
+    if (std.mem.eql(u8, member, "EventGroup")) return menuEventGroup(app, msg);
     if (std.mem.eql(u8, member, "AboutToShow")) {
         // Reply false: no layout change needed simply to show. Signature "b".
         var body = std.ArrayList(u8).empty;
@@ -739,6 +739,17 @@ fn dispatchMenu(app: *App, msg: dbus.Message, member: []const u8) !void {
         var w = dbus.Writer.init(&body, app.gpa);
         try w.boolean(false);
         return app.conn.reply(msg, "b", body.items);
+    }
+    if (std.mem.eql(u8, member, "AboutToShowGroup")) {
+        // (updatesNeeded ai, idErrors ai): both empty, nothing needs updating.
+        var body = std.ArrayList(u8).empty;
+        defer body.deinit(app.gpa);
+        var w = dbus.Writer.init(&body, app.gpa);
+        const updates = try w.beginArray(4);
+        w.endArray(updates);
+        const errors = try w.beginArray(4);
+        w.endArray(errors);
+        return app.conn.reply(msg, "aiai", body.items);
     }
     try app.conn.replyError(msg, "org.freedesktop.DBus.Error.UnknownMethod", "unhandled menu method");
 }
@@ -912,43 +923,86 @@ fn menuEvent(app: *App, msg: dbus.Message) !void {
     const id = @as(i32, @bitCast(try r.uint32()));
     const event_id = try r.string();
 
-    if (std.mem.eql(u8, event_id, "clicked")) {
-        switch (@as(MenuId, @enumFromInt(id))) {
-            .refresh => app.state.refresh.store(true, .release),
-            .toggle => {
-                const now_paused = !app.state.paused.load(.acquire);
-                app.state.paused.store(now_paused, .release);
-                if (!now_paused) app.state.refresh.store(true, .release);
-                wake(app); // reflect the new state in the icon/menu promptly
-            },
-            .osd => {
-                const o = if (app.osd) |*value| value else {
-                    app.state.osd_enabled.store(false, .release);
-                    return app.conn.reply(msg, null, &.{});
-                };
-                if (!o.alive()) {
-                    app.state.osd_enabled.store(false, .release);
-                    return app.conn.reply(msg, null, &.{});
-                }
-                const enabled = !app.state.osd_enabled.load(.acquire);
-                app.state.osd_enabled.store(enabled, .release);
-                app.state.layer_change.store(-1, .release);
-                if (!enabled) {
-                    o.hide();
-                    app.osd_hide_at = null;
-                }
-                // menuEvent owns the Wayland socket, so hide() is safe here.
-                app.menu_revision += 1;
-                emitLayoutUpdated(app) catch {};
-            },
-            .quit => {
-                app.state.stop.store(true, .release);
-                wake(app);
-            },
-            else => {},
-        }
-    }
+    if (std.mem.eql(u8, event_id, "clicked")) applyClicked(app, id);
     try app.conn.reply(msg, null, &.{});
+}
+
+/// EventGroup(events a(isvu)) -> (idErrors ai). Waybar's libdbusmenu client
+/// delivers menu clicks through this batched form, never plain Event.
+fn menuEventGroup(app: *App, msg: dbus.Message) !void {
+    try applyEventGroup(app, msg.body);
+    var body = std.ArrayList(u8).empty;
+    defer body.deinit(app.gpa);
+    var w = dbus.Writer.init(&body, app.gpa);
+    const tok = try w.beginArray(4); // ai: no unknown ids
+    w.endArray(tok);
+    try app.conn.reply(msg, "ai", body.items);
+}
+
+/// Walk an a(isvu) event batch and apply every "clicked" entry.
+fn applyEventGroup(app: *App, body: []const u8) !void {
+    var r = dbus.Reader{ .data = body };
+    const end = try r.arrayEnd(8);
+    while (r.pos < end) {
+        r.readAlign(8); // struct boundary
+        const id = @as(i32, @bitCast(try r.uint32()));
+        const event_id = try r.string();
+        try skipVariant(&r);
+        _ = try r.uint32(); // timestamp
+        if (std.mem.eql(u8, event_id, "clicked")) applyClicked(app, id);
+    }
+}
+
+/// Skip a variant's signature and value. Only the fixed/simple types a
+/// dbusmenu event's data slot carries in practice are supported.
+fn skipVariant(r: *dbus.Reader) !void {
+    const sig = try r.signature();
+    if (sig.len != 1) return error.Malformed;
+    switch (sig[0]) {
+        'y' => _ = try r.byte(),
+        'n', 'q' => _ = try r.uint16(),
+        'b', 'i', 'u' => _ = try r.uint32(),
+        's', 'o' => _ = try r.string(),
+        'g' => _ = try r.signature(),
+        else => return error.Malformed,
+    }
+}
+
+fn applyClicked(app: *App, id: i32) void {
+    switch (@as(MenuId, @enumFromInt(id))) {
+        .refresh => app.state.refresh.store(true, .release),
+        .toggle => {
+            const now_paused = !app.state.paused.load(.acquire);
+            app.state.paused.store(now_paused, .release);
+            if (!now_paused) app.state.refresh.store(true, .release);
+            wake(app); // reflect the new state in the icon/menu promptly
+        },
+        .osd => {
+            const o = if (app.osd) |*value| value else {
+                app.state.osd_enabled.store(false, .release);
+                return;
+            };
+            if (!o.alive()) {
+                app.state.osd_enabled.store(false, .release);
+                return;
+            }
+            const enabled = !app.state.osd_enabled.load(.acquire);
+            app.state.osd_enabled.store(enabled, .release);
+            app.state.layer_change.store(-1, .release);
+            if (!enabled) {
+                o.hide();
+                app.osd_hide_at = null;
+            }
+            // The menu dispatch owns the Wayland socket, so hide() is safe here.
+            app.menu_revision += 1;
+            emitLayoutUpdated(app) catch {};
+        },
+        .quit => {
+            app.state.stop.store(true, .release);
+            wake(app);
+        },
+        else => {},
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -992,6 +1046,100 @@ test "renderIcon draws at least one white text pixel for question mark" {
         if (buf[i + 1] == 255 and buf[i + 2] == 255 and buf[i + 3] == 255) found_white = true;
     }
     try std.testing.expect(found_white);
+}
+
+test "EventGroup clicked event toggles pause state" {
+    var state: tray_common.State = .{};
+    var app = App{
+        .io = undefined,
+        .gpa = undefined,
+        .conn = undefined,
+        .environ = undefined,
+        .state = &state,
+        .event_fd = -1,
+        .item_name = "",
+    };
+
+    // Marshal a(isvu) with one clicked event on the pause/resume item, the
+    // exact shape waybar's libdbusmenu client sends.
+    var body = std.ArrayList(u8).empty;
+    defer body.deinit(std.testing.allocator);
+    var w = dbus.Writer.init(&body, std.testing.allocator);
+    const tok = try w.beginArray(8);
+    try w.beginStruct();
+    try w.int32(@intFromEnum(MenuId.toggle));
+    try w.string("clicked");
+    try w.signature("i");
+    try w.int32(0);
+    try w.uint32(14559246);
+    w.endArray(tok);
+
+    try applyEventGroup(&app, body.items);
+    try std.testing.expect(state.paused.load(.acquire));
+}
+
+test "EventGroup clicked event on OSD item without an OSD disables it" {
+    var state: tray_common.State = .{};
+    var app = App{
+        .io = undefined,
+        .gpa = undefined,
+        .conn = undefined,
+        .environ = undefined,
+        .state = &state,
+        .event_fd = -1,
+        .item_name = "",
+    };
+    try std.testing.expect(state.osd_enabled.load(.acquire));
+
+    var body = std.ArrayList(u8).empty;
+    defer body.deinit(std.testing.allocator);
+    var w = dbus.Writer.init(&body, std.testing.allocator);
+    const tok = try w.beginArray(8);
+    try w.beginStruct();
+    try w.int32(@intFromEnum(MenuId.osd));
+    try w.string("clicked");
+    try w.signature("i");
+    try w.int32(0);
+    try w.uint32(14559246);
+    w.endArray(tok);
+
+    try applyEventGroup(&app, body.items);
+    try std.testing.expect(!state.osd_enabled.load(.acquire));
+}
+
+test "EventGroup with two events applies both" {
+    var state: tray_common.State = .{};
+    var app = App{
+        .io = undefined,
+        .gpa = undefined,
+        .conn = undefined,
+        .environ = undefined,
+        .state = &state,
+        .event_fd = -1,
+        .item_name = "",
+    };
+
+    var body = std.ArrayList(u8).empty;
+    defer body.deinit(std.testing.allocator);
+    var w = dbus.Writer.init(&body, std.testing.allocator);
+    const tok = try w.beginArray(8);
+    try w.beginStruct();
+    try w.int32(@intFromEnum(MenuId.refresh));
+    try w.string("clicked");
+    try w.signature("i");
+    try w.int32(0);
+    try w.uint32(1);
+    try w.beginStruct();
+    try w.int32(@intFromEnum(MenuId.toggle));
+    try w.string("clicked");
+    try w.signature("i");
+    try w.int32(0);
+    try w.uint32(2);
+    w.endArray(tok);
+
+    try applyEventGroup(&app, body.items);
+    try std.testing.expect(state.refresh.load(.acquire));
+    try std.testing.expect(state.paused.load(.acquire));
 }
 
 test "missing menu header is exact" {
