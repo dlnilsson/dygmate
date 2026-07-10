@@ -1,6 +1,6 @@
 //! Linux system-tray battery indicator (StatusNotifierItem over D-Bus).
 //! Wayland-oriented (waybar is the primary target). Mirrors the Windows tray's
-//! menu and icon. No layer overlay and no notifications this step. Linux only.
+//! menu, icon, notification behavior, and layer OSD. Linux only.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -8,6 +8,8 @@ const linux = std.os.linux;
 const tray_common = @import("tray_common.zig");
 const battery = @import("battery.zig");
 const dbus = @import("dbus.zig");
+const layer = @import("layer.zig");
+const osd_linux = @import("osd_linux.zig");
 
 comptime {
     if (builtin.os.tag != .linux) @compileError("tray_linux.zig is Linux-only");
@@ -134,6 +136,11 @@ const App = struct {
     notify_id: u32 = 0,
     pending_notify_serial: ?u32 = null,
 
+    // Layer OSD. Null when Wayland/layer-shell is unavailable, in which case
+    // the menu item is disabled and the poll thread skips layer reads.
+    osd: ?osd_linux.Osd = null,
+    osd_hide_at: ?i64 = null, // monotonic deadline; replaces Win32 SetTimer
+
     // Current display snapshot (UI thread only).
     last: tray_common.LastKnown = .{},
     status: tray_common.DeviceStatus = .missing,
@@ -189,6 +196,8 @@ fn run(init: std.process.Init) !void {
         "no reading yet",
     }) catch app.tip_body[0..0];
     app.tip_body_len = start_tip.len;
+    // Do not poll layers until the UI thread has completed Wayland setup.
+    app.state.osd_enabled.store(false, .release);
 
     // Watch the watcher: re-register if waybar (etc.) restarts.
     try addWatcherMatch(conn);
@@ -205,19 +214,41 @@ fn run(init: std.process.Init) !void {
     // Register with the watcher (retries in the loop if it isn't up yet).
     tryRegister(&app);
 
+    // Layer OSD (Wayland layer-shell). No socket, missing layer-shell, or any
+    // setup failure leaves the tray fully functional with the OSD disabled.
+    app.osd = osd_linux.Osd.init(gpa, init.environ_map) catch null;
+    defer if (app.osd) |*o| o.deinit();
+    app.state.osd_enabled.store(app.osd != null, .release);
+
     var fds = [_]std.posix.pollfd{
         // Always read app.conn.fd() fresh — reconnect() swaps the connection.
         .{ .fd = app.conn.fd(), .events = std.posix.POLL.IN, .revents = 0 },
         .{ .fd = app.event_fd, .events = std.posix.POLL.IN, .revents = 0 },
+        // Wayland socket; -1 is ignored by poll when the OSD is unavailable.
+        .{ .fd = -1, .events = std.posix.POLL.IN, .revents = 0 },
     };
     while (!app.state.stop.load(.acquire)) {
         fds[0].fd = app.conn.fd();
-        _ = std.posix.poll(&fds, 1000) catch break;
+        fds[2].fd = if (app.osd) |*o| o.fd() else -1;
+
+        // Wake early when an OSD hide deadline is pending.
+        var timeout: i32 = 1000;
+        if (app.osd_hide_at) |at| {
+            const left = at - nowMs();
+            if (left <= 0) {
+                if (app.osd) |*o| o.hide();
+                app.osd_hide_at = null;
+            } else {
+                timeout = @intCast(@min(left, 1000));
+            }
+        }
+        _ = std.posix.poll(&fds, timeout) catch break;
 
         if (fds[1].revents & std.posix.POLL.IN != 0) {
             var drain: u64 = 0;
             _ = linux.read(app.event_fd, std.mem.asBytes(&drain), 8);
             rebuildAndNotify(&app);
+            drainLayerChanges(&app);
         }
         if (fds[0].revents & std.posix.POLL.IN != 0) {
             const msg = app.conn.readMessage() catch {
@@ -225,6 +256,17 @@ fn run(init: std.process.Init) !void {
                 continue;
             };
             dispatch(&app, msg) catch {};
+        }
+        if (fds[2].revents & (std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR) != 0) {
+            if (app.osd) |*o| {
+                o.handleReadable();
+                if (!o.alive()) {
+                    app.state.osd_enabled.store(false, .release);
+                    app.osd_hide_at = null;
+                    app.menu_revision += 1;
+                    emitLayoutUpdated(&app) catch {};
+                }
+            }
         }
         // Retry registration only when the watcher is (re)available; the
         // NameOwnerChanged handler drives re-registration, so a bounded retry
@@ -236,12 +278,31 @@ fn run(init: std.process.Init) !void {
 }
 
 fn pollThread(app: *App) void {
-    tray_common.runPollLoop(App, app, app.io, app.gpa, app.state, wake, false);
+    tray_common.runPollLoop(App, app, app.io, app.gpa, app.state, wake, true);
 }
 
 fn wake(app: *App) void {
     var v: u64 = 1;
     _ = linux.write(app.event_fd, std.mem.asBytes(&v), 8);
+}
+
+fn nowMs() i64 {
+    var ts: linux.timespec = undefined;
+    _ = linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(i64, ts.sec) * 1000 +
+        @as(i64, @divTrunc(ts.nsec, @as(isize, std.time.ns_per_ms)));
+}
+
+/// Consume the poll thread's pending layer change and (re)show the OSD,
+/// re-arming its hide deadline after every change.
+fn drainLayerChanges(app: *App) void {
+    const layer_idx = app.state.layer_change.swap(-1, .acq_rel);
+    if (layer_idx < 0) return;
+    if (!app.state.osd_enabled.load(.acquire)) return;
+    if (app.osd) |*o| {
+        o.show(layer.displayNumber(@intCast(layer_idx)));
+        app.osd_hide_at = nowMs() + osd_linux.osd_duration_ms;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -609,6 +670,10 @@ fn vU32(w: *dbus.Writer, v: u32) !void {
     try w.signature("u");
     try w.uint32(v);
 }
+fn vI32(w: *dbus.Writer, v: i32) !void {
+    try w.signature("i");
+    try w.int32(v);
+}
 fn vObjPath(w: *dbus.Writer, s: []const u8) !void {
     try w.signature("o");
     try w.objectPath(s);
@@ -645,7 +710,8 @@ const MenuId = enum(i32) {
     sep = 4,
     refresh = 5,
     toggle = 6,
-    quit = 7,
+    osd = 7,
+    quit = 8,
 };
 
 const menu_props = [_][]const u8{ "Version", "Status", "TextDirection" };
@@ -683,9 +749,11 @@ const MenuItem = struct {
     label: []const u8,
     enabled: bool,
     separator: bool = false,
+    /// Non-null renders a dbusmenu checkmark.
+    checked: ?bool = null,
 };
 
-fn buildMenuItems(app: *App, buf: *[3][48]u8) [7]MenuItem {
+fn buildMenuItems(app: *App, buf: *[3][48]u8) [8]MenuItem {
     const header = tray_common.menuHeader(app.status, app.paused);
 
     var sb: [24]u8 = undefined;
@@ -700,6 +768,12 @@ fn buildMenuItems(app: *App, buf: *[3][48]u8) [7]MenuItem {
         .{ .id = .sep, .label = "", .enabled = false, .separator = true },
         .{ .id = .refresh, .label = "Refresh battery now", .enabled = true },
         .{ .id = .toggle, .label = toggle_label, .enabled = true },
+        .{
+            .id = .osd,
+            .label = "Show layer overlay",
+            .enabled = if (app.osd) |*o| o.alive() else false,
+            .checked = app.state.osd_enabled.load(.acquire),
+        },
         .{ .id = .quit, .label = "Quit", .enabled = true },
     };
 }
@@ -752,6 +826,14 @@ fn writeMenuNode(w: *dbus.Writer, it: MenuItem) !void {
         try w.beginStruct();
         try w.string("visible");
         try vBool(w, true);
+        if (it.checked) |on| {
+            try w.beginStruct();
+            try w.string("toggle-type");
+            try vStr(w, "checkmark");
+            try w.beginStruct();
+            try w.string("toggle-state");
+            try vI32(w, if (on) 1 else 0);
+        }
     }
     w.endArray(props);
 
@@ -803,6 +885,14 @@ fn menuGetGroupProperties(app: *App, msg: dbus.Message) !void {
             try w.beginStruct();
             try w.string("visible");
             try vBool(&w, true);
+            if (it.checked) |on| {
+                try w.beginStruct();
+                try w.string("toggle-type");
+                try vStr(&w, "checkmark");
+                try w.beginStruct();
+                try w.string("toggle-state");
+                try vI32(&w, if (on) 1 else 0);
+            }
         }
         w.endArray(props);
     }
@@ -831,6 +921,26 @@ fn menuEvent(app: *App, msg: dbus.Message) !void {
                 if (!now_paused) app.state.refresh.store(true, .release);
                 wake(app); // reflect the new state in the icon/menu promptly
             },
+            .osd => {
+                const o = if (app.osd) |*value| value else {
+                    app.state.osd_enabled.store(false, .release);
+                    return app.conn.reply(msg, null, &.{});
+                };
+                if (!o.alive()) {
+                    app.state.osd_enabled.store(false, .release);
+                    return app.conn.reply(msg, null, &.{});
+                }
+                const enabled = !app.state.osd_enabled.load(.acquire);
+                app.state.osd_enabled.store(enabled, .release);
+                app.state.layer_change.store(-1, .release);
+                if (!enabled) {
+                    o.hide();
+                    app.osd_hide_at = null;
+                }
+                // menuEvent owns the Wayland socket, so hide() is safe here.
+                app.menu_revision += 1;
+                emitLayoutUpdated(app) catch {};
+            },
             .quit => {
                 app.state.stop.store(true, .release);
                 wake(app);
@@ -845,9 +955,11 @@ fn menuEvent(app: *App, msg: dbus.Message) !void {
 // Tests
 // ---------------------------------------------------------------------------
 test {
-    // Pull in the D-Bus + shared planner unit tests for `zig build test-tray`.
+    // Pull in D-Bus, shared planner, Wayland, and OSD unit tests.
     _ = @import("dbus.zig");
     _ = @import("tray_common.zig");
+    _ = @import("wayland.zig");
+    _ = @import("osd_linux.zig");
 }
 
 test "renderIcon fills background color at a corner pixel" {
@@ -883,12 +995,13 @@ test "renderIcon draws at least one white text pixel for question mark" {
 }
 
 test "missing menu header is exact" {
+    var state: tray_common.State = .{};
     var app = App{
         .io = undefined,
         .gpa = undefined,
         .conn = undefined,
         .environ = undefined,
-        .state = undefined,
+        .state = &state,
         .event_fd = -1,
         .item_name = "",
     };

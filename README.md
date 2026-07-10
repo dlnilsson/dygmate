@@ -10,8 +10,12 @@ statically.
 Tiny runtime footprint: about 2.4 MB memory usage and very low CPU usage.
 
 Shows desktop notifications on startup and when either side reaches a low
-battery level (Windows). The layer overlay and desktop notifications are not
-yet implemented on Linux.
+battery level. On Linux/Wayland, layer changes also show the same "Layer N"
+overlay through zwlr-layer-shell. It requires a compositor with
+`zwlr_layer_shell_v1` support (Hyprland, Sway, and KDE Plasma; not GNOME).
+The tray menu's **Show layer overlay** toggle controls it. The surface uses
+the `dygmate-osd` layer-shell namespace, so Hyprland users can apply rules
+such as `layerrule = noanim, dygmate-osd`.
 
 <p align="center">
    <img src="docs/tray.png" alt="Dygmate tray" width="120">

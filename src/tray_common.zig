@@ -62,8 +62,8 @@ pub const State = struct {
     paused: std.atomic.Value(bool) = .init(false),
     layer_change: std.atomic.Value(i32) = .init(-1),
     /// When false, the poll thread skips the layer read. Toggled from the tray
-    /// menu on Windows; always on there. Linux passes osd_enabled=false at
-    /// comptime so the layer read is compiled out entirely.
+    /// menu on both platforms; Linux disables it at runtime without a usable
+    /// Wayland layer-shell OSD.
     osd_enabled: std.atomic.Value(bool) = .init(true),
     /// UI-thread-only: latched per side (0=left, 1=right) so a low-battery
     /// notification fires once per crossing, not every poll.
@@ -307,7 +307,7 @@ pub fn planNotifications(
 /// Run the discover -> connect -> poll loop. `wake(ctx)` notifies the UI that
 /// a new reading (or connection-state change) is available: Windows posts a
 /// window message; Linux writes an eventfd. When `osd_enabled` is false the
-/// layer read is compiled out entirely (Linux, step 1).
+/// layer read is skipped.
 pub fn runPollLoop(
     comptime Ctx: type,
     ctx: *Ctx,
