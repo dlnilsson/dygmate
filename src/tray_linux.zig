@@ -10,6 +10,7 @@ const battery = @import("battery.zig");
 const dbus = @import("dbus.zig");
 const layer = @import("layer.zig");
 const osd_linux = @import("osd_linux.zig");
+const config = @import("config.zig");
 
 comptime {
     if (builtin.os.tag != .linux) @compileError("tray_linux.zig is Linux-only");
@@ -252,7 +253,10 @@ fn run(init: std.process.Init) !void {
     };
     if (app.osd != null) dlog("layer OSD initialized", .{});
     defer if (app.osd) |*o| o.deinit();
-    app.state.osd_enabled.store(app.osd != null, .release);
+    // Restore the saved "Show layer overlay" preference, but an unavailable OSD
+    // still forces it off.
+    const cfg = config.load(io, gpa, init.environ_map);
+    app.state.osd_enabled.store(app.osd != null and cfg.show_layer_overlay, .release);
 
     var fds = [_]std.posix.pollfd{
         // Always read app.conn.fd() fresh — reconnect() swaps the connection.
@@ -1052,6 +1056,7 @@ fn applyClicked(app: *App, id: i32) void {
             }
             const enabled = !app.state.osd_enabled.load(.acquire);
             app.state.osd_enabled.store(enabled, .release);
+            config.save(app.io, app.gpa, app.environ, .{ .show_layer_overlay = enabled });
             app.state.layer_change.store(-1, .release);
             if (!enabled) {
                 o.hide();

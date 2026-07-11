@@ -13,6 +13,7 @@ const battery = @import("battery.zig");
 const layer = @import("layer.zig");
 const device = @import("device.zig");
 const common = @import("tray_common.zig");
+const config = @import("config.zig");
 const windows = std.os.windows;
 
 // ---------------------------------------------------------------------------
@@ -314,12 +315,26 @@ var g_osd_text_len: usize = 0;
 /// The process Io, shared by the UI and polling threads (Threaded io is
 /// thread-safe). Stashed globally so the UI thread can lock the state mutex.
 var g_io: std.Io = undefined;
+/// Allocator, shared with the UI thread for the best-effort config save.
+var g_gpa: std.mem.Allocator = undefined;
+/// Config file path, resolved once at startup so the window callback (which has
+/// no environ) can persist toggles. Null if the path could not be built.
+var g_config_path: ?[]const u8 = null;
 
 // Last-known-good reading, per side (UI thread only). See common.LastKnown.
 var g_last: common.LastKnown = .{};
 
 pub fn main(init: std.process.Init) void {
     g_io = init.io;
+    g_gpa = init.gpa;
+
+    // Resolve the config path once (leaked for the process lifetime) and restore
+    // the saved "Show layer overlay" preference before the tray goes live.
+    g_config_path = config.path(init.gpa, init.environ_map) catch null;
+    if (g_config_path) |p| {
+        const cfg = config.loadFrom(init.io, init.gpa, p);
+        g_state.osd_enabled.store(cfg.show_layer_overlay, .release);
+    }
 
     // Single instance only: a second copy could never open the exclusive COM
     // port anyway, and would just show a confusing duplicate "--" icon. The
@@ -484,6 +499,7 @@ fn showMenu(hwnd: HWND) void {
         ID_OSD_TOGGLE => {
             const now_on = !g_state.osd_enabled.load(.acquire);
             g_state.osd_enabled.store(now_on, .release);
+            if (g_config_path) |p| config.saveTo(g_io, g_gpa, p, .{ .show_layer_overlay = now_on });
             // Turning it off: drop any queued change and hide a live OSD so
             // nothing lingers or pops after the user opts out.
             if (!now_on) {

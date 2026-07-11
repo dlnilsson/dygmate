@@ -163,4 +163,5 @@ test {
     _ = @import("device.zig");
     _ = @import("layer.zig");
     _ = @import("porthint.zig");
+    _ = @import("config.zig");
 }
