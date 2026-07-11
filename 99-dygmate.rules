@@ -1,0 +1,2 @@
+# Let the active local user access the Dygma Defy's CDC-ACM serial interface.
+SUBSYSTEM=="tty", ATTRS{idVendor}=="35ef", ATTRS{idProduct}=="0012", TAG+="uaccess"

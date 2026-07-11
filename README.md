@@ -52,6 +52,35 @@ zig build run-tray         # Windows
 
 ## Linux setup
 
+### Packaged installation (Arch Linux)
+
+The `dygmate-git` AUR package installs both binaries, a systemd **user** unit,
+and a targeted udev rule for the Defy's serial interface. After installing the
+package, unplug and reconnect the keyboard so the new udev rule is applied.
+Then start the tray for the logged-in desktop user (not with `sudo`):
+
+```sh
+systemctl --user enable --now dygmate-tray.service
+```
+
+The service uses the user manager's session D-Bus and device permissions. If
+you want the optional layer-shell OSD on Wayland, make sure the user manager
+also receives the Wayland environment. Run this from your compositor's
+autostart (or once in a terminal inside the Wayland session), then restart the
+service:
+
+```sh
+systemctl --user import-environment WAYLAND_DISPLAY XDG_RUNTIME_DIR
+systemctl --user restart dygmate-tray.service
+```
+
+Package maintainers can refresh the checked-in `PKGBUILD` version after
+updating the source with:
+
+```sh
+scripts/bump-pkgver
+```
+
 ### Serial port permissions
 
 The keyboard shows up as a CDC-ACM serial device (`/dev/ttyACM0`). By default
@@ -83,13 +112,14 @@ Log out and back in (or run `newgrp uucp`) for it to take effect.
 replug):
 
 ```sh
-echo 'SUBSYSTEM=="tty", ATTRS{idVendor}=="35ef", ATTRS{idProduct}=="0012", MODE="0660", TAG+="uaccess"' \
-  | sudo tee /etc/udev/rules.d/99-dygma.rules
+echo 'SUBSYSTEM=="tty", ATTRS{idVendor}=="35ef", ATTRS{idProduct}=="0012", TAG+="uaccess"' \
+  | sudo tee /etc/udev/rules.d/99-dygmate.rules
 sudo udevadm control --reload-rules && sudo udevadm trigger
 ```
 
 `TAG+="uaccess"` grants access to the user of the active login session, so no
-group membership is needed and it works for the tray too.
+group membership is needed and it works for the tray too. Replug the keyboard
+after adding or changing the rule.
 
 Close Bazecor before running dygmate either way — the serial port is exclusive.
 
@@ -105,5 +135,6 @@ Plasma, and others. In waybar, add the `tray` module to your config:
 }
 ```
 
-Start `dygmate-tray` (e.g. from your compositor's autostart). Left-click the
-icon to refresh; right-click for the menu.
+Start `dygmate-tray` (e.g. from your compositor's autostart), or use the
+packaged user service above. Left-click the icon to refresh; right-click for
+the menu.

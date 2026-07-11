@@ -1,0 +1,16 @@
+[Unit]
+Description=Dygmate Defy battery tray indicator
+PartOf=graphical-session.target
+Requires=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=/usr/bin/dygmate-tray
+Restart=on-failure
+RestartSec=3s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dygmate
+
+[Install]
+WantedBy=graphical-session.target
