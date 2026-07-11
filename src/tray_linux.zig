@@ -128,6 +128,9 @@ const App = struct {
     event_fd: i32,
     item_name: []const u8, // owned: "org.kde.StatusNotifierItem-<pid>-1"
     item_registered: bool = false,
+    // The main loop retries registration every poll tick while the watcher is
+    // down; log only the first failure of each streak to avoid 1/s spam.
+    register_fail_logged: bool = false,
     menu_revision: u32 = 1,
 
     // Notification popup slot. The daemon assigns an id on the first Notify
@@ -156,6 +159,23 @@ const App = struct {
 
 var g_state: tray_common.State = .{};
 
+/// Set by --debug. Informational progress goes to stdout (dlog), failures to
+/// stderr (dlogErr), so a terminal run can split them:
+///   dygmate-tray --debug > info.log 2> errors.log
+var debug_log = false;
+
+fn dlog(comptime fmt: []const u8, args: anytype) void {
+    if (!debug_log) return;
+    // Big enough for two 255-byte D-Bus names (iface.member) plus the prefix.
+    var buf: [640]u8 = undefined;
+    const line = std.fmt.bufPrint(&buf, "dygmate-tray: " ++ fmt ++ "\n", args) catch return;
+    _ = linux.write(1, line.ptr, line.len);
+}
+
+fn dlogErr(comptime fmt: []const u8, args: anytype) void {
+    if (debug_log) std.debug.print("dygmate-tray: " ++ fmt ++ "\n", args);
+}
+
 pub fn main(init: std.process.Init) void {
     run(init) catch |e| {
         std.debug.print("dygmate-tray: {s}\n", .{@errorName(e)});
@@ -166,13 +186,22 @@ fn run(init: std.process.Init) !void {
     const io = init.io;
     const gpa = init.gpa;
 
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
+    for (args[1..]) |arg| {
+        if (std.mem.eql(u8, arg, "--debug")) debug_log = true;
+    }
+
     // Single instance: hold an exclusive flock on a lock file in the runtime
     // dir. A second copy could never open the exclusive serial port anyway.
     const runtime_dir = init.environ_map.get("XDG_RUNTIME_DIR") orelse "/tmp";
-    if (acquireSingleton(runtime_dir) == null) return; // already running
+    if (acquireSingleton(runtime_dir) == null) {
+        dlog("another instance holds the lock, exiting", .{});
+        return; // already running
+    }
 
     const uid = linux.getuid();
     const conn = try dbus.Connection.connectSession(io, gpa, init.environ_map, uid);
+    dlog("connected to session bus as {s}", .{conn.unique_name});
 
     const pid = linux.getpid();
     const item_name = try std.fmt.allocPrint(gpa, "{s}-{d}-1", .{ item_iface, pid });
@@ -202,6 +231,7 @@ fn run(init: std.process.Init) !void {
     // Watch the watcher: re-register if waybar (etc.) restarts.
     try addWatcherMatch(conn);
     try requestName(&app);
+    dlog("acquired bus name {s}", .{app.item_name});
 
     // Background serial poll thread. It only touches State + the eventfd, never
     // the D-Bus socket, so all bus I/O stays on this (the main) thread.
@@ -216,7 +246,11 @@ fn run(init: std.process.Init) !void {
 
     // Layer OSD (Wayland layer-shell). No socket, missing layer-shell, or any
     // setup failure leaves the tray fully functional with the OSD disabled.
-    app.osd = osd_linux.Osd.init(gpa, init.environ_map) catch null;
+    app.osd = osd_linux.Osd.init(gpa, init.environ_map) catch |e| blk: {
+        dlogErr("layer OSD unavailable: {s}", .{@errorName(e)});
+        break :blk null;
+    };
+    if (app.osd != null) dlog("layer OSD initialized", .{});
     defer if (app.osd) |*o| o.deinit();
     app.state.osd_enabled.store(app.osd != null, .release);
 
@@ -251,11 +285,12 @@ fn run(init: std.process.Init) !void {
             drainLayerChanges(&app);
         }
         if (fds[0].revents & std.posix.POLL.IN != 0) {
-            const msg = app.conn.readMessage() catch {
+            const msg = app.conn.readMessage() catch |e| {
+                dlogErr("bus read failed ({s}), reconnecting", .{@errorName(e)});
                 reconnect(&app);
                 continue;
             };
-            dispatch(&app, msg) catch {};
+            dispatch(&app, msg) catch |e| dlogErr("dispatch error: {s}", .{@errorName(e)});
         }
         if (fds[2].revents & (std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR) != 0) {
             if (app.osd) |*o| {
@@ -346,11 +381,17 @@ fn addWatcherMatch(conn: *dbus.Connection) !void {
 /// Attempt to register with the watcher; on success set item_registered. On
 /// failure (watcher not up yet) leave it false so the main loop retries.
 fn tryRegister(app: *App) void {
-    registerItem(app) catch {
+    registerItem(app) catch |e| {
+        if (!app.register_fail_logged) {
+            dlogErr("watcher registration failed: {s} (retrying until it appears)", .{@errorName(e)});
+            app.register_fail_logged = true;
+        }
         app.item_registered = false;
         return;
     };
     app.item_registered = true;
+    app.register_fail_logged = false;
+    dlog("registered with StatusNotifierWatcher", .{});
 }
 
 fn registerItem(app: *App) !void {
@@ -364,6 +405,7 @@ fn registerItem(app: *App) !void {
 const watcher_iface = "org.kde.StatusNotifierWatcher";
 
 fn reconnect(app: *App) void {
+    dlogErr("session bus connection lost, reconnecting", .{});
     app.conn.deinit();
     app.item_registered = false;
     // Notification ids are daemon/connection-scoped; a new bus means a new slot.
@@ -375,8 +417,9 @@ fn reconnect(app: *App) void {
             continue;
         };
         app.conn = conn;
-        addWatcherMatch(conn) catch {};
-        requestName(app) catch {};
+        dlog("reconnected to session bus as {s}", .{conn.unique_name});
+        addWatcherMatch(conn) catch |e| dlogErr("re-adding watcher match failed: {s}", .{@errorName(e)});
+        requestName(app) catch |e| dlogErr("re-requesting bus name failed: {s}", .{@errorName(e)});
         tryRegister(app);
         return;
     }
@@ -419,6 +462,9 @@ fn rebuildAndNotify(app: *App) void {
     }
     app.status = status;
     app.paused = paused;
+    dlog("update: status={s} paused={} left={?d}% right={?d}%", .{
+        @tagName(status), paused, app.last.left.level, app.last.right.level,
+    });
 
     // Icon: show '?' only for true USB absence. Available/paused keep the
     // gray last-known display, with '--' reserved for "no reading yet".
@@ -467,7 +513,11 @@ fn emitLayoutUpdated(app: *App) !void {
 /// failure is swallowed. The reply (the assigned id) is picked up async in
 /// dispatch; callAndWait would drop concurrent incoming menu calls (dbus.zig).
 fn sendNotification(app: *App, ev: tray_common.NotifyEvent, snapshot: battery.Reading) void {
-    notifyInner(app, ev, snapshot) catch {};
+    notifyInner(app, ev, snapshot) catch |e| {
+        dlogErr("notification failed: {s}", .{@errorName(e)});
+        return;
+    };
+    dlog("notification sent: {s}", .{@tagName(ev.kind)});
 }
 
 fn notifyInner(app: *App, ev: tray_common.NotifyEvent, snapshot: battery.Reading) !void {
@@ -545,6 +595,7 @@ fn dispatch(app: *App, msg: dbus.Message) !void {
 
     const iface = msg.interface orelse "";
     const member = msg.member orelse "";
+    dlog("method call {s}.{s}", .{ iface, member });
 
     if (std.mem.eql(u8, iface, props_iface)) {
         if (std.mem.eql(u8, member, "Get")) return handlePropGet(app, msg);
@@ -568,6 +619,7 @@ fn handleNameOwnerChanged(app: *App, msg: dbus.Message) void {
     _ = r.string() catch return; // old owner
     const new_owner = r.string() catch return;
     if (std.mem.eql(u8, name, watcher_name) and new_owner.len > 0) {
+        dlog("watcher owner changed to '{s}', re-registering", .{new_owner});
         app.item_registered = false;
         tryRegister(app);
     }
@@ -976,7 +1028,11 @@ fn skipVariant(r: *dbus.Reader) !void {
 fn applyClicked(app: *App, id: i32) void {
     // A host is free to send any id; an out-of-range @enumFromInt would be
     // safety-checked illegal behavior, so reject unknown ids explicitly.
-    const menu_id = std.enums.fromInt(MenuId, id) orelse return;
+    const menu_id = std.enums.fromInt(MenuId, id) orelse {
+        dlog("menu click on unknown id {d}, ignored", .{id});
+        return;
+    };
+    dlog("menu click: {s}", .{@tagName(menu_id)});
     switch (menu_id) {
         .refresh => app.state.refresh.store(true, .release),
         .toggle => {
