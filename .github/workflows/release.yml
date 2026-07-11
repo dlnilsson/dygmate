@@ -1,0 +1,41 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-upload:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Build (ReleaseSmall, linux x86_64)
+        run: zig build -Doptimize=ReleaseSmall
+
+      - name: Assemble release tarball
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          stage="dygmate-${ver}-x86_64"
+          mkdir "${stage}"
+          cp zig-out/bin/dygmate zig-out/bin/dygmate-tray "${stage}/"
+          cp dygmate-tray.service 99-dygmate.rules LICENSE "${stage}/"
+          tar -C "${stage}" -czf "${stage}.tar.gz" .
+          sha256sum "${stage}.tar.gz" | tee "${stage}.tar.gz.sha256"
+
+      - name: Publish release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dygmate-*-x86_64.tar.gz
+            dygmate-*-x86_64.tar.gz.sha256
