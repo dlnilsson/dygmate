@@ -12,7 +12,7 @@ makedepends=('zig')
 options=('!debug')
 provides=('dygmate')
 conflicts=('dygmate')
-source=("git+${url}.git")
+source=("git+${url}.git#branch=next")
 sha256sums=('SKIP')
 
 pkgver() {
