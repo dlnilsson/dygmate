@@ -144,6 +144,11 @@ const App = struct {
     // the menu item is disabled and the poll thread skips layer reads.
     osd: ?osd_linux.Osd = null,
     osd_hide_at: ?i64 = null, // monotonic deadline; replaces Win32 SetTimer
+    osd_show_at: ?i64 = null, // monotonic deadline for a delayed show, or null
+    osd_pending_layer: u8 = 0, // layer to show when osd_show_at fires
+    // Persisted settings, loaded once at startup. Kept whole so toggling one
+    // field and saving does not clobber the user's other hand-edited values.
+    cfg: config.Config = .{},
 
     // Current display snapshot (UI thread only).
     last: tray_common.LastKnown = .{},
@@ -255,8 +260,8 @@ fn run(init: std.process.Init) !void {
     defer if (app.osd) |*o| o.deinit();
     // Restore the saved "Show layer overlay" preference, but an unavailable OSD
     // still forces it off.
-    const cfg = config.load(io, gpa, init.environ_map);
-    app.state.osd_enabled.store(app.osd != null and cfg.show_layer_overlay, .release);
+    app.cfg = config.loadOrInit(io, gpa, init.environ_map);
+    app.state.osd_enabled.store(app.osd != null and app.cfg.show_layer_overlay, .release);
 
     var fds = [_]std.posix.pollfd{
         // Always read app.conn.fd() fresh — reconnect() swaps the connection.
@@ -269,15 +274,23 @@ fn run(init: std.process.Init) !void {
         fds[0].fd = app.conn.fd();
         fds[2].fd = if (app.osd) |*o| o.fd() else -1;
 
-        // Wake early when an OSD hide deadline is pending.
+        // Wake early when an OSD show or hide deadline is pending.
         var timeout: i32 = 1000;
+        if (app.osd_show_at) |at| {
+            const left = at - nowMs();
+            if (left <= 0) {
+                showOsdNow(&app);
+            } else {
+                timeout = @intCast(@min(left, 1000));
+            }
+        }
         if (app.osd_hide_at) |at| {
             const left = at - nowMs();
             if (left <= 0) {
                 if (app.osd) |*o| o.hide();
                 app.osd_hide_at = null;
             } else {
-                timeout = @intCast(@min(left, 1000));
+                timeout = @min(timeout, @as(i32, @intCast(@min(left, 1000))));
             }
         }
         _ = std.posix.poll(&fds, timeout) catch break;
@@ -302,6 +315,7 @@ fn run(init: std.process.Init) !void {
                 if (!o.alive()) {
                     app.state.osd_enabled.store(false, .release);
                     app.osd_hide_at = null;
+                    app.osd_show_at = null;
                     app.menu_revision += 1;
                     emitLayoutUpdated(&app) catch {};
                 }
@@ -332,15 +346,28 @@ fn nowMs() i64 {
         @as(i64, @divTrunc(ts.nsec, @as(isize, std.time.ns_per_ms)));
 }
 
-/// Consume the poll thread's pending layer change and (re)show the OSD,
-/// re-arming its hide deadline after every change.
+/// Consume the poll thread's pending layer change and (re)arm the OSD. With no
+/// configured delay the overlay shows immediately; otherwise the show is
+/// deferred by `overlay_delay_ms`, re-arming with the latest layer each change.
 fn drainLayerChanges(app: *App) void {
     const layer_idx = app.state.layer_change.swap(-1, .acq_rel);
     if (layer_idx < 0) return;
     if (!app.state.osd_enabled.load(.acquire)) return;
+    if (app.osd == null) return;
+    app.osd_pending_layer = @intCast(layer_idx);
+    if (app.cfg.overlay_delay_ms == 0) {
+        showOsdNow(app);
+    } else {
+        app.osd_show_at = nowMs() + @as(i64, app.cfg.overlay_delay_ms);
+    }
+}
+
+/// Show the pending layer overlay now and arm its hide deadline.
+fn showOsdNow(app: *App) void {
+    app.osd_show_at = null;
     if (app.osd) |*o| {
-        o.show(layer.displayNumber(@intCast(layer_idx)));
-        app.osd_hide_at = nowMs() + osd_linux.osd_duration_ms;
+        o.show(layer.displayNumber(app.osd_pending_layer));
+        app.osd_hide_at = nowMs() + @as(i64, app.cfg.overlay_duration_ms);
     }
 }
 
@@ -1056,11 +1083,13 @@ fn applyClicked(app: *App, id: i32) void {
             }
             const enabled = !app.state.osd_enabled.load(.acquire);
             app.state.osd_enabled.store(enabled, .release);
-            config.save(app.io, app.gpa, app.environ, .{ .show_layer_overlay = enabled });
+            app.cfg.show_layer_overlay = enabled;
+            config.save(app.io, app.gpa, app.environ, app.cfg);
             app.state.layer_change.store(-1, .release);
             if (!enabled) {
                 o.hide();
                 app.osd_hide_at = null;
+                app.osd_show_at = null;
             }
             // The menu dispatch owns the Wayland socket, so hide() is safe here.
             app.menu_revision += 1;

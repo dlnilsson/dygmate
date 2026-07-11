@@ -259,9 +259,9 @@ const ID_QUIT: i32 = 2;
 const ID_TOGGLE: i32 = 3;
 const ID_OSD_TOGGLE: i32 = 4;
 const ID_OSD_HIDE: usize = 1;
+const ID_OSD_SHOW: usize = 2;
 
 const icon_size: i32 = 16;
-const osd_duration_ms: UINT = 900;
 const osd_width: i32 = 156;
 const osd_height: i32 = 56;
 const osd_bottom_margin: i32 = 124;
@@ -320,6 +320,9 @@ var g_gpa: std.mem.Allocator = undefined;
 /// Config file path, resolved once at startup so the window callback (which has
 /// no environ) can persist toggles. Null if the path could not be built.
 var g_config_path: ?[]const u8 = null;
+/// Persisted settings, loaded once at startup. Kept whole so toggling one field
+/// and saving does not clobber the user's other hand-edited values.
+var g_cfg: config.Config = .{};
 
 // Last-known-good reading, per side (UI thread only). See common.LastKnown.
 var g_last: common.LastKnown = .{};
@@ -332,8 +335,8 @@ pub fn main(init: std.process.Init) void {
     // the saved "Show layer overlay" preference before the tray goes live.
     g_config_path = config.path(init.gpa, init.environ_map) catch null;
     if (g_config_path) |p| {
-        const cfg = config.loadFrom(init.io, init.gpa, p);
-        g_state.osd_enabled.store(cfg.show_layer_overlay, .release);
+        g_cfg = config.loadOrInitFrom(init.io, init.gpa, p);
+        g_state.osd_enabled.store(g_cfg.show_layer_overlay, .release);
     }
 
     // Single instance only: a second copy could never open the exclusive COM
@@ -447,6 +450,9 @@ fn osdWndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.w
             if (wparam == ID_OSD_HIDE) {
                 _ = KillTimer(hwnd, ID_OSD_HIDE);
                 _ = ShowWindow(hwnd, SW_HIDE);
+            } else if (wparam == ID_OSD_SHOW) {
+                _ = KillTimer(hwnd, ID_OSD_SHOW);
+                presentOsd(hwnd);
             }
             return 0;
         },
@@ -499,12 +505,14 @@ fn showMenu(hwnd: HWND) void {
         ID_OSD_TOGGLE => {
             const now_on = !g_state.osd_enabled.load(.acquire);
             g_state.osd_enabled.store(now_on, .release);
-            if (g_config_path) |p| config.saveTo(g_io, g_gpa, p, .{ .show_layer_overlay = now_on });
+            g_cfg.show_layer_overlay = now_on;
+            if (g_config_path) |p| config.saveTo(g_io, g_gpa, p, g_cfg);
             // Turning it off: drop any queued change and hide a live OSD so
             // nothing lingers or pops after the user opts out.
             if (!now_on) {
                 g_state.layer_change.store(-1, .release);
                 if (g_osd_hwnd) |osd| {
+                    _ = KillTimer(osd, ID_OSD_SHOW);
                     _ = KillTimer(osd, ID_OSD_HIDE);
                     _ = ShowWindow(osd, SW_HIDE);
                 }
@@ -650,17 +658,26 @@ fn drainLayerChanges() void {
     const layer_idx = g_state.layer_change.swap(-1, .acq_rel);
     if (layer_idx < 0) return;
     if (!g_state.osd_enabled.load(.acquire)) return;
-    showLayerOsd(@intCast(layer_idx));
-}
-
-fn showLayerOsd(layer_idx: u8) void {
     const hwnd = g_osd_hwnd orelse return;
 
+    // Build the label now (captures the latest layer); the show itself may be
+    // deferred by the configured delay.
     var label_buf: [16]u8 = undefined;
-    const label = std.fmt.bufPrint(&label_buf, "Layer {d}", .{layer.displayNumber(layer_idx)}) catch return;
+    const label = std.fmt.bufPrint(&label_buf, "Layer {d}", .{layer.displayNumber(@intCast(layer_idx))}) catch return;
     g_osd_text_len = std.unicode.utf8ToUtf16Le(g_osd_text[0 .. g_osd_text.len - 1], label) catch return;
     g_osd_text[g_osd_text_len] = 0;
 
+    if (g_cfg.overlay_delay_ms == 0) {
+        presentOsd(hwnd);
+    } else {
+        _ = KillTimer(hwnd, ID_OSD_SHOW);
+        _ = SetTimer(hwnd, ID_OSD_SHOW, g_cfg.overlay_delay_ms, null);
+    }
+}
+
+/// Position, show, and arm the auto-hide for the OSD using the label already
+/// staged in `g_osd_text`. Called immediately or from the delayed show timer.
+fn presentOsd(hwnd: HWND) void {
     var work = RECT{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
     const work_ptr: *anyopaque = @ptrCast(&work);
     if (SystemParametersInfoW(SPI_GETWORKAREA, 0, work_ptr, 0) == .FALSE) {
@@ -674,7 +691,7 @@ fn showLayerOsd(layer_idx: u8) void {
     _ = InvalidateRect(hwnd, null, .TRUE);
     _ = UpdateWindow(hwnd);
     _ = KillTimer(hwnd, ID_OSD_HIDE);
-    _ = SetTimer(hwnd, ID_OSD_HIDE, osd_duration_ms, null);
+    _ = SetTimer(hwnd, ID_OSD_HIDE, g_cfg.overlay_duration_ms, null);
 }
 
 fn paintOsd(hwnd: HWND) void {

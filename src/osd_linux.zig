@@ -1,7 +1,8 @@
 //! Linux layer OSD: a zwlr_layer_shell_v1 overlay surface showing "Layer N",
 //! rendered in software into a wl_shm buffer. Visual parity with the Windows
 //! OSD (tray_windows.zig paintOsd): 156x56, rounded corners d=26, dark bg,
-//! 2px border, alpha 250, bottom-centered 124px up, 900ms auto-hide.
+//! 2px border, alpha 250, bottom-centered 124px up. Show delay and auto-hide
+//! duration are config-driven (defaults: no delay, 900ms visible).
 
 const std = @import("std");
 const builtin = @import("builtin");
