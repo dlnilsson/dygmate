@@ -2,7 +2,7 @@
 
 pkgname=dygmate-git
 _pkgname=dygmate
-pkgver=0.1.0.r26.gc075964
+pkgver=0.1.0.r33.gd3dfa1f
 pkgrel=1
 pkgdesc='Dygma Defy wireless battery indicator'
 arch=('x86_64')
