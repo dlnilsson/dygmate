@@ -7,3 +7,4 @@ zig-out/
 /dygmate/
 /src/dygmate/
 *.pkg.tar.zst
+dist/
