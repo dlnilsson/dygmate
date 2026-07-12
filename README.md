@@ -1,6 +1,6 @@
 # dygmate
 
-Battery status for the Dygma Defy wireless, right in your system tray — over
+Battery status for the [Dygma Defy](https://dygma.com/pages/defy) wireless, right in your system tray — over
 RF and Bluetooth, on Windows and Linux. Right-click for the menu, and get an optional on-screen overlay when you
 switch layers.
 
@@ -12,6 +12,24 @@ switch layers.
 <p align="center">
   <img src="docs/dygmate-overlay.gif" alt="Dygmate layer overlay" width="426">
 </p>
+
+## Install
+
+### Linux
+
+#### AUR
+
+```sh
+yay -S dygmate-bin
+```
+
+The package installs the udev rule and the `dygmate-tray` user service, so you
+can skip the manual steps under [Linux setup](#linux-setup) — just replug the
+keyboard and enable the service:
+
+```sh
+systemctl --user enable --now dygmate-tray.service
+```
 
 ## Build
 
@@ -84,7 +102,8 @@ sudo usermod -aG uucp "$USER"     # or: dialout
 Log out and back in (or run `newgrp uucp`) for it to take effect.
 
 **Or install a udev rule** (targeted to the Dygma, no group change, survives
-replug):
+replug). The AUR package already ships this rule — replug the keyboard and
+skip this step. Manual install:
 
 ```sh
 echo 'SUBSYSTEM=="tty", ATTRS{idVendor}=="35ef", ATTRS{idProduct}=="0012", TAG+="uaccess"' \
@@ -96,4 +115,4 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 group membership is needed and it works for the tray too. Replug the keyboard
 after adding or changing the rule.
 
-Close Bazecor before running dygmate either way — the serial port is exclusive.
+Close [Bazecor](https://github.com/Dygmalab/Bazecor) before running dygmate either way — the serial port is exclusive.
