@@ -49,7 +49,7 @@ forks winget-pkgs and opens the PR under your GitHub account:
 winget install wingetcreate
 
 # First release (interactive; prefills from the installer URL):
-wingetcreate new https://github.com/dlnilsson/dygma-battery-tray/releases/download/v0.1.0/dygmate-0.1.0-windows-x86_64.zip
+wingetcreate new https://github.com/dlnilsson/dygmate/releases/download/v0.1.0/dygmate-0.1.0-windows-x86_64.zip
 
 # Later releases (one command):
 wingetcreate update dlnilsson.dygmate --version 0.2.0 --urls <new-zip-url> --submit

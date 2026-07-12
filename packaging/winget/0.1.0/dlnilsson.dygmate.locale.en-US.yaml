@@ -4,11 +4,11 @@ PackageVersion: 0.1.0
 PackageLocale: en-US
 Publisher: Daniel Nilsson
 PublisherUrl: https://github.com/dlnilsson
-PublisherSupportUrl: https://github.com/dlnilsson/dygma-battery-tray/issues
+PublisherSupportUrl: https://github.com/dlnilsson/dygmate/issues
 PackageName: dygmate
-PackageUrl: https://github.com/dlnilsson/dygma-battery-tray
+PackageUrl: https://github.com/dlnilsson/dygmate
 License: GPL-2.0-only
-LicenseUrl: https://github.com/dlnilsson/dygma-battery-tray/blob/main/LICENSE
+LicenseUrl: https://github.com/dlnilsson/dygmate/blob/main/LICENSE
 ShortDescription: Tray app for checking Dygma Defy wireless battery status.
 Description: |-
   System-tray app showing the battery level of both sides of a Dygma Defy
