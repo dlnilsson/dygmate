@@ -13,8 +13,7 @@ NestedInstallerFiles:
     PortableCommandAlias: dygmate-tray
 Installers:
   - Architecture: x64
-    InstallerUrl: https://github.com/dlnilsson/dygma-battery-tray/releases/download/v0.1.0/dygmate-0.1.0-windows-x86_64.zip
-    # Placeholder — replace with the hash from the release's SHA256SUMS.txt.
-    InstallerSha256: 0000000000000000000000000000000000000000000000000000000000000000
+    InstallerUrl: https://github.com/dlnilsson/dygmate/releases/download/v0.1.0/dygmate-0.1.0-windows-x86_64.zip
+    InstallerSha256: ed78a3c051bda51422c553e620a53faf4d61d8150fb78bc9a74a0d899ed7562f
 ManifestType: installer
 ManifestVersion: 1.6.0
