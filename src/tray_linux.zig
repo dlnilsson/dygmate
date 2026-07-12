@@ -12,6 +12,7 @@ const dbus = @import("dbus.zig");
 const layer = @import("layer.zig");
 const osd_linux = @import("osd_linux.zig");
 const config = @import("config.zig");
+const update = @import("update.zig");
 
 comptime {
     if (builtin.os.tag != .linux) @compileError("tray_linux.zig is Linux-only");
@@ -159,6 +160,9 @@ const App = struct {
     tip_body: [128]u8 = undefined,
     tip_body_len: usize = 0,
 
+    // Populated by the one-shot GitHub update check ~60s after startup.
+    update: update.State = .{},
+
     fn tipBody(self: *const App) []const u8 {
         return self.tip_body[0..self.tip_body_len];
     }
@@ -255,6 +259,9 @@ fn run(init: std.process.Init) !void {
 
     // Register with the watcher (retries in the loop if it isn't up yet).
     tryRegister(&app);
+
+    // One-shot GitHub update check on its own thread + isolated io.
+    update.spawnCheck(gpa, build_options.version, &app.update);
 
     // Layer OSD (Wayland layer-shell). No socket, missing layer-shell, or any
     // setup failure leaves the tray fully functional with the OSD disabled.
@@ -801,6 +808,7 @@ const MenuId = enum(i32) {
     toggle = 6,
     osd = 7,
     quit = 8,
+    update = 9,
 };
 
 const menu_props = [_][]const u8{ "Version", "Status", "TextDirection" };
@@ -853,7 +861,9 @@ const MenuItem = struct {
     checked: ?bool = null,
 };
 
-fn buildMenuItems(app: *App, buf: *[3][48]u8) [8]MenuItem {
+/// Fill `out` with the current menu, returning the populated prefix. The update
+/// item is present only after the background check has found a newer release.
+fn buildMenuItems(app: *App, buf: *[3][48]u8, out: *[9]MenuItem) []const MenuItem {
     const header = tray_common.menuHeader(app.status, app.paused);
 
     var sb: [24]u8 = undefined;
@@ -861,28 +871,41 @@ fn buildMenuItems(app: *App, buf: *[3][48]u8) [8]MenuItem {
     const right_label: []const u8 = std.fmt.bufPrint(&buf[1], "Right: {s}", .{tray_common.fmtMenuSide(&sb, app.last.right)}) catch "Right: ?";
     const toggle_label: []const u8 = if (app.paused) "Reconnect" else "Disconnect (release port for Bazecor)";
 
-    return .{
-        .{ .id = .status, .label = header, .enabled = false },
-        .{ .id = .left, .label = left_label, .enabled = false },
-        .{ .id = .right, .label = right_label, .enabled = false },
-        .{ .id = .sep, .label = "", .enabled = false, .separator = true },
-        .{ .id = .refresh, .label = "Refresh battery now", .enabled = true },
-        .{ .id = .toggle, .label = toggle_label, .enabled = true },
-        .{
-            .id = .osd,
-            .label = "Show layer overlay",
-            .enabled = if (app.osd) |*o| o.alive() else false,
-            .checked = app.state.osd_enabled.load(.acquire),
-        },
-        .{ .id = .quit, .label = "Quit", .enabled = true },
+    var n: usize = 0;
+    out[n] = .{ .id = .status, .label = header, .enabled = false };
+    n += 1;
+    out[n] = .{ .id = .left, .label = left_label, .enabled = false };
+    n += 1;
+    out[n] = .{ .id = .right, .label = right_label, .enabled = false };
+    n += 1;
+    out[n] = .{ .id = .sep, .label = "", .enabled = false, .separator = true };
+    n += 1;
+    out[n] = .{ .id = .refresh, .label = "Refresh battery now", .enabled = true };
+    n += 1;
+    out[n] = .{ .id = .toggle, .label = toggle_label, .enabled = true };
+    n += 1;
+    out[n] = .{
+        .id = .osd,
+        .label = "Show layer overlay",
+        .enabled = if (app.osd) |*o| o.alive() else false,
+        .checked = app.state.osd_enabled.load(.acquire),
     };
+    n += 1;
+    if (app.update.isAvailable()) {
+        out[n] = .{ .id = .update, .label = app.update.label(), .enabled = true };
+        n += 1;
+    }
+    out[n] = .{ .id = .quit, .label = "Quit", .enabled = true };
+    n += 1;
+    return out[0..n];
 }
 
 /// GetLayout(parentId i, recursionDepth i, propertyNames as) ->
 ///   (revision u, layout (ia{sv}av)).
 fn menuGetLayout(app: *App, msg: dbus.Message) !void {
     var line: [3][48]u8 = undefined;
-    const items = buildMenuItems(app, &line);
+    var item_buf: [9]MenuItem = undefined;
+    const items = buildMenuItems(app, &line, &item_buf);
 
     var body = std.ArrayList(u8).empty;
     defer body.deinit(app.gpa);
@@ -950,11 +973,12 @@ fn writeEmptyProps(w: *dbus.Writer) !void {
 /// GetGroupProperties(ids ai, propertyNames as) -> a(ia{sv}).
 fn menuGetGroupProperties(app: *App, msg: dbus.Message) !void {
     var line: [3][48]u8 = undefined;
-    const items = buildMenuItems(app, &line);
+    var item_buf: [9]MenuItem = undefined;
+    const items = buildMenuItems(app, &line, &item_buf);
 
     var r = dbus.Reader{ .data = msg.body };
     const ids_end = try r.arrayEnd(4);
-    var requested: [8]i32 = undefined;
+    var requested: [16]i32 = undefined;
     var n_req: usize = 0;
     while (r.pos < ids_end and n_req < requested.len) : (n_req += 1) {
         requested[n_req] = @bitCast(try r.uint32());
@@ -1101,12 +1125,42 @@ fn applyClicked(app: *App, id: i32) void {
             app.menu_revision += 1;
             emitLayoutUpdated(app) catch {};
         },
+        .update => openReleasePage(app),
         .quit => {
             app.state.stop.store(true, .release);
             wake(app);
         },
         else => {},
     }
+}
+
+/// Open the release page in the user's browser. Runs on a detached thread with
+/// its own io so a slow-launching browser never stalls the D-Bus dispatch loop.
+fn openReleasePage(app: *App) void {
+    const t = std.Thread.spawn(.{}, openUrlWorker, .{app}) catch |e| {
+        dlogErr("open release page: {s}", .{@errorName(e)});
+        return;
+    };
+    t.detach();
+}
+
+fn openUrlWorker(app: *App) void {
+    var threaded = std.Io.Threaded.init(app.gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var child = std.process.spawn(io, .{
+        .argv = &.{ "xdg-open", app.update.url() },
+        // Inherit the real session env so xdg-open sees DISPLAY / DBUS / HOME.
+        .environ_map = app.environ,
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    }) catch |e| {
+        dlogErr("xdg-open spawn failed: {s}", .{@errorName(e)});
+        return;
+    };
+    _ = child.wait(io) catch {};
 }
 
 // ---------------------------------------------------------------------------
@@ -1118,6 +1172,7 @@ test {
     _ = @import("tray_common.zig");
     _ = @import("wayland.zig");
     _ = @import("osd_linux.zig");
+    _ = @import("update.zig");
 }
 
 test "renderIcon fills background color at a corner pixel" {
@@ -1321,6 +1376,7 @@ test "missing menu header is exact" {
     app.status = .missing;
     app.paused = false;
     var buf: [3][48]u8 = undefined;
-    const items = buildMenuItems(&app, &buf);
+    var item_buf: [9]MenuItem = undefined;
+    const items = buildMenuItems(&app, &buf, &item_buf);
     try std.testing.expectEqualStrings("No keyboard discovered", items[0].label);
 }

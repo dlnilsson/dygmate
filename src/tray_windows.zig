@@ -15,6 +15,7 @@ const layer = @import("layer.zig");
 const device = @import("device.zig");
 const common = @import("tray_common.zig");
 const config = @import("config.zig");
+const update = @import("update.zig");
 const windows = std.os.windows;
 
 // ---------------------------------------------------------------------------
@@ -114,6 +115,8 @@ extern "kernel32" fn GetLastError() callconv(.winapi) DWORD;
 extern "kernel32" fn AttachConsole(dwProcessId: DWORD) callconv(.winapi) BOOL;
 extern "kernel32" fn GetStdHandle(nStdHandle: DWORD) callconv(.winapi) ?windows.HANDLE;
 extern "kernel32" fn WriteFile(hFile: windows.HANDLE, lpBuffer: [*]const u8, nNumberOfBytesToWrite: DWORD, lpNumberOfBytesWritten: ?*DWORD, lpOverlapped: ?*anyopaque) callconv(.winapi) BOOL;
+// Opens the release page in the default browser for the update menu item.
+extern "shell32" fn ShellExecuteW(hwnd: ?HWND, lpOperation: ?[*:0]const u16, lpFile: [*:0]const u16, lpParameters: ?[*:0]const u16, lpDirectory: ?[*:0]const u16, nShowCmd: i32) callconv(.winapi) ?windows.HINSTANCE;
 
 extern "user32" fn RegisterClassExW(lpWndClass: *const WNDCLASSEXW) callconv(.winapi) ATOM;
 extern "user32" fn CreateWindowExW(
@@ -247,6 +250,7 @@ const WS_EX_NOACTIVATE: DWORD = 0x08000000;
 const LWA_COLORKEY: DWORD = 0x00000001;
 const LWA_ALPHA: DWORD = 0x00000002;
 const SW_HIDE: i32 = 0;
+const SW_SHOWNORMAL: i32 = 1;
 const SW_SHOWNOACTIVATE: i32 = 4;
 const SWP_NOACTIVATE: UINT = 0x0010;
 const SWP_SHOWWINDOW: UINT = 0x0040;
@@ -264,6 +268,7 @@ const ID_REFRESH: i32 = 1;
 const ID_QUIT: i32 = 2;
 const ID_TOGGLE: i32 = 3;
 const ID_OSD_TOGGLE: i32 = 4;
+const ID_UPDATE: i32 = 5;
 const ID_OSD_HIDE: usize = 1;
 const ID_OSD_SHOW: usize = 2;
 
@@ -329,6 +334,9 @@ var g_config_path: ?[]const u8 = null;
 /// Persisted settings, loaded once at startup. Kept whole so toggling one field
 /// and saving does not clobber the user's other hand-edited values.
 var g_cfg: config.Config = .{};
+/// Populated by the one-shot GitHub update check ~60s after startup. Read on
+/// the UI thread when building the tray menu.
+var g_update: update.State = .{};
 
 // Last-known-good reading, per side (UI thread only). See common.LastKnown.
 var g_last: common.LastKnown = .{};
@@ -429,6 +437,9 @@ pub fn main(init: std.process.Init) void {
         return;
     };
 
+    // One-shot GitHub update check on its own thread + isolated io.
+    update.spawnCheck(init.gpa, build_options.version, &g_update);
+
     var msg: MSG = undefined;
     while (GetMessageW(&msg, null, 0, 0) > 0) {
         _ = TranslateMessage(&msg);
@@ -516,6 +527,9 @@ fn showMenu(hwnd: HWND) void {
     var osd_flags: UINT = MF_STRING;
     if (g_state.osd_enabled.load(.acquire)) osd_flags |= MF_CHECKED;
     _ = AppendMenuW(menu, osd_flags, @intCast(ID_OSD_TOGGLE), menu_osd);
+    if (g_update.isAvailable()) {
+        appendMenuText(menu, MF_STRING, @intCast(ID_UPDATE), g_update.label());
+    }
     _ = AppendMenuW(menu, MF_STRING, @intCast(ID_QUIT), menu_quit);
     // Bold "Refresh battery now" as the default (also the double-click action).
     _ = SetMenuDefaultItem(menu, @intCast(ID_REFRESH), MF_BYCOMMAND);
@@ -553,6 +567,7 @@ fn showMenu(hwnd: HWND) void {
             // Reflect the new state in the icon/tooltip right away.
             _ = PostMessageW(hwnd, WM_BATTERY_UPDATE, 0, 0);
         },
+        ID_UPDATE => openReleasePage(),
         ID_QUIT => {
             g_state.stop.store(true, .release);
             _ = Shell_NotifyIconW(NIM_DELETE, &g_nid);
@@ -652,6 +667,19 @@ fn appendMenuText(menu: HMENU, flags: UINT, id: usize, text: []const u8) void {
     const n = std.unicode.utf8ToUtf16Le(wbuf[0..max], src) catch 0;
     wbuf[n] = 0;
     _ = AppendMenuW(menu, flags, id, wbuf[0..n :0].ptr);
+}
+
+/// Open the published release URL in the default browser. ShellExecuteW is
+/// non-blocking, so this is safe to call directly from the UI thread.
+fn openReleasePage() void {
+    const url = g_update.url();
+    var wbuf: [512]u16 = undefined;
+    const max = wbuf.len - 1;
+    if (url.len > max) return;
+    const n = std.unicode.utf8ToUtf16Le(wbuf[0..max], url) catch return;
+    wbuf[n] = 0;
+    const verb = std.unicode.utf8ToUtf16LeStringLiteral("open");
+    _ = ShellExecuteW(null, verb, wbuf[0..n :0].ptr, null, null, SW_SHOWNORMAL);
 }
 
 /// Render one planner event as a tray balloon. connect_status shows both-sides
