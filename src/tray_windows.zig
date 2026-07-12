@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 const focus = @import("focus.zig");
 const battery = @import("battery.zig");
 const layer = @import("layer.zig");
@@ -108,6 +109,11 @@ const ICONINFO = extern struct {
 extern "kernel32" fn GetModuleHandleW(lpModuleName: ?[*:0]const u16) callconv(.winapi) ?HINSTANCE;
 extern "kernel32" fn CreateMutexW(lpMutexAttributes: ?*anyopaque, bInitialOwner: BOOL, lpName: ?[*:0]const u16) callconv(.winapi) ?windows.HANDLE;
 extern "kernel32" fn GetLastError() callconv(.winapi) DWORD;
+// --version support: this is a GUI-subsystem exe with no console of its own, so
+// borrow the parent console (if any) and write straight to its stdout handle.
+extern "kernel32" fn AttachConsole(dwProcessId: DWORD) callconv(.winapi) BOOL;
+extern "kernel32" fn GetStdHandle(nStdHandle: DWORD) callconv(.winapi) ?windows.HANDLE;
+extern "kernel32" fn WriteFile(hFile: windows.HANDLE, lpBuffer: [*]const u8, nNumberOfBytesToWrite: DWORD, lpNumberOfBytesWritten: ?*DWORD, lpOverlapped: ?*anyopaque) callconv(.winapi) BOOL;
 
 extern "user32" fn RegisterClassExW(lpWndClass: *const WNDCLASSEXW) callconv(.winapi) ATOM;
 extern "user32" fn CreateWindowExW(
@@ -327,9 +333,30 @@ var g_cfg: config.Config = .{};
 // Last-known-good reading, per side (UI thread only). See common.LastKnown.
 var g_last: common.LastKnown = .{};
 
+/// Write the version to the parent console's stdout. No-op-ish if launched
+/// without a console (e.g. from Explorer): AttachConsole simply fails and the
+/// handle is invalid, so nothing is printed and the process still exits 0.
+fn printVersion() void {
+    const attach_parent_process: DWORD = 0xFFFFFFFF; // ATTACH_PARENT_PROCESS
+    const std_output_handle: DWORD = @bitCast(@as(i32, -11)); // STD_OUTPUT_HANDLE
+    _ = AttachConsole(attach_parent_process);
+    const h = GetStdHandle(std_output_handle) orelse return;
+    const line = "dygmate-tray " ++ build_options.version ++ "\r\n";
+    _ = WriteFile(h, line.ptr, line.len, null, null);
+}
+
 pub fn main(init: std.process.Init) void {
     g_io = init.io;
     g_gpa = init.gpa;
+
+    if (init.minimal.args.toSlice(init.arena.allocator())) |args| {
+        for (args[1..]) |arg| {
+            if (std.mem.eql(u8, arg, "--version")) {
+                printVersion();
+                return;
+            }
+        }
+    } else |_| {}
 
     // Resolve the config path once (leaked for the process lifetime) and restore
     // the saved "Show layer overlay" preference before the tray goes live.
