@@ -1,30 +1,16 @@
 # dygmate
 
-Tray app for checking Dygma Defy wireless battery status, on Windows and Linux.
-
-On Linux the tray is a StatusNotifierItem over D-Bus, so it works in waybar and
-other SNI-compatible bars/panels (Wayland). No X11/XEmbed. The Linux build has
-no C dependencies (the D-Bus protocol is spoken directly) and links fully
-statically.
-
-Tiny runtime footprint: about 2.4 MB memory usage and very low CPU usage.
-
-Shows desktop notifications on startup and when either side reaches a low
-battery level. On Linux/Wayland, layer changes also show the same "Layer N"
-overlay through zwlr-layer-shell. It requires a compositor with
-`zwlr_layer_shell_v1` support (Hyprland, Sway, and KDE Plasma; not GNOME).
-The tray menu's **Show layer overlay** toggle controls it. The surface uses
-the `dygmate-osd` layer-shell namespace, so Hyprland users can apply rules
-such as `layerrule = noanim, dygmate-osd`.
+Battery status for the Dygma Defy wireless, right in your system tray — over
+RF and Bluetooth, on Windows and Linux. Right-click for the menu, and get an optional on-screen overlay when you
+switch layers.
 
 <p align="center">
-   <img src="docs/tray.png" alt="Dygmate tray" width="120">
-   <img src="docs/notification.png" alt="Dygmate tray" width="360">
-  <img src="docs/context-menu.png" alt="Dygmate context menu" width="360">
+  <img src="docs/notification.png" alt="Dygmate battery notification" height="160">
+  <img src="docs/context-menu.png" alt="Dygmate context menu" height="160">
 </p>
 
 <p align="center">
-  <img src="docs/dygmate-overlay.gif" alt="Dygmate layer overlay" width="720">
+  <img src="docs/dygmate-overlay.gif" alt="Dygmate layer overlay" width="426">
 </p>
 
 ## Build
@@ -52,12 +38,8 @@ zig build run-tray         # Windows
 
 ## Linux setup
 
-### Packaged installation (Arch Linux)
-
-The `dygmate-git` AUR package installs both binaries, a systemd **user** unit,
-and a targeted udev rule for the Defy's serial interface. After installing the
-package, unplug and reconnect the keyboard so the new udev rule is applied.
-Then start the tray for the logged-in desktop user (not with `sudo`):
+Start `dygmate-tray` from your compositor's autostart, or enable the packaged
+user service:
 
 ```sh
 systemctl --user enable --now dygmate-tray.service
@@ -74,13 +56,6 @@ systemctl --user import-environment WAYLAND_DISPLAY XDG_RUNTIME_DIR
 systemctl --user restart dygmate-tray.service
 ```
 
-Package maintainers can refresh the checked-in `PKGBUILD` version after
-updating the source with:
-
-```sh
-scripts/bump-pkgver
-```
-
 ### Serial port permissions
 
 The keyboard shows up as a CDC-ACM serial device (`/dev/ttyACM0`). By default
@@ -91,7 +66,7 @@ dygmate reports:
 failed to open /dev/ttyACM0 (AccessDenied) ...
 ```
 
-Fix it one of two ways.
+Fix it in one of two ways.
 
 **Add your user to the serial group** (simplest). Check the device's group
 first:
@@ -122,19 +97,3 @@ group membership is needed and it works for the tray too. Replug the keyboard
 after adding or changing the rule.
 
 Close Bazecor before running dygmate either way — the serial port is exclusive.
-
-### Tray
-
-The Linux tray is a StatusNotifierItem, shown by any SNI host: waybar, KDE
-Plasma, and others. In waybar, add the `tray` module to your config:
-
-```jsonc
-{
-  "modules-right": ["tray"],
-  "tray": { "spacing": 8 }
-}
-```
-
-Start `dygmate-tray` (e.g. from your compositor's autostart), or use the
-packaged user service above. Left-click the icon to refresh; right-click for
-the menu.
