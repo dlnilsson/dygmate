@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 const linux = std.os.linux;
 const tray_common = @import("tray_common.zig");
 const battery = @import("battery.zig");
@@ -194,7 +195,12 @@ fn run(init: std.process.Init) !void {
 
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     for (args[1..]) |arg| {
-        if (std.mem.eql(u8, arg, "--debug")) debug_log = true;
+        if (std.mem.eql(u8, arg, "--debug")) {
+            debug_log = true;
+        } else if (std.mem.eql(u8, arg, "--version")) {
+            std.debug.print("dygmate-tray {s}\n", .{build_options.version});
+            return;
+        }
     }
 
     // Single instance: hold an exclusive flock on a lock file in the runtime

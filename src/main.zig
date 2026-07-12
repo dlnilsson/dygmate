@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 const focus = @import("focus.zig");
 const battery = @import("battery.zig");
 const device = @import("device.zig");
@@ -20,6 +21,7 @@ const usage =
     \\  --interval <secs>  Fixed poll interval in seconds (minimum: 900).
     \\                     Default: adaptive 15-60 minutes.
     \\  --once             Print one reading and exit.
+    \\  --version          Print version and exit.
     \\  -h, --help         Show this help.
     \\
 ;
@@ -44,6 +46,11 @@ pub fn main(init: std.process.Init) !u8 {
     const opts = parseArgs(args) catch |err| switch (err) {
         error.Help => {
             try out.writeAll(usage);
+            try out.flush();
+            return 0;
+        },
+        error.Version => {
+            try out.print("dygmate {s}\n", .{build_options.version});
             try out.flush();
             return 0;
         },
@@ -113,7 +120,7 @@ fn sleepSeconds(io: std.Io, secs: u64) void {
     dur.sleep(io) catch {};
 }
 
-fn parseArgs(args: []const [:0]const u8) error{ Help, InvalidArgs }!Options {
+fn parseArgs(args: []const [:0]const u8) error{ Help, Version, InvalidArgs }!Options {
     var opts = Options{};
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -132,6 +139,8 @@ fn parseArgs(args: []const [:0]const u8) error{ Help, InvalidArgs }!Options {
             opts.once = true;
         } else if (std.mem.eql(u8, arg, "--debug")) {
             focus.debug = true;
+        } else if (std.mem.eql(u8, arg, "--version")) {
+            return error.Version;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             return error.Help;
         } else {

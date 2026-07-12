@@ -1,5 +1,9 @@
 const std = @import("std");
 
+/// Falls back to the package version; release builds override it with the git
+/// tag via `-Dversion=<tag>` so `--version` reports the tagged release.
+const default_version = @import("build.zig.zon").version;
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -7,10 +11,15 @@ pub fn build(b: *std.Build) void {
     const serial_dep = b.dependency("serial", .{});
     const serial_mod = serial_dep.module("serial");
 
+    const version = b.option([]const u8, "version", "Version string reported by --version") orelse default_version;
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", version);
+    const build_options_mod = build_options.createModule();
+
     const test_step = b.step("test", "Run unit tests");
 
     // Default build: CLI + tray for the host (or -Dtarget), installed normally.
-    const bins = addBinaries(b, target, optimize, serial_mod, null);
+    const bins = addBinaries(b, target, optimize, serial_mod, build_options_mod, null);
 
     const run_cmd = b.addRunArtifact(bins.cli);
     run_cmd.step.dependOn(b.getInstallStep());
@@ -43,7 +52,7 @@ pub fn build(b: *std.Build) void {
     for (release_targets) |q| {
         const rt = b.resolveTargetQuery(q);
         const dir = @tagName(q.os_tag.?);
-        _ = addBinaries(b, rt, .ReleaseSmall, serial_mod, .{ .step = release_step, .dir = dir });
+        _ = addBinaries(b, rt, .ReleaseSmall, serial_mod, build_options_mod, .{ .step = release_step, .dir = dir });
     }
 }
 
@@ -66,6 +75,7 @@ fn addBinaries(
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     serial_mod: *std.Build.Module,
+    build_options_mod: *std.Build.Module,
     release: ?ReleaseInstall,
 ) Binaries {
     const cli = b.addExecutable(.{
@@ -74,7 +84,10 @@ fn addBinaries(
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "serial", .module = serial_mod }},
+            .imports = &.{
+                .{ .name = "serial", .module = serial_mod },
+                .{ .name = "build_options", .module = build_options_mod },
+            },
         }),
     });
     installBinary(b, cli, release);
@@ -92,7 +105,10 @@ fn addBinaries(
                 .root_source_file = b.path(root),
                 .target = target,
                 .optimize = optimize,
-                .imports = &.{.{ .name = "serial", .module = serial_mod }},
+                .imports = &.{
+                    .{ .name = "serial", .module = serial_mod },
+                    .{ .name = "build_options", .module = build_options_mod },
+                },
             }),
         });
         if (target.result.os.tag == .windows) {

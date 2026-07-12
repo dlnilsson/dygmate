@@ -21,7 +21,7 @@ jobs:
           version: 0.16.0
 
       - name: Build (ReleaseSmall, Windows + Linux)
-        run: zig build release
+        run: zig build release -Dversion="${GITHUB_REF_NAME#v}"
 
       - name: Assemble release assets
         run: |
