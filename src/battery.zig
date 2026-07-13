@@ -38,10 +38,23 @@ pub const Reading = struct {
     right: SideReading,
 };
 
-pub const min_poll_interval_s: u64 = 15 * 60;
-pub const poll_interval_50_s: u64 = 30 * 60;
-pub const poll_interval_80_s: u64 = 45 * 60;
-pub const max_poll_interval_s: u64 = 60 * 60;
+// Poll cadence. Plain reads hit the USB-powered neuron only — no flash wear,
+// no RF traffic to the sides (Bazecor polls at 5s forever) — so short
+// intervals are free. Short intervals also bound how long a bogus reading can
+// stay on screen: after the halves wake from deep sleep the neuron's cache can
+// transiently report 100% before real data arrives.
+pub const fast_poll_interval_s: u64 = 30;
+pub const slow_poll_interval_s: u64 = 120;
+/// Below this level always poll fast (matches the tray's low_threshold).
+pub const low_level_fast_threshold: u8 = 20;
+/// Fuel gauges jitter a point or two with load/temperature; anything above
+/// this while discharging is an implausible upward jump.
+pub const level_jump_tolerance: u8 = 3;
+/// Consecutive sightings before an implausible upward jump is accepted.
+pub const suspect_confirm_polls: u8 = 3;
+/// Consecutive sightings before an initial 100 (no baseline yet) is trusted —
+/// 100 is exactly what the post-wake bogus cache reports.
+pub const first_reading_confirm_polls: u8 = 2;
 pub const force_read_settle_s: u64 = 2;
 
 /// Issue the four battery read commands. Parse failures degrade to
@@ -94,12 +107,106 @@ fn sleepMs(io: std.Io, ms: u64) void {
     dur.sleep(io) catch {};
 }
 
-pub fn suggestedPollIntervalSeconds(r: Reading) u64 {
-    const lvl = lowestLevel(r) orelse return min_poll_interval_s;
-    if (lvl >= 95) return max_poll_interval_s;
-    if (lvl >= 80) return poll_interval_80_s;
-    if (lvl >= 50) return poll_interval_50_s;
-    return min_poll_interval_s;
+/// Plausibility gate for battery levels. After the halves wake from deep
+/// sleep the neuron's cache can transiently report a bogus 100%, and a level
+/// cannot genuinely rise while discharging — so an upward jump must repeat on
+/// consecutive polls before it is accepted. Drops are always plausible and
+/// accepted immediately; charging/charged sides are trusted outright (the
+/// sides really do charge over cable while the user is away). Pure state
+/// machine: no Io, no allocator, unit-testable without hardware.
+pub const Acceptor = struct {
+    left: SideState = .{},
+    right: SideState = .{},
+
+    pub const SideState = struct {
+        /// Last accepted level; null until a side first passes the gate.
+        accepted: ?u8 = null,
+        /// Suspect value awaiting confirmation.
+        pending: ?u8 = null,
+        pending_count: u8 = 0,
+    };
+
+    pub const Result = struct {
+        /// Validated reading: rejected levels are replaced by the last
+        /// accepted level (or null). Statuses pass through untouched.
+        reading: Reading,
+        /// True while any side holds an unconfirmed suspect value — callers
+        /// should poll fast until it resolves.
+        suspect: bool,
+    };
+
+    pub fn feed(self: *Acceptor, raw: Reading) Result {
+        return self.result(.{
+            .left = feedSide(&self.left, raw.left),
+            .right = feedSide(&self.right, raw.right),
+        });
+    }
+
+    /// Post-forceRead: the neuron just re-polled the sides over RF, so any
+    /// numeric level is ground truth — accept it outright and clear pending.
+    /// Refusing it for several polls would make an explicit user refresh
+    /// appear broken.
+    pub fn feedAuthoritative(self: *Acceptor, raw: Reading) Result {
+        return self.result(.{
+            .left = acceptSide(&self.left, raw.left),
+            .right = acceptSide(&self.right, raw.right),
+        });
+    }
+
+    fn result(self: *const Acceptor, reading: Reading) Result {
+        return .{
+            .reading = reading,
+            .suspect = self.left.pending != null or self.right.pending != null,
+        };
+    }
+
+    fn feedSide(st: *SideState, raw: SideReading) SideReading {
+        // A sleeping half answers with an empty payload; that's routine, not
+        // evidence for or against a pending suspect — keep the streak.
+        const lvl = raw.level orelse
+            return .{ .level = st.accepted, .status = raw.status };
+        if (raw.status == .charging or raw.status == .charged)
+            return acceptSide(st, raw);
+        if (st.accepted) |acc| {
+            if (lvl <= acc +| level_jump_tolerance) return acceptSide(st, raw);
+            return suspectSide(st, raw, suspect_confirm_polls);
+        }
+        // No baseline to jump-gate against; only an initial 100 matches the
+        // known bogus post-wake value, everything else is taken at face value.
+        if (lvl < 100) return acceptSide(st, raw);
+        return suspectSide(st, raw, first_reading_confirm_polls);
+    }
+
+    fn acceptSide(st: *SideState, raw: SideReading) SideReading {
+        if (raw.level) |lvl| {
+            st.accepted = lvl;
+            st.pending = null;
+            st.pending_count = 0;
+        }
+        return .{ .level = st.accepted, .status = raw.status };
+    }
+
+    fn suspectSide(st: *SideState, raw: SideReading, confirm: u8) SideReading {
+        const lvl = raw.level.?;
+        if (st.pending) |p| {
+            const diff = if (lvl > p) lvl - p else p - lvl;
+            if (diff <= level_jump_tolerance) {
+                st.pending_count += 1;
+                if (st.pending_count >= confirm) return acceptSide(st, raw);
+                return .{ .level = st.accepted, .status = raw.status };
+            }
+        }
+        st.pending = lvl;
+        st.pending_count = 1;
+        return .{ .level = st.accepted, .status = raw.status };
+    }
+};
+
+pub fn suggestedPollIntervalSeconds(r: Reading, suspect: bool) u64 {
+    if (suspect) return fast_poll_interval_s;
+    const lvl = lowestLevel(r) orelse return fast_poll_interval_s;
+    if (lvl < low_level_fast_threshold) return fast_poll_interval_s;
+    return slow_poll_interval_s;
 }
 
 fn lowestLevel(r: Reading) ?u8 {
@@ -158,33 +265,162 @@ test "parseStatus maps firmware codes" {
     try std.testing.expectEqual(Status.unknown, parseStatus("x"));
 }
 
-test "suggestedPollIntervalSeconds uses the lower valid side level" {
+test "suggestedPollIntervalSeconds: fast when suspect, unknown, or low" {
+    const healthy: Reading = .{
+        .left = .{ .level = 100, .status = .charged },
+        .right = .{ .level = 98, .status = .discharging },
+    };
+    try std.testing.expectEqual(slow_poll_interval_s, suggestedPollIntervalSeconds(healthy, false));
+    try std.testing.expectEqual(fast_poll_interval_s, suggestedPollIntervalSeconds(healthy, true));
     try std.testing.expectEqual(
-        min_poll_interval_s,
+        fast_poll_interval_s,
         suggestedPollIntervalSeconds(.{
             .left = .{ .level = null, .status = .unknown },
             .right = .{ .level = null, .status = .unknown },
-        }),
+        }, false),
     );
     try std.testing.expectEqual(
-        max_poll_interval_s,
+        fast_poll_interval_s,
         suggestedPollIntervalSeconds(.{
-            .left = .{ .level = 100, .status = .charged },
-            .right = .{ .level = 98, .status = .charged },
-        }),
-    );
-    try std.testing.expectEqual(
-        poll_interval_50_s,
-        suggestedPollIntervalSeconds(.{
-            .left = .{ .level = 100, .status = .charged },
-            .right = .{ .level = 55, .status = .discharging },
-        }),
-    );
-    try std.testing.expectEqual(
-        min_poll_interval_s,
-        suggestedPollIntervalSeconds(.{
-            .left = .{ .level = 49, .status = .discharging },
+            .left = .{ .level = 19, .status = .discharging },
             .right = .{ .level = 100, .status = .charged },
-        }),
+        }, false),
     );
+}
+
+// -- Acceptor ---------------------------------------------------------------
+
+fn side(level: ?u8, status: Status) SideReading {
+    return .{ .level = level, .status = status };
+}
+
+/// Feed a reading where only the left side varies; the right side stays quiet.
+fn feedLeft(a: *Acceptor, level: ?u8, status: Status) Acceptor.Result {
+    return a.feed(.{
+        .left = side(level, status),
+        .right = side(null, .unknown),
+    });
+}
+
+test "Acceptor: first reading below 100 accepted immediately" {
+    var a: Acceptor = .{};
+    const res = feedLeft(&a, 87, .discharging);
+    try std.testing.expectEqual(@as(?u8, 87), res.reading.left.level);
+    try std.testing.expect(!res.suspect);
+}
+
+test "Acceptor: first reading of 100 needs confirmation unless charging" {
+    var a: Acceptor = .{};
+    var res = feedLeft(&a, 100, .discharging);
+    try std.testing.expectEqual(@as(?u8, null), res.reading.left.level);
+    try std.testing.expect(res.suspect);
+    res = feedLeft(&a, 100, .discharging);
+    try std.testing.expectEqual(@as(?u8, 100), res.reading.left.level);
+    try std.testing.expect(!res.suspect);
+
+    var b: Acceptor = .{};
+    const charged = feedLeft(&b, 100, .charged);
+    try std.testing.expectEqual(@as(?u8, 100), charged.reading.left.level);
+    try std.testing.expect(!charged.suspect);
+}
+
+test "Acceptor: drops and small drift accepted immediately" {
+    var a: Acceptor = .{};
+    _ = feedLeft(&a, 45, .discharging);
+    var res = feedLeft(&a, 30, .discharging);
+    try std.testing.expectEqual(@as(?u8, 30), res.reading.left.level);
+    try std.testing.expect(!res.suspect);
+    res = feedLeft(&a, 32, .discharging); // within jump tolerance
+    try std.testing.expectEqual(@as(?u8, 32), res.reading.left.level);
+    try std.testing.expect(!res.suspect);
+}
+
+test "Acceptor: upward jump held until confirmed on consecutive polls" {
+    var a: Acceptor = .{};
+    _ = feedLeft(&a, 45, .discharging);
+    var res = feedLeft(&a, 100, .discharging);
+    try std.testing.expectEqual(@as(?u8, 45), res.reading.left.level);
+    try std.testing.expect(res.suspect);
+    res = feedLeft(&a, 100, .discharging);
+    try std.testing.expectEqual(@as(?u8, 45), res.reading.left.level);
+    try std.testing.expect(res.suspect);
+    res = feedLeft(&a, 100, .discharging); // third consecutive sighting
+    try std.testing.expectEqual(@as(?u8, 100), res.reading.left.level);
+    try std.testing.expect(!res.suspect);
+}
+
+test "Acceptor: plausible reading cancels a pending jump" {
+    var a: Acceptor = .{};
+    _ = feedLeft(&a, 45, .discharging);
+    _ = feedLeft(&a, 100, .discharging);
+    const res = feedLeft(&a, 44, .discharging);
+    try std.testing.expectEqual(@as(?u8, 44), res.reading.left.level);
+    try std.testing.expect(!res.suspect);
+}
+
+test "Acceptor: charging status accepts an upward jump outright" {
+    var a: Acceptor = .{};
+    _ = feedLeft(&a, 45, .discharging);
+    const res = feedLeft(&a, 80, .charging);
+    try std.testing.expectEqual(@as(?u8, 80), res.reading.left.level);
+    try std.testing.expect(!res.suspect);
+}
+
+test "Acceptor: null polls keep the pending streak alive" {
+    var a: Acceptor = .{};
+    _ = feedLeft(&a, 45, .discharging);
+    _ = feedLeft(&a, 100, .discharging);
+    var res = feedLeft(&a, null, .unknown);
+    try std.testing.expectEqual(@as(?u8, 45), res.reading.left.level);
+    try std.testing.expect(res.suspect);
+    _ = feedLeft(&a, 100, .discharging);
+    res = feedLeft(&a, 100, .discharging);
+    try std.testing.expectEqual(@as(?u8, 100), res.reading.left.level);
+    try std.testing.expect(!res.suspect);
+}
+
+test "Acceptor: a different high value restarts the streak" {
+    var a: Acceptor = .{};
+    _ = feedLeft(&a, 45, .discharging);
+    _ = feedLeft(&a, 100, .discharging);
+    _ = feedLeft(&a, 90, .discharging); // pending restarts at 90, count 1
+    var res = feedLeft(&a, 90, .discharging); // count 2: still held
+    try std.testing.expectEqual(@as(?u8, 45), res.reading.left.level);
+    res = feedLeft(&a, 90, .discharging); // count 3: accepted
+    try std.testing.expectEqual(@as(?u8, 90), res.reading.left.level);
+}
+
+test "Acceptor: sides gate independently" {
+    var a: Acceptor = .{};
+    _ = a.feed(.{
+        .left = side(45, .discharging),
+        .right = side(60, .discharging),
+    });
+    const res = a.feed(.{
+        .left = side(100, .discharging),
+        .right = side(55, .discharging),
+    });
+    try std.testing.expectEqual(@as(?u8, 45), res.reading.left.level);
+    try std.testing.expectEqual(@as(?u8, 55), res.reading.right.level);
+    try std.testing.expect(res.suspect);
+}
+
+test "Acceptor: feedAuthoritative accepts a jump in one shot" {
+    var a: Acceptor = .{};
+    _ = feedLeft(&a, 45, .discharging);
+    _ = feedLeft(&a, 100, .discharging);
+    const res = a.feedAuthoritative(.{
+        .left = side(97, .discharging),
+        .right = side(null, .unknown),
+    });
+    try std.testing.expectEqual(@as(?u8, 97), res.reading.left.level);
+    try std.testing.expect(!res.suspect);
+}
+
+test "Acceptor: status passes through even when the level is rejected" {
+    var a: Acceptor = .{};
+    _ = feedLeft(&a, 45, .discharging);
+    const res = feedLeft(&a, 100, .fault);
+    try std.testing.expectEqual(@as(?u8, 45), res.reading.left.level);
+    try std.testing.expectEqual(Status.fault, res.reading.left.status);
 }

@@ -7,6 +7,9 @@ const device = @import("device.zig");
 const porthint = @import("porthint.zig");
 
 const rescan_delay_s = 3;
+// Bazecor polls at 5s continuously; bare reads only touch the USB-powered
+// neuron, so anything at or above that cadence is provably safe.
+const min_cli_interval_s = 5;
 
 const usage =
     \\Usage: dygmate [options]
@@ -18,8 +21,8 @@ const usage =
     \\Options:
     \\  --port <name>      Serial port (e.g. COM5 or /dev/ttyACM0).
     \\                     Default: auto-detect by USB VID/PID 35EF:0012.
-    \\  --interval <secs>  Fixed poll interval in seconds (minimum: 900).
-    \\                     Default: adaptive 15-60 minutes.
+    \\  --interval <secs>  Fixed poll interval in seconds (minimum: 5).
+    \\                     Default: adaptive 30s-2min.
     \\  --once             Print one reading and exit.
     \\  --version          Print version and exit.
     \\  -h, --help         Show this help.
@@ -60,6 +63,11 @@ pub fn main(init: std.process.Init) !u8 {
         },
     };
 
+    // Plausibility gate for battery levels; outside the reconnect loop so the
+    // baseline survives reconnects (a reconnect after sleep is exactly when
+    // the neuron's cache reports a bogus 100%).
+    var acceptor: battery.Acceptor = .{};
+
     while (true) {
         // DISCOVER
         const path: []u8 = blk: {
@@ -93,7 +101,7 @@ pub fn main(init: std.process.Init) !u8 {
         // (Bazecor only forceReads on an explicit button press). battery.read
         // retries once when a side momentarily reports "disconnected".
         while (true) {
-            const reading = battery.read(&dev) catch |err| {
+            const raw = battery.read(&dev) catch |err| {
                 if (opts.once) {
                     std.debug.print("dygmate: communication failed: {s}\n", .{@errorName(err)});
                     return 1;
@@ -101,11 +109,16 @@ pub fn main(init: std.process.Init) !u8 {
                 std.debug.print("connection lost ({s}), rescanning...\n", .{@errorName(err)});
                 break;
             };
-            try printReading(out, reading);
+            // --once prints the raw reading: a single sample has no history to
+            // confirm against, and gating it would print ?% with no later
+            // chance to correct.
             if (opts.once) {
+                try printReading(out, raw);
                 return 0;
             }
-            const interval_s = opts.fixed_interval_s orelse battery.suggestedPollIntervalSeconds(reading);
+            const res = acceptor.feed(raw);
+            try printReading(out, res.reading);
+            const interval_s = opts.fixed_interval_s orelse battery.suggestedPollIntervalSeconds(res.reading, res.suspect);
             sleepSeconds(io, interval_s);
         }
     }
@@ -133,7 +146,7 @@ fn parseArgs(args: []const [:0]const u8) error{ Help, Version, InvalidArgs }!Opt
             i += 1;
             if (i >= args.len) return error.InvalidArgs;
             const interval_s = std.fmt.parseInt(u64, args[i], 10) catch return error.InvalidArgs;
-            if (interval_s < battery.min_poll_interval_s) return error.InvalidArgs;
+            if (interval_s < min_cli_interval_s) return error.InvalidArgs;
             opts.fixed_interval_s = interval_s;
         } else if (std.mem.eql(u8, arg, "--once")) {
             opts.once = true;

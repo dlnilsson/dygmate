@@ -16,8 +16,8 @@ pub const low_threshold: u8 = 20;
 // value once a side has reported, so a plain read right after connect is often
 // empty. Poll fast until a side reports a real level (populates the tray within
 // a few seconds of connect), then back off to battery.suggestedPollIntervalSeconds
-// (15–60 min by level). Once a side has reported, a later empty read keeps the
-// current cadence — last-known-good covers the display. Plain reads hit the
+// (30s–2min). Once a side has reported, a later empty read keeps the current
+// cadence — last-known-good covers the display. Plain reads hit the
 // USB-powered neuron only; they never wake the sides or wear flash.
 pub const initial_poll_interval_ms: u64 = 5 * 1000;
 pub const layer_poll_interval_ms: u64 = 250;
@@ -317,6 +317,15 @@ pub fn runPollLoop(
     comptime wake: fn (*Ctx) void,
     comptime osd_enabled: bool,
 ) void {
+    // Plausibility gate for battery levels. Deliberately OUTSIDE the
+    // discover/connect loop: a reconnect after the machine (or the halves)
+    // slept is exactly when the neuron's cache reports a bogus 100%, so the
+    // baseline must survive reconnects. A genuinely different keyboard with a
+    // higher battery just confirms over a few fast polls.
+    var acceptor: battery.Acceptor = .{};
+    // Set after a user-requested forceRead: the next reading is ground truth
+    // and bypasses the gate.
+    var next_read_authoritative = false;
     while (!st.stop.load(.acquire)) {
         // PAUSED: hold no port so Bazecor can use it; idle until resumed.
         if (st.paused.load(.acquire)) {
@@ -380,13 +389,18 @@ pub fn runPollLoop(
             }
             var should_post = false;
             if (battery_elapsed_ms >= battery_interval_ms) {
-                const r = battery.read(&dev) catch {
+                const raw = battery.read(&dev) catch {
                     const still_present = device.isDygmaPresent(io) catch false;
                     resetLayerState(st);
                     setStatus(Ctx, ctx, io, st, wake, offlineStatus(still_present));
                     break;
                 };
-                known.merge(r);
+                const res = if (next_read_authoritative)
+                    acceptor.feedAuthoritative(raw)
+                else
+                    acceptor.feed(raw);
+                next_read_authoritative = false;
+                known.merge(res.reading);
                 const merged: battery.Reading = .{ .left = known.left, .right = known.right };
                 st.mutex.lockUncancelable(io);
                 const announce_connection = st.status != .connected;
@@ -397,9 +411,11 @@ pub fn runPollLoop(
                 // Back off only once BOTH sides have reported this connection —
                 // the same gate as the connect announcement, so slowing down can't
                 // leave the announcement pending for a whole slow interval. Until
-                // then stay fast.
+                // then stay fast. `res.suspect` comes from the FRESH read (not the
+                // merged snapshot), so an unresolved suspect value always forces
+                // the fast interval until it's confirmed or refuted.
                 if (bothLevelsKnown(merged)) {
-                    battery_interval_ms = battery.suggestedPollIntervalSeconds(merged) * std.time.ms_per_s;
+                    battery_interval_ms = battery.suggestedPollIntervalSeconds(merged, res.suspect) * std.time.ms_per_s;
                 }
                 battery_elapsed_ms = 0;
                 should_post = true;
@@ -432,6 +448,7 @@ pub fn runPollLoop(
             if (refreshed) {
                 battery.forceRead(&dev);
                 sleepMs(io, st, battery.force_read_settle_s * 1000);
+                next_read_authoritative = true;
                 battery_elapsed_ms = battery_interval_ms; // force a read next cycle
             } else {
                 battery_elapsed_ms += layer_poll_interval_ms;
