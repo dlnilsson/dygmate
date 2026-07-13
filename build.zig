@@ -117,6 +117,8 @@ fn addBinaries(
             t.root_module.linkSystemLibrary("user32", .{});
             t.root_module.linkSystemLibrary("shell32", .{});
             t.root_module.linkSystemLibrary("gdi32", .{});
+            t.root_module.linkSystemLibrary("advapi32", .{});
+            t.root_module.linkSystemLibrary("ole32", .{});
         }
         installBinary(b, t, release);
         tray = t;

@@ -28,6 +28,7 @@ const LPARAM = isize;
 const LRESULT = isize;
 const COLORREF = u32;
 const BOOL = windows.BOOL;
+const GUID = windows.GUID;
 const HWND = windows.HWND;
 const HICON = windows.HICON;
 const HMENU = windows.HMENU;
@@ -110,6 +111,7 @@ const ICONINFO = extern struct {
 extern "kernel32" fn GetModuleHandleW(lpModuleName: ?[*:0]const u16) callconv(.winapi) ?HINSTANCE;
 extern "kernel32" fn CreateMutexW(lpMutexAttributes: ?*anyopaque, bInitialOwner: BOOL, lpName: ?[*:0]const u16) callconv(.winapi) ?windows.HANDLE;
 extern "kernel32" fn GetLastError() callconv(.winapi) DWORD;
+extern "kernel32" fn GetModuleFileNameW(hModule: ?HINSTANCE, lpFilename: [*]u16, nSize: DWORD) callconv(.winapi) DWORD;
 // --version support: this is a GUI-subsystem exe with no console of its own, so
 // borrow the parent console (if any) and write straight to its stdout handle.
 extern "kernel32" fn AttachConsole(dwProcessId: DWORD) callconv(.winapi) BOOL;
@@ -195,6 +197,104 @@ extern "gdi32" fn CreateFontW(
 extern "gdi32" fn CreateIconIndirect(piconinfo: *ICONINFO) callconv(.winapi) ?HICON;
 
 extern "shell32" fn Shell_NotifyIconW(dwMessage: DWORD, lpData: *NOTIFYICONDATAW) callconv(.winapi) BOOL;
+extern "shell32" fn SetCurrentProcessExplicitAppUserModelID(AppID: [*:0]const u16) callconv(.winapi) i32; // HRESULT
+
+extern "advapi32" fn RegCreateKeyExW(hKey: windows.HKEY, lpSubKey: [*:0]const u16, Reserved: DWORD, lpClass: ?[*:0]const u16, dwOptions: DWORD, samDesired: DWORD, lpSecurityAttributes: ?*anyopaque, phkResult: *windows.HKEY, lpdwDisposition: ?*DWORD) callconv(.winapi) i32;
+extern "advapi32" fn RegSetValueExW(hKey: windows.HKEY, lpValueName: ?[*:0]const u16, Reserved: DWORD, dwType: DWORD, lpData: [*]const u8, cbData: DWORD) callconv(.winapi) i32;
+extern "advapi32" fn RegCloseKey(hKey: windows.HKEY) callconv(.winapi) i32;
+
+// ---------------------------------------------------------------------------
+// COM plumbing for the Start Menu shortcut. Explorer only attributes legacy
+// Shell_NotifyIcon toasts to our AUMID when a Start Menu .lnk carries the
+// same System.AppUserModel.ID shell property; the AppUserModelId registry
+// DisplayName alone is not consulted for balloon notifications.
+// ---------------------------------------------------------------------------
+extern "ole32" fn CoInitializeEx(pvReserved: ?*anyopaque, dwCoInit: DWORD) callconv(.winapi) i32;
+extern "ole32" fn CoUninitialize() callconv(.winapi) void;
+extern "ole32" fn CoCreateInstance(rclsid: *const GUID, pUnkOuter: ?*anyopaque, dwClsContext: DWORD, riid: *const GUID, ppv: *?*anyopaque) callconv(.winapi) i32;
+extern "ole32" fn CoTaskMemFree(pv: ?*anyopaque) callconv(.winapi) void;
+extern "ole32" fn PropVariantClear(pvar: *PROPVARIANT) callconv(.winapi) i32;
+extern "shell32" fn SHGetKnownFolderPath(rfid: *const GUID, dwFlags: DWORD, hToken: ?*anyopaque, ppszPath: *?[*:0]u16) callconv(.winapi) i32;
+
+const PROPERTYKEY = extern struct { fmtid: GUID, pid: DWORD };
+
+// x64 PROPVARIANT is 24 bytes: 8-byte vt header + 16-byte value union
+// (largest members are {ULONG, void*} counted-array pairs).
+const PROPVARIANT = extern struct {
+    vt: u16,
+    r1: u16 = 0,
+    r2: u16 = 0,
+    r3: u16 = 0,
+    data: extern union { pwszVal: ?[*:0]const u16, raw: [2]u64 },
+};
+
+const IShellLinkW = extern struct {
+    v: *const VTable,
+    const VTable = extern struct {
+        QueryInterface: *const fn (*IShellLinkW, *const GUID, *?*anyopaque) callconv(.winapi) i32,
+        AddRef: *const fn (*IShellLinkW) callconv(.winapi) u32,
+        Release: *const fn (*IShellLinkW) callconv(.winapi) u32,
+        GetPath: *const fn (*IShellLinkW, [*]u16, i32, ?*anyopaque, DWORD) callconv(.winapi) i32,
+        GetIDList: *const anyopaque,
+        SetIDList: *const anyopaque,
+        GetDescription: *const anyopaque,
+        SetDescription: *const anyopaque,
+        GetWorkingDirectory: *const anyopaque,
+        SetWorkingDirectory: *const anyopaque,
+        GetArguments: *const anyopaque,
+        SetArguments: *const anyopaque,
+        GetHotkey: *const anyopaque,
+        SetHotkey: *const anyopaque,
+        GetShowCmd: *const anyopaque,
+        SetShowCmd: *const anyopaque,
+        GetIconLocation: *const anyopaque,
+        SetIconLocation: *const anyopaque,
+        SetRelativePath: *const anyopaque,
+        Resolve: *const anyopaque,
+        SetPath: *const fn (*IShellLinkW, [*:0]const u16) callconv(.winapi) i32,
+    };
+};
+
+const IPersistFile = extern struct {
+    v: *const VTable,
+    const VTable = extern struct {
+        QueryInterface: *const fn (*IPersistFile, *const GUID, *?*anyopaque) callconv(.winapi) i32,
+        AddRef: *const fn (*IPersistFile) callconv(.winapi) u32,
+        Release: *const fn (*IPersistFile) callconv(.winapi) u32,
+        GetClassID: *const anyopaque,
+        IsDirty: *const anyopaque,
+        Load: *const fn (*IPersistFile, [*:0]const u16, DWORD) callconv(.winapi) i32,
+        Save: *const fn (*IPersistFile, ?[*:0]const u16, BOOL) callconv(.winapi) i32,
+        SaveCompleted: *const anyopaque,
+        GetCurFile: *const anyopaque,
+    };
+};
+
+const IPropertyStore = extern struct {
+    v: *const VTable,
+    const VTable = extern struct {
+        QueryInterface: *const fn (*IPropertyStore, *const GUID, *?*anyopaque) callconv(.winapi) i32,
+        AddRef: *const fn (*IPropertyStore) callconv(.winapi) u32,
+        Release: *const fn (*IPropertyStore) callconv(.winapi) u32,
+        GetCount: *const anyopaque,
+        GetAt: *const anyopaque,
+        GetValue: *const fn (*IPropertyStore, *const PROPERTYKEY, *PROPVARIANT) callconv(.winapi) i32,
+        SetValue: *const fn (*IPropertyStore, *const PROPERTYKEY, *const PROPVARIANT) callconv(.winapi) i32,
+        Commit: *const fn (*IPropertyStore) callconv(.winapi) i32,
+    };
+};
+
+const CLSID_ShellLink = GUID.parse("{00021401-0000-0000-C000-000000000046}");
+const IID_IShellLinkW = GUID.parse("{000214F9-0000-0000-C000-000000000046}");
+const IID_IPersistFile = GUID.parse("{0000010B-0000-0000-C000-000000000046}");
+const IID_IPropertyStore = GUID.parse("{886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99}");
+const FOLDERID_Programs = GUID.parse("{A77F5D77-2E2B-44C3-A6A2-ABA601054A51}");
+const PKEY_AppUserModel_ID = PROPERTYKEY{ .fmtid = GUID.parse("{9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3}"), .pid = 5 };
+
+const VT_LPWSTR: u16 = 31;
+const CLSCTX_INPROC_SERVER: DWORD = 1;
+const COINIT_APARTMENTTHREADED: DWORD = 2;
+const STGM_READ: DWORD = 0;
 
 // ---------------------------------------------------------------------------
 // Win32 constants.
@@ -292,8 +392,21 @@ const col_osd_bg = rgb(18, 20, 24);
 const col_osd_border = rgb(92, 101, 116);
 const col_text = rgb(255, 255, 255);
 
+const HKEY_CURRENT_USER: windows.HKEY = @ptrFromInt(0x80000001);
+const REG_SZ: DWORD = 1;
+const REG_OPTION_NON_VOLATILE: DWORD = 0;
+const KEY_SET_VALUE: DWORD = 0x0002;
+
 const ERROR_ALREADY_EXISTS: DWORD = 183;
 const singleton_name = std.unicode.utf8ToUtf16LeStringLiteral("Local\\DygmaBatteryTraySingleton");
+
+// Explicit AppUserModelID: without one, Windows attributes our balloon toasts
+// to a synthesized "Microsoft.Explorer.Notification.{hash}" sender.
+const aumid = std.unicode.utf8ToUtf16LeStringLiteral("dlnilsson.dygmate.tray");
+const aumid_key = std.unicode.utf8ToUtf16LeStringLiteral("Software\\Classes\\AppUserModelId\\dlnilsson.dygmate.tray");
+const aumid_display_name = std.unicode.utf8ToUtf16LeStringLiteral("dygmate");
+const reg_value_display_name = std.unicode.utf8ToUtf16LeStringLiteral("DisplayName");
+const lnk_name = std.unicode.utf8ToUtf16LeStringLiteral("\\dygmate.lnk");
 
 const class_name = std.unicode.utf8ToUtf16LeStringLiteral("DygmaBatteryTrayWnd");
 const osd_class_name = std.unicode.utf8ToUtf16LeStringLiteral("DygmaBatteryOsdWnd");
@@ -353,6 +466,85 @@ fn printVersion() void {
     _ = WriteFile(h, line.ptr, line.len, null, null);
 }
 
+/// Best-effort: register the AUMID display name so Windows 11 toast headers
+/// show "dygmate" instead of "Microsoft.Explorer.Notification.{hash}".
+/// Failures are ignored — notifications still work, just with the ugly header.
+/// The key is left behind on exit: deleting it would drop the app's entry
+/// (and the user's preferences) under Settings > Notifications, and a winget
+/// portable uninstall won't clean it up either — it's per-user and tiny.
+fn registerAumid() void {
+    var key: windows.HKEY = undefined;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, aumid_key, 0, null, REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, null, &key, null) != 0) return;
+    defer _ = RegCloseKey(key);
+    const bytes: DWORD = (aumid_display_name.len + 1) * 2; // UTF-16 incl. NUL
+    _ = RegSetValueExW(key, reg_value_display_name, 0, REG_SZ, @ptrCast(aumid_display_name), bytes);
+}
+
+/// Best-effort: create (or repair) a Start Menu shortcut carrying our AUMID
+/// as its System.AppUserModel.ID property. This is what actually makes
+/// Explorer show "dygmate" as the toast header -- registerAumid()'s registry
+/// DisplayName only covers the Settings > Notifications sender list. The
+/// shortcut is left behind on exit for the same reasons as the registry key
+/// (and so the header survives across sessions); winget portable uninstall
+/// won't remove it.
+fn ensureStartMenuShortcut() void {
+    var exe_buf: [1024]u16 = undefined;
+    const exe_len = GetModuleFileNameW(null, &exe_buf, exe_buf.len);
+    if (exe_len == 0 or exe_len >= exe_buf.len - 1) return;
+    exe_buf[exe_len] = 0;
+    const exe_path = exe_buf[0..exe_len :0];
+
+    var folder: ?[*:0]u16 = null;
+    if (SHGetKnownFolderPath(&FOLDERID_Programs, 0, null, &folder) != 0) return;
+    defer CoTaskMemFree(folder);
+    const folder_path = std.mem.span(folder.?);
+
+    var lnk_buf: [1024:0]u16 = undefined;
+    if (folder_path.len + lnk_name.len >= lnk_buf.len) return;
+    @memcpy(lnk_buf[0..folder_path.len], folder_path);
+    @memcpy(lnk_buf[folder_path.len..][0..lnk_name.len], lnk_name);
+    lnk_buf[folder_path.len + lnk_name.len] = 0;
+    const lnk_path = lnk_buf[0 .. folder_path.len + lnk_name.len :0];
+
+    const co = CoInitializeEx(null, COINIT_APARTMENTTHREADED);
+    if (co < 0) return; // S_OK (0) or S_FALSE (1): both need CoUninitialize
+    defer CoUninitialize();
+
+    var link_raw: ?*anyopaque = null;
+    if (CoCreateInstance(&CLSID_ShellLink, null, CLSCTX_INPROC_SERVER, &IID_IShellLinkW, &link_raw) != 0) return;
+    const link: *IShellLinkW = @ptrCast(@alignCast(link_raw.?));
+    defer _ = link.v.Release(link);
+
+    var pf_raw: ?*anyopaque = null;
+    if (link.v.QueryInterface(link, &IID_IPersistFile, &pf_raw) != 0) return;
+    const pf: *IPersistFile = @ptrCast(@alignCast(pf_raw.?));
+    defer _ = pf.v.Release(pf);
+
+    var ps_raw: ?*anyopaque = null;
+    if (link.v.QueryInterface(link, &IID_IPropertyStore, &ps_raw) != 0) return;
+    const ps: *IPropertyStore = @ptrCast(@alignCast(ps_raw.?));
+    defer _ = ps.v.Release(ps);
+
+    // Skip the write when an up-to-date shortcut already exists.
+    if (pf.v.Load(pf, lnk_path, STGM_READ) == 0) {
+        var cur_path: [1024]u16 = undefined;
+        const path_ok = link.v.GetPath(link, &cur_path, cur_path.len, null, 0) == 0 and
+            std.mem.eql(u16, std.mem.sliceTo(&cur_path, 0), exe_path);
+        var pv = PROPVARIANT{ .vt = 0, .data = .{ .raw = .{ 0, 0 } } };
+        const aumid_ok = ps.v.GetValue(ps, &PKEY_AppUserModel_ID, &pv) == 0 and
+            pv.vt == VT_LPWSTR and pv.data.pwszVal != null and
+            std.mem.eql(u16, std.mem.span(pv.data.pwszVal.?), aumid);
+        _ = PropVariantClear(&pv);
+        if (path_ok and aumid_ok) return;
+    }
+
+    if (link.v.SetPath(link, exe_path) != 0) return;
+    var pv = PROPVARIANT{ .vt = VT_LPWSTR, .data = .{ .pwszVal = aumid } };
+    if (ps.v.SetValue(ps, &PKEY_AppUserModel_ID, &pv) < 0) return;
+    if (ps.v.Commit(ps) < 0) return;
+    _ = pf.v.Save(pf, lnk_path, .TRUE);
+}
+
 pub fn main(init: std.process.Init) void {
     g_io = init.io;
     g_gpa = init.gpa;
@@ -379,6 +571,12 @@ pub fn main(init: std.process.Init) void {
     // mutex handle is intentionally leaked — the OS frees it when we exit.
     _ = CreateMutexW(null, .FALSE, singleton_name);
     if (GetLastError() == ERROR_ALREADY_EXISTS) return;
+
+    // Must run before any window/tray creation so notifications are
+    // attributed to our AUMID instead of a synthesized Explorer one.
+    registerAumid();
+    ensureStartMenuShortcut();
+    _ = SetCurrentProcessExplicitAppUserModelID(aumid);
 
     const hinst = GetModuleHandleW(null).?;
 
