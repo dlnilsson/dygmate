@@ -107,13 +107,16 @@ fn sleepMs(io: std.Io, ms: u64) void {
     dur.sleep(io) catch {};
 }
 
-/// Plausibility gate for battery levels. After the halves wake from deep
-/// sleep the neuron's cache can transiently report a bogus 100%, and a level
-/// cannot genuinely rise while discharging — so an upward jump must repeat on
-/// consecutive polls before it is accepted. Drops are always plausible and
-/// accepted immediately; charging/charged sides are trusted outright (the
-/// sides really do charge over cable while the user is away). Pure state
-/// machine: no Io, no allocator, unit-testable without hardware.
+/// Plausibility gate for battery levels. While a half is asleep or out of RF
+/// contact the neuron persistently serves a bogus cached 100% with status
+/// "disconnected" on every plain read — not transiently, but until the half
+/// actually wakes — so a disconnected side's level is never evidence of
+/// anything and is ignored outright. A level also cannot genuinely rise while
+/// discharging, so an upward jump must repeat on consecutive polls before it
+/// is accepted. Drops are always plausible and accepted immediately;
+/// charging/charged sides are trusted outright (the sides really do charge
+/// over cable while the user is away). Pure state machine: no Io, no
+/// allocator, unit-testable without hardware.
 pub const Acceptor = struct {
     left: SideState = .{},
     right: SideState = .{},
@@ -145,11 +148,13 @@ pub const Acceptor = struct {
     /// Post-forceRead: the neuron just re-polled the sides over RF, so any
     /// numeric level is ground truth — accept it outright and clear pending.
     /// Refusing it for several polls would make an explicit user refresh
-    /// appear broken.
+    /// appear broken. A side that still answers "disconnected" was NOT
+    /// reached by the re-poll, so its level is still stale cache and is held
+    /// like any other disconnected reading.
     pub fn feedAuthoritative(self: *Acceptor, raw: Reading) Result {
         return self.result(.{
-            .left = acceptSide(&self.left, raw.left),
-            .right = acceptSide(&self.right, raw.right),
+            .left = acceptAuthoritativeSide(&self.left, raw.left),
+            .right = acceptAuthoritativeSide(&self.right, raw.right),
         });
     }
 
@@ -165,6 +170,12 @@ pub const Acceptor = struct {
         // evidence for or against a pending suspect — keep the streak.
         const lvl = raw.level orelse
             return .{ .level = st.accepted, .status = raw.status };
+        // A disconnected side's level is the neuron's stale cache (the bogus
+        // post-wake 100 is served persistently in this state, so repetition
+        // would "confirm" it) — ignore it exactly like an empty payload: no
+        // accept, no baseline, no streak advance.
+        if (raw.status == .disconnected)
+            return .{ .level = st.accepted, .status = raw.status };
         if (raw.status == .charging or raw.status == .charged)
             return acceptSide(st, raw);
         if (st.accepted) |acc| {
@@ -175,6 +186,12 @@ pub const Acceptor = struct {
         // known bogus post-wake value, everything else is taken at face value.
         if (lvl < 100) return acceptSide(st, raw);
         return suspectSide(st, raw, first_reading_confirm_polls);
+    }
+
+    fn acceptAuthoritativeSide(st: *SideState, raw: SideReading) SideReading {
+        if (raw.status == .disconnected)
+            return .{ .level = st.accepted, .status = raw.status };
+        return acceptSide(st, raw);
     }
 
     fn acceptSide(st: *SideState, raw: SideReading) SideReading {
@@ -377,6 +394,53 @@ test "Acceptor: null polls keep the pending streak alive" {
     res = feedLeft(&a, 100, .discharging);
     try std.testing.expectEqual(@as(?u8, 100), res.reading.left.level);
     try std.testing.expect(!res.suspect);
+}
+
+test "Acceptor: disconnected 100 is never accepted, however often it repeats" {
+    var a: Acceptor = .{};
+    _ = feedLeft(&a, 62, .discharging);
+    var res: Acceptor.Result = undefined;
+    for (0..5) |_| {
+        res = feedLeft(&a, 100, .disconnected);
+        try std.testing.expectEqual(@as(?u8, 62), res.reading.left.level);
+        try std.testing.expectEqual(Status.disconnected, res.reading.left.status);
+        try std.testing.expect(!res.suspect);
+    }
+}
+
+test "Acceptor: disconnected reading establishes no baseline" {
+    var a: Acceptor = .{};
+    var res = feedLeft(&a, 100, .disconnected);
+    try std.testing.expectEqual(@as(?u8, null), res.reading.left.level);
+    try std.testing.expect(!res.suspect);
+    // First live reading still goes through the first-reading path untainted.
+    res = feedLeft(&a, 87, .discharging);
+    try std.testing.expectEqual(@as(?u8, 87), res.reading.left.level);
+    try std.testing.expect(!res.suspect);
+}
+
+test "Acceptor: disconnected polls keep the pending streak alive" {
+    var a: Acceptor = .{};
+    _ = feedLeft(&a, 45, .discharging);
+    _ = feedLeft(&a, 100, .discharging);
+    var res = feedLeft(&a, 100, .disconnected);
+    try std.testing.expectEqual(@as(?u8, 45), res.reading.left.level);
+    try std.testing.expect(res.suspect);
+    _ = feedLeft(&a, 100, .discharging);
+    res = feedLeft(&a, 100, .discharging);
+    try std.testing.expectEqual(@as(?u8, 100), res.reading.left.level);
+    try std.testing.expect(!res.suspect);
+}
+
+test "Acceptor: feedAuthoritative holds a disconnected side's cached level" {
+    var a: Acceptor = .{};
+    _ = feedLeft(&a, 62, .discharging);
+    const res = a.feedAuthoritative(.{
+        .left = side(100, .disconnected),
+        .right = side(null, .unknown),
+    });
+    try std.testing.expectEqual(@as(?u8, 62), res.reading.left.level);
+    try std.testing.expectEqual(Status.disconnected, res.reading.left.status);
 }
 
 test "Acceptor: a different high value restarts the streak" {
