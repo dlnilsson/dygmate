@@ -14,13 +14,13 @@ const min_cli_interval_s = 5;
 const usage =
     \\Usage: dygmate [options]
     \\
-    \\Reports battery level and charging status of both halves of a
-    \\Dygma Defy wireless keyboard. Close Bazecor first: the serial
-    \\port is exclusive.
+    \\Reports battery level and charging status of a Dygma wireless
+    \\keyboard (Defy, Raise 2, or Sonsei). Close Bazecor first: the
+    \\serial port is exclusive.
     \\
     \\Options:
     \\  --port <name>      Serial port (e.g. COM5 or /dev/ttyACM0).
-    \\                     Default: auto-detect by USB VID/PID 35EF:0012.
+    \\                     Default: auto-detect by USB VID/PID (35EF:0012, :0021, :0031).
     \\  --interval <secs>  Fixed poll interval in seconds (minimum: 5).
     \\                     Default: adaptive 30s-2min.
     \\  --once             Print one reading and exit.
@@ -74,10 +74,10 @@ pub fn main(init: std.process.Init) !u8 {
             if (opts.port) |p| break :blk try device.normalizePortPath(alloc, p);
             if (device.findDygmaPort(io, alloc) catch null) |p| break :blk p;
             if (opts.once) {
-                std.debug.print("dygmate: no Dygma Defy wireless (35EF:0012) serial port found\n", .{});
+                std.debug.print("dygmate: no supported Dygma keyboard serial port found\n", .{});
                 return 1;
             }
-            std.debug.print("waiting for keyboard (no 35EF:0012 serial port found), rescanning in 3s...\n", .{});
+            std.debug.print("waiting for keyboard (no supported Dygma serial port found), rescanning in 3s...\n", .{});
             sleepSeconds(io, rescan_delay_s);
             continue;
         };

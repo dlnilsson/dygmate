@@ -8,6 +8,7 @@ const build_options = @import("build_options");
 const linux = std.os.linux;
 const tray_common = @import("tray_common.zig");
 const battery = @import("battery.zig");
+const device = @import("device.zig");
 const dbus = @import("dbus.zig");
 const layer = @import("layer.zig");
 const osd_linux = @import("osd_linux.zig");
@@ -155,6 +156,7 @@ const App = struct {
     // Current display snapshot (UI thread only).
     last: tray_common.LastKnown = .{},
     status: tray_common.DeviceStatus = .missing,
+    model: ?device.Model = null,
     paused: bool = false,
     icon_buf: IconBuf = undefined,
     tip_body: [128]u8 = undefined,
@@ -476,9 +478,13 @@ fn rebuildAndNotify(app: *App) void {
     app.state.mutex.lockUncancelable(app.io);
     const reading = app.state.reading;
     const status = app.state.status;
+    const model = app.state.model;
     const announce_pending = app.state.announce_connection and status == .connected and reading != null;
     app.state.mutex.unlock(app.io);
     const paused = app.state.paused.load(.acquire);
+    // Snapshot the model before the notification block: notifyInner reads it
+    // for titles/bodies, and the menu/tooltip pick 1- vs 2-sided rendering.
+    app.model = model;
 
     if (tray_common.isLive(status, paused) and reading != null) {
         const r = reading.?;
@@ -488,10 +494,11 @@ fn rebuildAndNotify(app: *App) void {
         // not the raw reading, so a momentarily-empty charging status can't fire
         // a false low-battery warning. Mirrors the Windows tray.
         const snapshot: battery.Reading = .{ .left = app.last.left, .right = app.last.right };
-        // Gate the announcement on the raw reading (both fresh levels present),
-        // but render/latch from the merged snapshot — a stale last-known value
-        // surviving a reconnect must not fire the announcement early.
-        const announce_ready = tray_common.bothLevelsKnown(r);
+        // Gate the announcement on the raw reading (fresh levels present for
+        // every battery-reporting side), but render/latch from the merged
+        // snapshot — a stale last-known value surviving a reconnect must not
+        // fire the announcement early.
+        const announce_ready = tray_common.levelsKnown(model, r);
         const plan = tray_common.planNotifications(&app.state.notified_low, announce_pending, announce_ready, snapshot);
         for (plan.events) |ev_opt| {
             if (ev_opt) |ev| sendNotification(app, ev, snapshot);
@@ -524,13 +531,19 @@ fn rebuildAndNotify(app: *App) void {
         renderIcon(&app.icon_buf, "--", tray_common.palette.gray);
     }
 
-    // Tooltip body: per-side last-known values.
+    // Tooltip body: last-known values per battery-reporting side.
     var lb: [40]u8 = undefined;
     var rb: [40]u8 = undefined;
-    const tip = std.fmt.bufPrint(&app.tip_body, "Left: {s}\nRight: {s}", .{
-        tray_common.fmtKnownSide(&lb, app.last.left),
-        tray_common.fmtKnownSide(&rb, app.last.right),
-    }) catch app.tip_body[0..0];
+    const one_sided = if (model) |m| m.sides() < 2 else false;
+    const tip = if (one_sided)
+        std.fmt.bufPrint(&app.tip_body, "Battery: {s}", .{
+            tray_common.fmtKnownSide(&lb, app.last.left),
+        }) catch app.tip_body[0..0]
+    else
+        std.fmt.bufPrint(&app.tip_body, "Left: {s}\nRight: {s}", .{
+            tray_common.fmtKnownSide(&lb, app.last.left),
+            tray_common.fmtKnownSide(&rb, app.last.right),
+        }) catch app.tip_body[0..0];
     app.tip_body_len = tip.len;
 
     app.menu_revision += 1;
@@ -570,12 +583,12 @@ fn notifyInner(app: *App, ev: tray_common.NotifyEvent, snapshot: battery.Reading
     var text: []const u8 = undefined;
     switch (ev.kind) {
         .connect_status => {
-            title = tray_common.notification_title_status;
-            text = tray_common.fmtStatusBody(&body_buf, snapshot);
+            title = tray_common.notificationTitleStatus(app.model);
+            text = tray_common.fmtStatusBody(&body_buf, app.model, snapshot);
         },
         .low_battery => {
-            title = tray_common.notification_title_low;
-            text = tray_common.fmtLowBody(&body_buf, ev.side.?, ev.level.?);
+            title = tray_common.notificationTitleLow(app.model);
+            text = tray_common.fmtLowBody(&body_buf, app.model, ev.side.?, ev.level.?);
         },
     }
     const app_icon: []const u8 = if (ev.warning) "battery-caution" else "battery";
@@ -867,17 +880,24 @@ fn buildMenuItems(app: *App, buf: *[3][48]u8, out: *[9]MenuItem) []const MenuIte
     const header = tray_common.menuHeader(app.status, app.paused);
 
     var sb: [24]u8 = undefined;
-    const left_label: []const u8 = std.fmt.bufPrint(&buf[0], "Left: {s}", .{tray_common.fmtMenuSide(&sb, app.last.left)}) catch "Left: ?";
-    const right_label: []const u8 = std.fmt.bufPrint(&buf[1], "Right: {s}", .{tray_common.fmtMenuSide(&sb, app.last.right)}) catch "Right: ?";
+    const one_sided = if (app.model) |m| m.sides() < 2 else false;
     const toggle_label: []const u8 = if (app.paused) "Reconnect" else "Disconnect (release port for Bazecor)";
 
     var n: usize = 0;
     out[n] = .{ .id = .status, .label = header, .enabled = false };
     n += 1;
-    out[n] = .{ .id = .left, .label = left_label, .enabled = false };
-    n += 1;
-    out[n] = .{ .id = .right, .label = right_label, .enabled = false };
-    n += 1;
+    if (one_sided) {
+        const battery_label: []const u8 = std.fmt.bufPrint(&buf[0], "Battery: {s}", .{tray_common.fmtMenuSide(&sb, app.last.left)}) catch "Battery: ?";
+        out[n] = .{ .id = .left, .label = battery_label, .enabled = false };
+        n += 1;
+    } else {
+        const left_label: []const u8 = std.fmt.bufPrint(&buf[0], "Left: {s}", .{tray_common.fmtMenuSide(&sb, app.last.left)}) catch "Left: ?";
+        const right_label: []const u8 = std.fmt.bufPrint(&buf[1], "Right: {s}", .{tray_common.fmtMenuSide(&sb, app.last.right)}) catch "Right: ?";
+        out[n] = .{ .id = .left, .label = left_label, .enabled = false };
+        n += 1;
+        out[n] = .{ .id = .right, .label = right_label, .enabled = false };
+        n += 1;
+    }
     out[n] = .{ .id = .sep, .label = "", .enabled = false, .separator = true };
     n += 1;
     out[n] = .{ .id = .refresh, .label = "Refresh battery now", .enabled = true };

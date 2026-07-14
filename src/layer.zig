@@ -60,7 +60,7 @@ test "parseActive rejects invalid payloads" {
     try std.testing.expectEqual(@as(?u8, null), parseActive("-1"));
     // No layer active at all.
     try std.testing.expectEqual(@as(?u8, null), parseActive("0 0 0 0 0 0 0 0 0 0"));
-    // Active flag beyond the Defy's 10 layers.
+    // Active flag beyond the keyboard's 10 layers.
     try std.testing.expectEqual(@as(?u8, null), parseActive("1 0 0 0 0 0 0 0 0 0 1"));
 }
 

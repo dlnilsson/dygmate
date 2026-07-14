@@ -1,2 +1,5 @@
-# Let the active local user access the Dygma Defy's CDC-ACM serial interface.
+# Let the active local user access a Dygma keyboard's CDC-ACM serial
+# interface (Defy wireless, Raise 2, Sonsei).
 SUBSYSTEM=="tty", ATTRS{idVendor}=="35ef", ATTRS{idProduct}=="0012", TAG+="uaccess"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="35ef", ATTRS{idProduct}=="0021", TAG+="uaccess"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="35ef", ATTRS{idProduct}=="0031", TAG+="uaccess"

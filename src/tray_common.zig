@@ -54,6 +54,9 @@ pub const State = struct {
     mutex: std.Io.Mutex = .init,
     reading: ?battery.Reading = null,
     status: DeviceStatus = .missing,
+    /// Detected keyboard model; null while absent. Written by the poll
+    /// thread on every discovery pass (mutex-protected, like `reading`).
+    model: ?device.Model = null,
     announce_connection: bool = false,
     stop: std.atomic.Value(bool) = .init(false),
     refresh: std.atomic.Value(bool) = .init(false),
@@ -182,8 +185,27 @@ pub fn fmtKnownSide(buf: []u8, s: battery.SideReading) []const u8 {
 // merged snapshot to planNotifications and render the returned events with
 // their own toolkit (Windows balloons, freedesktop Notifications on Linux).
 // ---------------------------------------------------------------------------
-pub const notification_title_status = "Dygma Defy battery level";
-pub const notification_title_low = "Dygma Defy battery low";
+/// Title of the connect-status notification, named after the detected
+/// keyboard. Null model (e.g. --port override) falls back to the generic name.
+pub fn notificationTitleStatus(model: ?device.Model) []const u8 {
+    const m = model orelse return "Dygma battery level";
+    return switch (m) {
+        .defy_wireless => "Dygma Defy battery level",
+        .raise2 => "Dygma Raise 2 battery level",
+        .sonsei => "Dygma Sonsei battery level",
+    };
+}
+
+/// Title of the low-battery notification; same shape as
+/// `notificationTitleStatus`.
+pub fn notificationTitleLow(model: ?device.Model) []const u8 {
+    const m = model orelse return "Dygma battery low";
+    return switch (m) {
+        .defy_wireless => "Dygma Defy battery low",
+        .raise2 => "Dygma Raise 2 battery low",
+        .sonsei => "Dygma Sonsei battery low",
+    };
+}
 
 /// A single notification to render. `connect_status` carries both-sides detail
 /// (rendered from the snapshot); `low_battery` carries the offending side and
@@ -203,9 +225,12 @@ pub const NotifyPlan = struct {
     consumed_announce: bool = false,
 };
 
-/// Both sides have a level — the gate for the connect announcement.
-pub fn bothLevelsKnown(r: battery.Reading) bool {
-    return r.left.level != null and r.right.level != null;
+/// All battery-reporting sides have a level — gates the connect announcement
+/// and the poll backoff. Null model (e.g. --port override) assumes 2 sides.
+pub fn levelsKnown(model: ?device.Model, r: battery.Reading) bool {
+    if (r.left.level == null) return false;
+    const m = model orelse return r.right.level != null;
+    return m.sides() < 2 or r.right.level != null;
 }
 
 /// Any non-charging side below the low threshold — drives warning urgency on
@@ -220,9 +245,16 @@ pub fn hasLowBattery(r: battery.Reading) bool {
     return false;
 }
 
-/// Body of the connect-status notification: "Left: {s}\nRight: {s}".
-pub fn fmtStatusBody(buf: []u8, r: battery.Reading) []const u8 {
+/// Body of the connect-status notification: "Left: {s}\nRight: {s}" for a
+/// 2-sided (or unknown) model; a 1-sided model renders just its single
+/// battery, which reports on the left channel.
+pub fn fmtStatusBody(buf: []u8, model: ?device.Model, r: battery.Reading) []const u8 {
     var lb: [32]u8 = undefined;
+    if (model) |m| {
+        if (m.sides() < 2) {
+            return std.fmt.bufPrint(buf, "Battery: {s}", .{fmtSide(&lb, r.left)}) catch buf[0..0];
+        }
+    }
     var rb: [32]u8 = undefined;
     return std.fmt.bufPrint(buf, "Left: {s}\nRight: {s}", .{
         fmtSide(&lb, r.left),
@@ -230,8 +262,14 @@ pub fn fmtStatusBody(buf: []u8, r: battery.Reading) []const u8 {
     }) catch buf[0..0];
 }
 
-/// Body of a low-battery notification: "{Left|Right} side at {d}%".
-pub fn fmtLowBody(buf: []u8, side: u1, level: u8) []const u8 {
+/// Body of a low-battery notification: "{Left|Right} side at {d}%"; a 1-sided
+/// model has no side to name.
+pub fn fmtLowBody(buf: []u8, model: ?device.Model, side: u1, level: u8) []const u8 {
+    if (model) |m| {
+        if (m.sides() < 2) {
+            return std.fmt.bufPrint(buf, "Battery at {d}%", .{level}) catch buf[0..0];
+        }
+    }
     const name: []const u8 = if (side == 0) "Left" else "Right";
     return std.fmt.bufPrint(buf, "{s} side at {d}%", .{ name, level }) catch buf[0..0];
 }
@@ -341,6 +379,12 @@ pub fn runPollLoop(
         // the serial layer (a plugged-in keyboard with no serial node yet is
         // present-without-port).
         const found = device.discoverDygma(io, gpa) catch device.Discovery{ .present = false };
+        // Publish the detected model every pass: it names notifications and
+        // picks 1- vs 2-sided rendering, and clearing it on absence keeps a
+        // swapped keyboard from rendering under the old model's layout.
+        st.mutex.lockUncancelable(io);
+        st.model = found.model;
+        st.mutex.unlock(io);
         if (!found.present) {
             if (found.port) |p| gpa.free(p);
             resetLayerState(st);
@@ -408,13 +452,14 @@ pub fn runPollLoop(
                 st.status = .connected;
                 if (announce_connection) st.announce_connection = true;
                 st.mutex.unlock(io);
-                // Back off only once BOTH sides have reported this connection —
-                // the same gate as the connect announcement, so slowing down can't
-                // leave the announcement pending for a whole slow interval. Until
-                // then stay fast. `res.suspect` comes from the FRESH read (not the
-                // merged snapshot), so an unresolved suspect value always forces
-                // the fast interval until it's confirmed or refuted.
-                if (bothLevelsKnown(merged)) {
+                // Back off only once every battery-reporting side has reported
+                // this connection — the same gate as the connect announcement,
+                // so slowing down can't leave the announcement pending for a
+                // whole slow interval. Until then stay fast. `res.suspect`
+                // comes from the FRESH read (not the merged snapshot), so an
+                // unresolved suspect value always forces the fast interval
+                // until it's confirmed or refuted.
+                if (levelsKnown(found.model, merged)) {
                     battery_interval_ms = battery.suggestedPollIntervalSeconds(merged, res.suspect) * std.time.ms_per_s;
                 }
                 battery_elapsed_ms = 0;
@@ -596,6 +641,50 @@ test "planNotifications: announce gates on raw readiness, not the merged snapsho
     const plan = planNotifications(&latch, true, false, merged);
     try std.testing.expectEqual(@as(usize, 0), countEvents(plan));
     try std.testing.expect(!plan.consumed_announce);
+}
+
+test "levelsKnown: 2-sided and null models need both sides, 1-sided needs left only" {
+    const left_only = reading(80, .discharging, null, .unknown);
+    const both = reading(80, .discharging, 90, .discharging);
+    const none = reading(null, .unknown, null, .unknown);
+
+    try std.testing.expect(!levelsKnown(.defy_wireless, left_only));
+    try std.testing.expect(levelsKnown(.defy_wireless, both));
+    try std.testing.expect(!levelsKnown(.raise2, left_only));
+    try std.testing.expect(levelsKnown(.raise2, both));
+    try std.testing.expect(levelsKnown(.sonsei, left_only));
+    try std.testing.expect(!levelsKnown(.sonsei, none));
+    try std.testing.expect(!levelsKnown(null, left_only));
+    try std.testing.expect(levelsKnown(null, both));
+}
+
+test "fmtStatusBody: 1-sided model renders a single battery line" {
+    var buf: [96]u8 = undefined;
+    const r = reading(42, .discharging, null, .unknown);
+    try std.testing.expectEqualStrings("Battery: 42% (discharging)", fmtStatusBody(&buf, .sonsei, r));
+    try std.testing.expectEqualStrings(
+        "Left: 42% (discharging)\nRight: ?% (?)",
+        fmtStatusBody(&buf, .defy_wireless, r),
+    );
+    try std.testing.expectEqualStrings(
+        "Left: 42% (discharging)\nRight: ?% (?)",
+        fmtStatusBody(&buf, null, r),
+    );
+}
+
+test "fmtLowBody: 1-sided model drops the side name" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("Battery at 15%", fmtLowBody(&buf, .sonsei, 0, 15));
+    try std.testing.expectEqualStrings("Left side at 15%", fmtLowBody(&buf, .raise2, 0, 15));
+    try std.testing.expectEqualStrings("Right side at 15%", fmtLowBody(&buf, null, 1, 15));
+}
+
+test "notification titles name the detected keyboard" {
+    try std.testing.expectEqualStrings("Dygma Defy battery level", notificationTitleStatus(.defy_wireless));
+    try std.testing.expectEqualStrings("Dygma Raise 2 battery level", notificationTitleStatus(.raise2));
+    try std.testing.expectEqualStrings("Dygma Sonsei battery low", notificationTitleLow(.sonsei));
+    try std.testing.expectEqualStrings("Dygma battery level", notificationTitleStatus(null));
+    try std.testing.expectEqualStrings("Dygma battery low", notificationTitleLow(null));
 }
 
 test "offlineStatus maps USB absence to missing" {

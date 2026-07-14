@@ -102,7 +102,7 @@ pub fn render(pixels: []u8, layer_display_num: u8) void {
         }
     }
 
-    // Center "Layer N". A ten-layer Defy stays inside the 120px usable width.
+    // Center "Layer N". A ten-layer keyboard stays inside the 120px usable width.
     var text_buf: [16]u8 = undefined;
     const text = std.fmt.bufPrint(&text_buf, "Layer {d}", .{layer_display_num}) catch return;
     const total_w = text.len * advance - glyph_scale; // drop trailing gap

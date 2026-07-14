@@ -1,4 +1,4 @@
-//! Windows system-tray battery indicator for the Dygma Defy wireless.
+//! Windows system-tray battery indicator for Dygma wireless keyboards.
 //!
 //! A hidden window owns a Shell_NotifyIcon tray icon; a background thread
 //! owns the Focus serial connection and runs the same discover -> connect ->
@@ -708,16 +708,22 @@ fn showMenu(hwnd: HWND) void {
     // UI-thread-only, so no lock is needed for them; status needs the mutex.
     g_state.mutex.lockUncancelable(g_io);
     const status = g_state.status;
+    const model = g_state.model;
     g_state.mutex.unlock(g_io);
 
     const conn_text = common.menuHeader(status, paused);
+    const one_sided = if (model) |m| m.sides() < 2 else false;
 
     var lb: [48]u8 = undefined;
     var rb: [48]u8 = undefined;
     var sb: [24]u8 = undefined;
     appendMenuText(menu, MF_GRAYED, 0, conn_text);
-    appendMenuText(menu, MF_GRAYED, 0, std.fmt.bufPrint(&lb, "Left: {s}", .{common.fmtMenuSide(&sb, g_last.left)}) catch "Left: ?");
-    appendMenuText(menu, MF_GRAYED, 0, std.fmt.bufPrint(&rb, "Right: {s}", .{common.fmtMenuSide(&sb, g_last.right)}) catch "Right: ?");
+    if (one_sided) {
+        appendMenuText(menu, MF_GRAYED, 0, std.fmt.bufPrint(&lb, "Battery: {s}", .{common.fmtMenuSide(&sb, g_last.left)}) catch "Battery: ?");
+    } else {
+        appendMenuText(menu, MF_GRAYED, 0, std.fmt.bufPrint(&lb, "Left: {s}", .{common.fmtMenuSide(&sb, g_last.left)}) catch "Left: ?");
+        appendMenuText(menu, MF_GRAYED, 0, std.fmt.bufPrint(&rb, "Right: {s}", .{common.fmtMenuSide(&sb, g_last.right)}) catch "Right: ?");
+    }
     _ = AppendMenuW(menu, MF_SEPARATOR, 0, null);
 
     _ = AppendMenuW(menu, MF_STRING, @intCast(ID_REFRESH), menu_refresh);
@@ -780,9 +786,11 @@ fn updateTray() void {
     g_state.mutex.lockUncancelable(g_io);
     const reading = g_state.reading;
     const status = g_state.status;
+    const model = g_state.model;
     const announce_pending = g_state.announce_connection and status == .connected and reading != null;
     g_state.mutex.unlock(g_io);
     const paused = g_state.paused.load(.acquire);
+    const one_sided = if (model) |m| m.sides() < 2 else false;
 
     var icon_text: []const u8 = "--";
     var color: COLORREF = col_gray;
@@ -803,13 +811,14 @@ fn updateTray() void {
         // look ".unknown" (i.e. "not charging") and fire a false low-battery
         // warning. The snapshot carries the last real status per side.
         const snapshot: battery.Reading = .{ .left = g_last.left, .right = g_last.right };
-        // Gate the announcement on the raw reading (both fresh levels present),
-        // but render/latch from the merged snapshot — matches the pre-refactor
-        // behavior and avoids announcing early off a stale last-known value.
-        const announce_ready = common.bothLevelsKnown(r);
+        // Gate the announcement on the raw reading (fresh levels present for
+        // every battery-reporting side), but render/latch from the merged
+        // snapshot — matches the pre-refactor behavior and avoids announcing
+        // early off a stale last-known value.
+        const announce_ready = common.levelsKnown(model, r);
         const plan = common.planNotifications(&g_state.notified_low, announce_pending, announce_ready, snapshot);
         for (plan.events) |ev_opt| {
-            if (ev_opt) |ev| showEvent(ev, snapshot);
+            if (ev_opt) |ev| showEvent(ev, model, snapshot);
         }
         if (plan.consumed_announce) {
             g_state.mutex.lockUncancelable(g_io);
@@ -820,18 +829,24 @@ fn updateTray() void {
         g_state.notified_low = .{ false, false };
     }
 
-    // Tooltip: last-known value for each side, in every state, with a short
-    // header when the reading isn't live.
+    // Tooltip: last-known value for each battery-reporting side, in every
+    // state, with a short header when the reading isn't live.
     {
         var lb: [40]u8 = undefined;
         var rb: [40]u8 = undefined;
         var tip_buf: [128]u8 = undefined;
         const header = common.tooltipHeader(status, paused);
-        const tip = std.fmt.bufPrint(&tip_buf, "{s}Left: {s}\nRight: {s}", .{
-            header,
-            common.fmtKnownSide(&lb, g_last.left),
-            common.fmtKnownSide(&rb, g_last.right),
-        }) catch "dygmate";
+        const tip = if (one_sided)
+            std.fmt.bufPrint(&tip_buf, "{s}Battery: {s}", .{
+                header,
+                common.fmtKnownSide(&lb, g_last.left),
+            }) catch "dygmate"
+        else
+            std.fmt.bufPrint(&tip_buf, "{s}Left: {s}\nRight: {s}", .{
+                header,
+                common.fmtKnownSide(&lb, g_last.left),
+                common.fmtKnownSide(&rb, g_last.right),
+            }) catch "dygmate";
         setUtf16(g_nid.szTip[0..], tip);
     }
 
@@ -880,20 +895,21 @@ fn openReleasePage() void {
     _ = ShellExecuteW(null, verb, wbuf[0..n :0].ptr, null, null, SW_SHOWNORMAL);
 }
 
-/// Render one planner event as a tray balloon. connect_status shows both-sides
-/// detail; low_battery names the offending side. Warning events use NIIF_WARNING.
-fn showEvent(ev: common.NotifyEvent, snapshot: battery.Reading) void {
+/// Render one planner event as a tray balloon. connect_status shows per-side
+/// detail; low_battery names the offending side (2-sided models). Warning
+/// events use NIIF_WARNING.
+fn showEvent(ev: common.NotifyEvent, model: ?device.Model, snapshot: battery.Reading) void {
     switch (ev.kind) {
         .connect_status => {
             var text_buf: [96]u8 = undefined;
-            const text = common.fmtStatusBody(&text_buf, snapshot);
+            const text = common.fmtStatusBody(&text_buf, model, snapshot);
             const flags: DWORD = if (ev.warning) NIIF_WARNING else NIIF_INFO_ICON;
-            showBalloon(common.notification_title_status, text, flags);
+            showBalloon(common.notificationTitleStatus(model), text, flags);
         },
         .low_battery => {
             var tb: [64]u8 = undefined;
-            const text = common.fmtLowBody(&tb, ev.side.?, ev.level.?);
-            showBalloon(common.notification_title_low, text, NIIF_WARNING);
+            const text = common.fmtLowBody(&tb, model, ev.side.?, ev.level.?);
+            showBalloon(common.notificationTitleLow(model), text, NIIF_WARNING);
         },
     }
 }

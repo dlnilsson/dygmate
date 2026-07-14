@@ -97,7 +97,7 @@ test "modelForIds maps supported keyboards and rejects bootloaders" {
 
 - `State` (line 53) gains `model: ?device.Model = null` (mutex-protected, like `reading`/`status`).
 - `runPollLoop`: after successful discovery (~line 343), write `st.model = found.model` under the mutex (the lock at lines 405–410 is a natural spot; also set it in the present-without-port path).
-- **Side-aware readiness** replacing `bothLevelsKnown` at its two gate uses (announcement readiness in both trays, and backoff at line 417):
+- **Side-aware readiness** replacing `bothLevelsKnown` at its three gate uses (announcement readiness in both trays, and backoff at line 417):
 
 ```zig
 /// All battery-reporting sides have a level — gates the connect announcement

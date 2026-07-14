@@ -1,7 +1,7 @@
 # dygmate
 
-Battery status for the [Dygma Defy](https://dygma.com/pages/defy) wireless, right in your system tray — over
-RF and Bluetooth, on Windows and Linux. Right-click for the menu, and get an optional on-screen overlay when you
+Battery status for Dygma wireless keyboards — the [Defy](https://dygma.com/pages/defy), the Raise 2, and the
+Sonsei — right in your system tray, over RF and Bluetooth, on Windows and Linux. Right-click for the menu, and get an optional on-screen overlay when you
 switch layers.
 
 <p align="center">
@@ -106,7 +106,10 @@ replug). The AUR package already ships this rule — replug the keyboard and
 skip this step. Manual install:
 
 ```sh
-echo 'SUBSYSTEM=="tty", ATTRS{idVendor}=="35ef", ATTRS{idProduct}=="0012", TAG+="uaccess"' \
+printf '%s\n' \
+  'SUBSYSTEM=="tty", ATTRS{idVendor}=="35ef", ATTRS{idProduct}=="0012", TAG+="uaccess"' \
+  'SUBSYSTEM=="tty", ATTRS{idVendor}=="35ef", ATTRS{idProduct}=="0021", TAG+="uaccess"' \
+  'SUBSYSTEM=="tty", ATTRS{idVendor}=="35ef", ATTRS{idProduct}=="0031", TAG+="uaccess"' \
   | sudo tee /etc/udev/rules.d/99-dygmate.rules
 sudo udevadm control --reload-rules && sudo udevadm trigger
 ```

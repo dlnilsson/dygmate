@@ -1,5 +1,5 @@
 [Unit]
-Description=Dygmate Defy battery tray indicator
+Description=Dygmate battery tray indicator
 PartOf=graphical-session.target
 Requires=graphical-session.target
 After=graphical-session.target
