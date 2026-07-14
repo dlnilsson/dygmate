@@ -86,17 +86,22 @@ pub fn read(f: *focus.Focus) focus.Error!Reading {
     const r = try readAll(f);
     if (r.left.status != .disconnected and r.right.status != .disconnected) return r;
     sleepMs(f.io, 500);
-    // Keep the first reading if the retry itself errors out.
-    return readAll(f) catch r;
+    // A transport error mid-retry poisons the stream: the abandoned command's
+    // response arrives later and answers the NEXT command, shifting every
+    // response after it by one (a status "2" then parses as a 2% level).
+    // Propagate so the caller reconnects — reopening flushes the port.
+    return readAll(f);
 }
 
 /// Ask the neuron to re-poll both sides over RF (Bazecor's "Force read"
 /// button). Argument-less, so it writes no EEPROM, but it generates RF traffic
 /// and briefly blanks the cached values — call it only on an explicit user
 /// refresh, never in the poll loop. Mirrors battery.ForceRead in the Go tray.
-pub fn forceRead(f: *focus.Focus) void {
+/// Errors must propagate: an abandoned forceRead leaves its late response in
+/// the RX queue, desyncing every later exchange on this connection.
+pub fn forceRead(f: *focus.Focus) focus.Error!void {
     var buf: [64]u8 = undefined;
-    _ = f.request("wireless.battery.forceRead", &buf) catch {};
+    _ = try f.request("wireless.battery.forceRead", &buf);
 }
 
 fn sleepMs(io: std.Io, ms: u64) void {

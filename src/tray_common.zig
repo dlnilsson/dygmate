@@ -491,7 +491,15 @@ pub fn runPollLoop(
             // Wait out the interval, staying responsive to stop/refresh/pause.
             const refreshed = waitForNextPoll(io, st, layer_poll_interval_ms);
             if (refreshed) {
-                battery.forceRead(&dev);
+                // A failed forceRead means the stream state is unknown (its
+                // late response would answer the next command) — reconnect
+                // rather than keep polling a desynced port.
+                battery.forceRead(&dev) catch {
+                    const still_present = device.isDygmaPresent(io) catch false;
+                    resetLayerState(st);
+                    setStatus(Ctx, ctx, io, st, wake, offlineStatus(still_present));
+                    break;
+                };
                 sleepMs(io, st, battery.force_read_settle_s * 1000);
                 next_read_authoritative = true;
                 battery_elapsed_ms = battery_interval_ms; // force a read next cycle
