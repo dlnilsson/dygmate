@@ -502,6 +502,12 @@ pub fn runPollLoop(
                 };
                 sleepMs(io, st, battery.force_read_settle_s * 1000);
                 next_read_authoritative = true;
+                // Re-arm fast polling: if the sides were asleep the refresh
+                // read comes back empty, and staying on the slow interval
+                // would make the refresh look dead for up to 2 minutes after
+                // the halves wake. levelsKnown restores the adaptive interval
+                // once real data arrives.
+                battery_interval_ms = initial_poll_interval_ms;
                 battery_elapsed_ms = battery_interval_ms; // force a read next cycle
             } else {
                 battery_elapsed_ms += layer_poll_interval_ms;

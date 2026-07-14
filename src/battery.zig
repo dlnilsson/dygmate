@@ -116,12 +116,19 @@ fn sleepMs(io: std.Io, ms: u64) void {
 /// contact the neuron persistently serves a bogus cached 100% with status
 /// "disconnected" on every plain read — not transiently, but until the half
 /// actually wakes — so a disconnected side's level is never evidence of
-/// anything and is ignored outright. A level also cannot genuinely rise while
-/// discharging, so an upward jump must repeat on consecutive polls before it
-/// is accepted. Drops are always plausible and accepted immediately;
-/// charging/charged sides are trusted outright (the sides really do charge
-/// over cable while the user is away). Pure state machine: no Io, no
-/// allocator, unit-testable without hardware.
+/// anything and is ignored outright. Around sleep/wake transitions the
+/// neuron also transiently serves 0 (its unpopulated cache value; Bazecor
+/// refuses to render 0% for the same reason) and FOCUS_API documents status
+/// fault as "faulty or has some reading error", i.e. the level may be
+/// garbage — so a fault level is ignored and a 0 must repeat on consecutive
+/// polls before it is believed. A level also cannot genuinely rise while
+/// discharging, so an upward jump must repeat the same way. Ordinary drops
+/// are plausible and accepted immediately, but a first-ever reading below
+/// the low threshold is confirmed first (it would otherwise fire a
+/// low-battery notification off one garbage read). Charging/charged sides
+/// are trusted outright (the sides really do charge over cable while the
+/// user is away). Pure state machine: no Io, no allocator, unit-testable
+/// without hardware.
 pub const Acceptor = struct {
     left: SideState = .{},
     right: SideState = .{},
@@ -150,12 +157,13 @@ pub const Acceptor = struct {
         });
     }
 
-    /// Post-forceRead: the neuron just re-polled the sides over RF, so any
+    /// Post-forceRead: the neuron just re-polled the sides over RF, so a
     /// numeric level is ground truth — accept it outright and clear pending.
     /// Refusing it for several polls would make an explicit user refresh
-    /// appear broken. A side that still answers "disconnected" was NOT
-    /// reached by the re-poll, so its level is still stale cache and is held
-    /// like any other disconnected reading.
+    /// appear broken. Exceptions: a side that still answers "disconnected"
+    /// or "fault" was NOT (reliably) reached by the re-poll, and a 0 is the
+    /// blanked cache the forceRead itself just cleared — both are held like
+    /// any other untrusted reading.
     pub fn feedAuthoritative(self: *Acceptor, raw: Reading) Result {
         return self.result(.{
             .left = acceptAuthoritativeSide(&self.left, raw.left),
@@ -178,24 +186,38 @@ pub const Acceptor = struct {
         // A disconnected side's level is the neuron's stale cache (the bogus
         // post-wake 100 is served persistently in this state, so repetition
         // would "confirm" it) — ignore it exactly like an empty payload: no
-        // accept, no baseline, no streak advance.
-        if (raw.status == .disconnected)
+        // accept, no baseline, no streak advance. Fault means "faulty or has
+        // some reading error" (FOCUS_API), so its level gets the same
+        // treatment.
+        if (raw.status == .disconnected or raw.status == .fault)
             return .{ .level = st.accepted, .status = raw.status };
         if (raw.status == .charging or raw.status == .charged)
             return acceptSide(st, raw);
+        // 0 is the neuron's unpopulated-cache value around sleep/wake; a
+        // genuinely empty side keeps reporting it and confirms below.
+        if (lvl == 0) return suspectSide(st, raw, suspect_confirm_polls);
         if (st.accepted) |acc| {
             if (lvl <= acc +| level_jump_tolerance) return acceptSide(st, raw);
             return suspectSide(st, raw, suspect_confirm_polls);
         }
-        // No baseline to jump-gate against; only an initial 100 matches the
-        // known bogus post-wake value, everything else is taken at face value.
-        if (lvl < 100) return acceptSide(st, raw);
+        // No baseline to jump-gate against; an initial 100 matches the known
+        // bogus post-wake value and an initial low would fire a low-battery
+        // notification off one garbage read — confirm both, take the rest at
+        // face value.
+        if (lvl >= low_level_fast_threshold and lvl < 100) return acceptSide(st, raw);
         return suspectSide(st, raw, first_reading_confirm_polls);
     }
 
     fn acceptAuthoritativeSide(st: *SideState, raw: SideReading) SideReading {
-        if (raw.status == .disconnected)
+        if (raw.status == .disconnected or raw.status == .fault)
             return .{ .level = st.accepted, .status = raw.status };
+        // forceRead briefly blanks the neuron's cache, so even a post-refresh
+        // 0 is "no data yet" rather than ground truth — unless the side says
+        // charging, which a genuinely dead-but-plugged-in half really reports.
+        if (raw.level) |lvl| {
+            if (lvl == 0 and raw.status != .charging and raw.status != .charged)
+                return .{ .level = st.accepted, .status = raw.status };
+        }
         return acceptSide(st, raw);
     }
 
@@ -491,5 +513,91 @@ test "Acceptor: status passes through even when the level is rejected" {
     _ = feedLeft(&a, 45, .discharging);
     const res = feedLeft(&a, 100, .fault);
     try std.testing.expectEqual(@as(?u8, 45), res.reading.left.level);
+    try std.testing.expectEqual(Status.fault, res.reading.left.status);
+}
+
+test "Acceptor: fault level is ignored however often it repeats" {
+    var a: Acceptor = .{};
+    _ = feedLeft(&a, 45, .discharging);
+    for (0..5) |_| {
+        const res = feedLeft(&a, 2, .fault);
+        try std.testing.expectEqual(@as(?u8, 45), res.reading.left.level);
+        try std.testing.expect(!res.suspect);
+    }
+}
+
+test "Acceptor: fault polls keep a pending streak alive" {
+    var a: Acceptor = .{};
+    _ = feedLeft(&a, 45, .discharging);
+    _ = feedLeft(&a, 100, .discharging);
+    var res = feedLeft(&a, 100, .fault);
+    try std.testing.expectEqual(@as(?u8, 45), res.reading.left.level);
+    try std.testing.expect(res.suspect);
+    _ = feedLeft(&a, 100, .discharging);
+    res = feedLeft(&a, 100, .discharging);
+    try std.testing.expectEqual(@as(?u8, 100), res.reading.left.level);
+}
+
+test "Acceptor: 0 while discharging needs consecutive confirmation" {
+    var a: Acceptor = .{};
+    _ = feedLeft(&a, 45, .discharging);
+    var res = feedLeft(&a, 0, .discharging);
+    try std.testing.expectEqual(@as(?u8, 45), res.reading.left.level);
+    try std.testing.expect(res.suspect);
+    res = feedLeft(&a, 0, .discharging);
+    try std.testing.expectEqual(@as(?u8, 45), res.reading.left.level);
+    res = feedLeft(&a, 0, .discharging); // third consecutive sighting
+    try std.testing.expectEqual(@as(?u8, 0), res.reading.left.level);
+    try std.testing.expect(!res.suspect);
+}
+
+test "Acceptor: first reading of 0 is not taken at face value" {
+    var a: Acceptor = .{};
+    const res = feedLeft(&a, 0, .discharging);
+    try std.testing.expectEqual(@as(?u8, null), res.reading.left.level);
+    try std.testing.expect(res.suspect);
+}
+
+test "Acceptor: 0 while charging is accepted outright" {
+    var a: Acceptor = .{};
+    _ = feedLeft(&a, 45, .discharging);
+    const res = feedLeft(&a, 0, .charging);
+    try std.testing.expectEqual(@as(?u8, 0), res.reading.left.level);
+    try std.testing.expect(!res.suspect);
+}
+
+test "Acceptor: first reading below the low threshold needs confirmation" {
+    var a: Acceptor = .{};
+    var res = feedLeft(&a, 15, .discharging);
+    try std.testing.expectEqual(@as(?u8, null), res.reading.left.level);
+    try std.testing.expect(res.suspect);
+    res = feedLeft(&a, 15, .discharging);
+    try std.testing.expectEqual(@as(?u8, 15), res.reading.left.level);
+    try std.testing.expect(!res.suspect);
+}
+
+test "Acceptor: feedAuthoritative holds a 0 unless the side is charging" {
+    var a: Acceptor = .{};
+    _ = feedLeft(&a, 62, .discharging);
+    var res = a.feedAuthoritative(.{
+        .left = side(0, .discharging),
+        .right = side(null, .unknown),
+    });
+    try std.testing.expectEqual(@as(?u8, 62), res.reading.left.level);
+    res = a.feedAuthoritative(.{
+        .left = side(0, .charging),
+        .right = side(null, .unknown),
+    });
+    try std.testing.expectEqual(@as(?u8, 0), res.reading.left.level);
+}
+
+test "Acceptor: feedAuthoritative holds a fault side's level" {
+    var a: Acceptor = .{};
+    _ = feedLeft(&a, 62, .discharging);
+    const res = a.feedAuthoritative(.{
+        .left = side(3, .fault),
+        .right = side(null, .unknown),
+    });
+    try std.testing.expectEqual(@as(?u8, 62), res.reading.left.level);
     try std.testing.expectEqual(Status.fault, res.reading.left.status);
 }
