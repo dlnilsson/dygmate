@@ -417,6 +417,7 @@ const menu_disconnect = std.unicode.utf8ToUtf16LeStringLiteral("Disconnect (rele
 const menu_reconnect = std.unicode.utf8ToUtf16LeStringLiteral("Reconnect");
 const menu_osd = std.unicode.utf8ToUtf16LeStringLiteral("Show layer overlay");
 const menu_quit = std.unicode.utf8ToUtf16LeStringLiteral("Quit");
+const menu_version = std.unicode.utf8ToUtf16LeStringLiteral("Version: dygmate " ++ build_options.version);
 
 // ---------------------------------------------------------------------------
 // Shared state between the UI thread and the polling thread. Defined in
@@ -734,6 +735,8 @@ fn showMenu(hwnd: HWND) void {
     if (g_update.isAvailable()) {
         appendMenuText(menu, MF_STRING, @intCast(ID_UPDATE), g_update.label());
     }
+    _ = AppendMenuW(menu, MF_SEPARATOR, 0, null);
+    _ = AppendMenuW(menu, MF_GRAYED, 0, menu_version);
     _ = AppendMenuW(menu, MF_STRING, @intCast(ID_QUIT), menu_quit);
     // Bold "Refresh battery now" as the default (also the double-click action).
     _ = SetMenuDefaultItem(menu, @intCast(ID_REFRESH), MF_BYCOMMAND);

@@ -822,6 +822,8 @@ const MenuId = enum(i32) {
     osd = 7,
     quit = 8,
     update = 9,
+    sep2 = 10,
+    version = 11,
 };
 
 const menu_props = [_][]const u8{ "Version", "Status", "TextDirection" };
@@ -876,7 +878,7 @@ const MenuItem = struct {
 
 /// Fill `out` with the current menu, returning the populated prefix. The update
 /// item is present only after the background check has found a newer release.
-fn buildMenuItems(app: *App, buf: *[3][48]u8, out: *[9]MenuItem) []const MenuItem {
+fn buildMenuItems(app: *App, buf: *[3][48]u8, out: *[11]MenuItem) []const MenuItem {
     const header = tray_common.menuHeader(app.status, app.paused);
 
     var sb: [24]u8 = undefined;
@@ -915,6 +917,10 @@ fn buildMenuItems(app: *App, buf: *[3][48]u8, out: *[9]MenuItem) []const MenuIte
         out[n] = .{ .id = .update, .label = app.update.label(), .enabled = true };
         n += 1;
     }
+    out[n] = .{ .id = .sep2, .label = "", .enabled = false, .separator = true };
+    n += 1;
+    out[n] = .{ .id = .version, .label = "Version: dygmate " ++ build_options.version, .enabled = false };
+    n += 1;
     out[n] = .{ .id = .quit, .label = "Quit", .enabled = true };
     n += 1;
     return out[0..n];
@@ -924,7 +930,7 @@ fn buildMenuItems(app: *App, buf: *[3][48]u8, out: *[9]MenuItem) []const MenuIte
 ///   (revision u, layout (ia{sv}av)).
 fn menuGetLayout(app: *App, msg: dbus.Message) !void {
     var line: [3][48]u8 = undefined;
-    var item_buf: [9]MenuItem = undefined;
+    var item_buf: [11]MenuItem = undefined;
     const items = buildMenuItems(app, &line, &item_buf);
 
     var body = std.ArrayList(u8).empty;
@@ -993,7 +999,7 @@ fn writeEmptyProps(w: *dbus.Writer) !void {
 /// GetGroupProperties(ids ai, propertyNames as) -> a(ia{sv}).
 fn menuGetGroupProperties(app: *App, msg: dbus.Message) !void {
     var line: [3][48]u8 = undefined;
-    var item_buf: [9]MenuItem = undefined;
+    var item_buf: [11]MenuItem = undefined;
     const items = buildMenuItems(app, &line, &item_buf);
 
     var r = dbus.Reader{ .data = msg.body };
@@ -1396,7 +1402,7 @@ test "missing menu header is exact" {
     app.status = .missing;
     app.paused = false;
     var buf: [3][48]u8 = undefined;
-    var item_buf: [9]MenuItem = undefined;
+    var item_buf: [11]MenuItem = undefined;
     const items = buildMenuItems(&app, &buf, &item_buf);
     try std.testing.expectEqualStrings("No keyboard discovered", items[0].label);
 }

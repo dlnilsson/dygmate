@@ -1,8 +1,10 @@
 const std = @import("std");
 
-/// Falls back to the package version; release builds override it with the git
-/// tag via `-Dversion=<tag>` so `--version` reports the tagged release.
-const default_version = @import("build.zig.zon").version;
+/// Falls back to the package version plus a "-dirty" marker; GitHub release
+/// builds override it with the git tag via `-Dversion=<tag>` so `--version`
+/// reports the tagged release. The marker makes local/unofficial builds
+/// identifiable in the tray menu and `--version` output.
+const default_version = @import("build.zig.zon").version ++ "-dirty";
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
