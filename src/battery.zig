@@ -56,6 +56,9 @@ pub const suspect_confirm_polls: u8 = 3;
 /// 100 is exactly what the post-wake bogus cache reports.
 pub const first_reading_confirm_polls: u8 = 2;
 pub const force_read_settle_s: u64 = 4;
+/// Automatic forceRead verification retry schedule; first attempt fires
+/// immediately, each further attempt waits the next entry (last repeats).
+pub const verify_backoff_s = [_]u64{ 5, 15, 45, 120 };
 
 /// Issue the four battery read commands. Parse failures degrade to
 /// null/.unknown; only transport errors propagate (they mean the
@@ -125,11 +128,14 @@ fn sleepMs(io: std.Io, ms: u64) void {
 /// polls it cannot genuinely move more than a point or two in either
 /// direction, so any move beyond the jump tolerance must repeat on
 /// consecutive polls before it is accepted. A first-ever reading below the
-/// low threshold is confirmed the same way (it would otherwise fire a
-/// low-battery notification off one garbage read). Charging/charged sides
-/// are trusted outright (the sides really do charge over cable while the
-/// user is away). Pure state machine: no Io, no allocator, unit-testable
-/// without hardware.
+/// low threshold is never accepted off plain reads at all: post-wake the
+/// neuron persistently serves a bogus cached level with a clean status, and
+/// repetition of a cache adds no information, so a value that would newly
+/// cross below the low threshold (or any out-of-tolerance value while a
+/// side is wake-guarded) is held until an authoritative post-forceRead read
+/// settles it. Charging/charged sides are trusted outright (the sides
+/// really do charge over cable while the user is away). Pure state machine:
+/// no Io, no allocator, unit-testable without hardware.
 pub const Acceptor = struct {
     left: SideState = .{},
     right: SideState = .{},
@@ -140,8 +146,15 @@ pub const Acceptor = struct {
         /// Suspect value awaiting confirmation.
         pending: ?u8 = null,
         pending_count: u8 = 0,
+        /// Set by `noteWake` after the machine slept: the neuron's cache is
+        /// untrustworthy, so any out-of-tolerance value needs authoritative
+        /// verification. Cleared by any accepted level.
+        wake_guard: bool = false,
     };
 
+    /// Invariant: `reading` only carries accepted levels, so an unverified
+    /// low can never reach display or notifications — the callers' gating on
+    /// `needs_verification` is defense-in-depth.
     pub const Result = struct {
         /// Validated reading: rejected levels are replaced by the last
         /// accepted level (or null). Statuses pass through untouched.
@@ -149,6 +162,14 @@ pub const Acceptor = struct {
         /// True while any side holds an unconfirmed suspect value — callers
         /// should poll fast until it resolves.
         suspect: bool,
+        /// Per side (0=left, 1=right): the pending value can only be settled
+        /// by an authoritative post-forceRead read — callers should run the
+        /// forceRead verification loop until it clears.
+        needs_verification: [2]bool,
+
+        pub fn anyVerification(self: Result) bool {
+            return self.needs_verification[0] or self.needs_verification[1];
+        }
     };
 
     pub fn feed(self: *Acceptor, raw: Reading) Result {
@@ -172,11 +193,45 @@ pub const Acceptor = struct {
         });
     }
 
+    /// The machine just woke from sleep/hibernation: the neuron's cache may
+    /// hold bogus values with clean statuses. Drop pre-sleep pending streaks
+    /// (that evidence is stale) and guard both sides so any out-of-tolerance
+    /// value needs authoritative verification. Baselines survive — the last
+    /// accepted level is still the best guess (that's why the Acceptor lives
+    /// outside the reconnect loop).
+    pub fn noteWake(self: *Acceptor) void {
+        for ([_]*SideState{ &self.left, &self.right }) |st| {
+            st.pending = null;
+            st.pending_count = 0;
+            // Only a side that has ever reported gets guarded: with no
+            // baseline there is nothing for a bogus cache to contradict (the
+            // no-baseline rules already hold an initial low for verification
+            // and confirm an initial 100 by repetition), and guarding it
+            // would keep the forceRead retry loop alive forever on models
+            // where that side never reports at all (Sonsei's right channel).
+            st.wake_guard = st.accepted != null;
+        }
+    }
+
     fn result(self: *const Acceptor, reading: Reading) Result {
         return .{
             .reading = reading,
             .suspect = self.left.pending != null or self.right.pending != null,
+            .needs_verification = .{
+                sideNeedsVerification(self.left),
+                sideNeedsVerification(self.right),
+            },
         };
+    }
+
+    /// A side needs an authoritative read when its pending value would newly
+    /// cross below the low threshold (never confirmable by cache repetition)
+    /// or while it is wake-guarded (guard clears only on an accepted level,
+    /// so a side that stays silent after a wake keeps the retry loop alive).
+    fn sideNeedsVerification(st: SideState) bool {
+        if (st.wake_guard) return true;
+        const p = st.pending orelse return false;
+        return p < low_level_fast_threshold;
     }
 
     fn feedSide(st: *SideState, raw: SideReading) SideReading {
@@ -203,14 +258,24 @@ pub const Acceptor = struct {
         if (st.accepted) |acc| {
             const diff = if (lvl > acc) lvl - acc else acc - lvl;
             if (diff <= level_jump_tolerance) return acceptSide(st, raw);
+            // A jump below the low threshold would fire a low-battery
+            // notification, and a wake-guarded side may be serving a bogus
+            // post-wake cache on every read — repetition of a cache adds no
+            // information, so neither is ever confirmable by plain-read
+            // repetition; hold until an authoritative read settles it.
+            if (lvl < low_level_fast_threshold or st.wake_guard)
+                return suspectSide(st, raw, null);
             return suspectSide(st, raw, suspect_confirm_polls);
         }
         // No baseline to jump-gate against; an initial 100 matches the known
-        // bogus post-wake value and an initial low would fire a low-battery
-        // notification off one garbage read — confirm both, take the rest at
+        // bogus post-wake value (confirm by repetition), and an initial low
+        // may be a stale pre-sleep cache after an app restart following a
+        // wake — it must never fire a low-battery notification off plain
+        // reads, so hold it for authoritative verification. Take the rest at
         // face value.
         if (lvl >= low_level_fast_threshold and lvl < 100) return acceptSide(st, raw);
-        return suspectSide(st, raw, first_reading_confirm_polls);
+        if (lvl >= 100) return suspectSide(st, raw, first_reading_confirm_polls);
+        return suspectSide(st, raw, null);
     }
 
     fn acceptAuthoritativeSide(st: *SideState, raw: SideReading) SideReading {
@@ -231,17 +296,25 @@ pub const Acceptor = struct {
             st.accepted = lvl;
             st.pending = null;
             st.pending_count = 0;
+            st.wake_guard = false;
         }
         return .{ .level = st.accepted, .status = raw.status };
     }
 
-    fn suspectSide(st: *SideState, raw: SideReading, confirm: u8) SideReading {
+    /// `confirm == null`: never accept by repetition — track the pending
+    /// value (so `suspect`/`needs_verification` stay true) but only an
+    /// authoritative read can settle it. The count is not advanced in that
+    /// mode: a persistent bogus cache would overflow it, and it decides
+    /// nothing.
+    fn suspectSide(st: *SideState, raw: SideReading, confirm: ?u8) SideReading {
         const lvl = raw.level.?;
         if (st.pending) |p| {
             const diff = if (lvl > p) lvl - p else p - lvl;
             if (diff <= level_jump_tolerance) {
-                st.pending_count += 1;
-                if (st.pending_count >= confirm) return acceptSide(st, raw);
+                if (confirm) |c| {
+                    st.pending_count += 1;
+                    if (st.pending_count >= c) return acceptSide(st, raw);
+                }
                 return .{ .level = st.accepted, .status = raw.status };
             }
         }
@@ -611,14 +684,24 @@ test "Acceptor: 0 while charging is accepted outright" {
     try std.testing.expect(!res.suspect);
 }
 
-test "Acceptor: first reading below the low threshold needs confirmation" {
+test "Acceptor: first reading below the low threshold needs authoritative verification" {
     var a: Acceptor = .{};
-    var res = feedLeft(&a, 15, .discharging);
-    try std.testing.expectEqual(@as(?u8, null), res.reading.left.level);
-    try std.testing.expect(res.suspect);
-    res = feedLeft(&a, 15, .discharging);
+    // Plain-read repetition never confirms it, however often it repeats.
+    for (0..5) |_| {
+        const res = feedLeft(&a, 15, .discharging);
+        try std.testing.expectEqual(@as(?u8, null), res.reading.left.level);
+        try std.testing.expect(res.suspect);
+        try std.testing.expect(res.needs_verification[0]);
+        try std.testing.expect(!res.needs_verification[1]);
+    }
+    // A genuine low confirms in one authoritative read.
+    const res = a.feedAuthoritative(.{
+        .left = side(15, .discharging),
+        .right = side(null, .unknown),
+    });
     try std.testing.expectEqual(@as(?u8, 15), res.reading.left.level);
     try std.testing.expect(!res.suspect);
+    try std.testing.expect(!res.anyVerification());
 }
 
 test "Acceptor: feedAuthoritative holds a 0 unless the side is charging" {
@@ -645,4 +728,162 @@ test "Acceptor: feedAuthoritative holds a fault side's level" {
     });
     try std.testing.expectEqual(@as(?u8, 62), res.reading.left.level);
     try std.testing.expectEqual(Status.fault, res.reading.left.status);
+}
+
+test "Acceptor: low jump is never confirmed by plain repetition" {
+    var a: Acceptor = .{};
+    _ = feedLeft(&a, 90, .discharging);
+    for (0..5) |_| {
+        const res = feedLeft(&a, 15, .discharging);
+        try std.testing.expectEqual(@as(?u8, 90), res.reading.left.level);
+        try std.testing.expect(res.suspect);
+        try std.testing.expect(res.needs_verification[0]);
+    }
+}
+
+test "Acceptor: feedAuthoritative settles a pending low either way" {
+    // Confirms a genuine low in one read.
+    var a: Acceptor = .{};
+    _ = feedLeft(&a, 90, .discharging);
+    _ = feedLeft(&a, 15, .discharging);
+    var res = a.feedAuthoritative(.{
+        .left = side(15, .discharging),
+        .right = side(null, .unknown),
+    });
+    try std.testing.expectEqual(@as(?u8, 15), res.reading.left.level);
+    try std.testing.expect(!res.anyVerification());
+
+    // Refutes a bogus low: the authoritative value clears the pending streak.
+    var b: Acceptor = .{};
+    _ = b.feed(.{ .left = side(90, .discharging), .right = side(null, .unknown) });
+    _ = b.feed(.{ .left = side(15, .discharging), .right = side(null, .unknown) });
+    res = b.feedAuthoritative(.{
+        .left = side(89, .discharging),
+        .right = side(null, .unknown),
+    });
+    try std.testing.expectEqual(@as(?u8, 89), res.reading.left.level);
+    try std.testing.expect(!res.suspect);
+    try std.testing.expect(!res.anyVerification());
+}
+
+test "Acceptor: held authoritative answers keep verification pending" {
+    var a: Acceptor = .{};
+    _ = feedLeft(&a, 90, .discharging);
+    _ = feedLeft(&a, 15, .discharging);
+    const held = [_]SideReading{
+        side(null, .unknown),
+        side(100, .disconnected),
+        side(3, .fault),
+        side(0, .discharging),
+    };
+    for (held) |h| {
+        const res = a.feedAuthoritative(.{ .left = h, .right = side(null, .unknown) });
+        try std.testing.expectEqual(@as(?u8, 90), res.reading.left.level);
+        try std.testing.expect(res.needs_verification[0]);
+    }
+}
+
+test "Acceptor: noteWake clears the pending streak and guards the sides" {
+    var a: Acceptor = .{};
+    _ = feedLeft(&a, 90, .discharging);
+    // Two sightings of a pre-sleep suspect that must not carry across a wake.
+    _ = feedLeft(&a, 60, .discharging);
+    _ = feedLeft(&a, 60, .discharging);
+    a.noteWake();
+    try std.testing.expectEqual(@as(?u8, null), a.left.pending);
+    try std.testing.expectEqual(@as(?u8, 90), a.left.accepted); // baseline survives
+    // Post-wake the streak restarts and repetition no longer confirms.
+    for (0..5) |_| {
+        const res = feedLeft(&a, 60, .discharging);
+        try std.testing.expectEqual(@as(?u8, 90), res.reading.left.level);
+        try std.testing.expect(res.needs_verification[0]);
+    }
+}
+
+test "Acceptor: wake guard makes any out-of-tolerance value need verification" {
+    var a: Acceptor = .{};
+    _ = feedLeft(&a, 50, .discharging);
+    a.noteWake();
+    // A high jump — not a low — still needs verification while guarded.
+    for (0..5) |_| {
+        const res = feedLeft(&a, 100, .discharging);
+        try std.testing.expectEqual(@as(?u8, 50), res.reading.left.level);
+        try std.testing.expect(res.needs_verification[0]);
+    }
+}
+
+test "Acceptor: within-tolerance reading clears the wake guard" {
+    var a: Acceptor = .{};
+    _ = feedLeft(&a, 50, .discharging);
+    a.noteWake();
+    var res = feedLeft(&a, 49, .discharging);
+    try std.testing.expectEqual(@as(?u8, 49), res.reading.left.level);
+    try std.testing.expect(!res.needs_verification[0]);
+    // Repetition rules are back to normal after the guard clears.
+    _ = feedLeft(&a, 90, .discharging);
+    _ = feedLeft(&a, 90, .discharging);
+    res = feedLeft(&a, 90, .discharging);
+    try std.testing.expectEqual(@as(?u8, 90), res.reading.left.level);
+    try std.testing.expect(!res.anyVerification());
+}
+
+test "Acceptor: charging reading clears the wake guard" {
+    var a: Acceptor = .{};
+    _ = feedLeft(&a, 50, .discharging);
+    a.noteWake();
+    const res = feedLeft(&a, 80, .charging);
+    try std.testing.expectEqual(@as(?u8, 80), res.reading.left.level);
+    try std.testing.expect(!res.needs_verification[0]);
+}
+
+test "Acceptor: authoritative accept clears the wake guard" {
+    var a: Acceptor = .{};
+    _ = feedLeft(&a, 50, .discharging);
+    a.noteWake();
+    _ = feedLeft(&a, 100, .discharging);
+    const res = a.feedAuthoritative(.{
+        .left = side(97, .discharging),
+        .right = side(null, .unknown),
+    });
+    try std.testing.expectEqual(@as(?u8, 97), res.reading.left.level);
+    try std.testing.expect(!res.anyVerification());
+}
+
+test "Acceptor: noteWake without a baseline guards nothing" {
+    // A side that has never reported (Sonsei's right channel, app started
+    // post-wake) must not keep the forceRead retry loop alive forever.
+    var a: Acceptor = .{};
+    a.noteWake();
+    try std.testing.expect(!a.left.wake_guard);
+    try std.testing.expect(!a.right.wake_guard);
+    // First readings still follow the no-baseline rules untainted.
+    const res = feedLeft(&a, 87, .discharging);
+    try std.testing.expectEqual(@as(?u8, 87), res.reading.left.level);
+    try std.testing.expect(!res.anyVerification());
+}
+
+test "Acceptor: a never-reporting side does not hold verification open" {
+    // One-sided model: only the left channel ever reports. After a wake the
+    // guarded left resolves and verification must fully clear even though
+    // the right side stays silent forever.
+    var a: Acceptor = .{};
+    _ = feedLeft(&a, 50, .discharging);
+    a.noteWake();
+    try std.testing.expect(!a.right.wake_guard);
+    const res = feedLeft(&a, 50, .discharging);
+    try std.testing.expect(!res.anyVerification());
+}
+
+test "Acceptor: needs_verification is per-side" {
+    var a: Acceptor = .{};
+    _ = a.feed(.{
+        .left = side(90, .discharging),
+        .right = side(80, .discharging),
+    });
+    const res = a.feed(.{
+        .left = side(15, .discharging),
+        .right = side(79, .discharging),
+    });
+    try std.testing.expect(res.needs_verification[0]);
+    try std.testing.expect(!res.needs_verification[1]);
 }

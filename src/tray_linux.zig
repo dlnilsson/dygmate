@@ -155,6 +155,9 @@ const App = struct {
 
     // Current display snapshot (UI thread only).
     last: tray_common.LastKnown = .{},
+    /// Per side: awaiting authoritative forceRead verification (snapshotted
+    /// from State by rebuildAndNotify, read by the menu builder).
+    unverified: [2]bool = .{ false, false },
     status: tray_common.DeviceStatus = .missing,
     model: ?device.Model = null,
     paused: bool = false,
@@ -477,6 +480,7 @@ fn reconnect(app: *App) void {
 fn rebuildAndNotify(app: *App) void {
     app.state.mutex.lockUncancelable(app.io);
     const reading = app.state.reading;
+    const unverified = app.state.unverified;
     const status = app.state.status;
     const model = app.state.model;
     const announce_pending = app.state.announce_connection and status == .connected and reading != null;
@@ -485,6 +489,7 @@ fn rebuildAndNotify(app: *App) void {
     // Snapshot the model before the notification block: notifyInner reads it
     // for titles/bodies, and the menu/tooltip pick 1- vs 2-sided rendering.
     app.model = model;
+    app.unverified = unverified;
 
     if (tray_common.isLive(status, paused) and reading != null) {
         const r = reading.?;
@@ -499,7 +504,7 @@ fn rebuildAndNotify(app: *App) void {
         // snapshot — a stale last-known value surviving a reconnect must not
         // fire the announcement early.
         const announce_ready = tray_common.levelsKnown(model, r);
-        const plan = tray_common.planNotifications(&app.state.notified_low, announce_pending, announce_ready, snapshot);
+        const plan = tray_common.planNotifications(&app.state.notified_low, announce_pending, announce_ready, snapshot, unverified);
         for (plan.events) |ev_opt| {
             if (ev_opt) |ev| sendNotification(app, ev, snapshot);
         }
@@ -520,7 +525,7 @@ fn rebuildAndNotify(app: *App) void {
     // Icon: show '?' only for true USB absence. Available/paused keep the
     // gray last-known display, with '--' reserved for "no reading yet".
     const live = tray_common.isLive(status, paused);
-    const disp = app.last.display();
+    const disp = app.last.display(tray_common.hiddenSides(unverified));
     if (!paused and status == .missing) {
         renderIcon(&app.icon_buf, "?", tray_common.palette.gray);
     } else if (disp.level) |lvl| {
@@ -537,12 +542,12 @@ fn rebuildAndNotify(app: *App) void {
     const one_sided = if (model) |m| m.sides() < 2 else false;
     const tip = if (one_sided)
         std.fmt.bufPrint(&app.tip_body, "Battery: {s}", .{
-            tray_common.fmtKnownSide(&lb, app.last.left),
+            tray_common.fmtKnownSide(&lb, app.last.left, unverified[0]),
         }) catch app.tip_body[0..0]
     else
         std.fmt.bufPrint(&app.tip_body, "Left: {s}\nRight: {s}", .{
-            tray_common.fmtKnownSide(&lb, app.last.left),
-            tray_common.fmtKnownSide(&rb, app.last.right),
+            tray_common.fmtKnownSide(&lb, app.last.left, unverified[0]),
+            tray_common.fmtKnownSide(&rb, app.last.right, unverified[1]),
         }) catch app.tip_body[0..0];
     app.tip_body_len = tip.len;
 
@@ -889,12 +894,12 @@ fn buildMenuItems(app: *App, buf: *[3][48]u8, out: *[11]MenuItem) []const MenuIt
     out[n] = .{ .id = .status, .label = header, .enabled = false };
     n += 1;
     if (one_sided) {
-        const battery_label: []const u8 = std.fmt.bufPrint(&buf[0], "Battery: {s}", .{tray_common.fmtMenuSide(&sb, app.last.left)}) catch "Battery: ?";
+        const battery_label: []const u8 = std.fmt.bufPrint(&buf[0], "Battery: {s}", .{tray_common.fmtMenuSide(&sb, app.last.left, app.unverified[0])}) catch "Battery: ?";
         out[n] = .{ .id = .left, .label = battery_label, .enabled = false };
         n += 1;
     } else {
-        const left_label: []const u8 = std.fmt.bufPrint(&buf[0], "Left: {s}", .{tray_common.fmtMenuSide(&sb, app.last.left)}) catch "Left: ?";
-        const right_label: []const u8 = std.fmt.bufPrint(&buf[1], "Right: {s}", .{tray_common.fmtMenuSide(&sb, app.last.right)}) catch "Right: ?";
+        const left_label: []const u8 = std.fmt.bufPrint(&buf[0], "Left: {s}", .{tray_common.fmtMenuSide(&sb, app.last.left, app.unverified[0])}) catch "Left: ?";
+        const right_label: []const u8 = std.fmt.bufPrint(&buf[1], "Right: {s}", .{tray_common.fmtMenuSide(&sb, app.last.right, app.unverified[1])}) catch "Right: ?";
         out[n] = .{ .id = .left, .label = left_label, .enabled = false };
         n += 1;
         out[n] = .{ .id = .right, .label = right_label, .enabled = false };

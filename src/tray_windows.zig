@@ -454,6 +454,9 @@ var g_update: update.State = .{};
 
 // Last-known-good reading, per side (UI thread only). See common.LastKnown.
 var g_last: common.LastKnown = .{};
+/// Per side: awaiting authoritative forceRead verification (UI thread only;
+/// snapshotted from State by updateTray, read by the menu builder).
+var g_unverified: [2]bool = .{ false, false };
 
 /// Write the version to the parent console's stdout. No-op-ish if launched
 /// without a console (e.g. from Explorer): AttachConsole simply fails and the
@@ -720,10 +723,10 @@ fn showMenu(hwnd: HWND) void {
     var sb: [24]u8 = undefined;
     appendMenuText(menu, MF_GRAYED, 0, conn_text);
     if (one_sided) {
-        appendMenuText(menu, MF_GRAYED, 0, std.fmt.bufPrint(&lb, "Battery: {s}", .{common.fmtMenuSide(&sb, g_last.left)}) catch "Battery: ?");
+        appendMenuText(menu, MF_GRAYED, 0, std.fmt.bufPrint(&lb, "Battery: {s}", .{common.fmtMenuSide(&sb, g_last.left, g_unverified[0])}) catch "Battery: ?");
     } else {
-        appendMenuText(menu, MF_GRAYED, 0, std.fmt.bufPrint(&lb, "Left: {s}", .{common.fmtMenuSide(&sb, g_last.left)}) catch "Left: ?");
-        appendMenuText(menu, MF_GRAYED, 0, std.fmt.bufPrint(&rb, "Right: {s}", .{common.fmtMenuSide(&sb, g_last.right)}) catch "Right: ?");
+        appendMenuText(menu, MF_GRAYED, 0, std.fmt.bufPrint(&lb, "Left: {s}", .{common.fmtMenuSide(&sb, g_last.left, g_unverified[0])}) catch "Left: ?");
+        appendMenuText(menu, MF_GRAYED, 0, std.fmt.bufPrint(&rb, "Right: {s}", .{common.fmtMenuSide(&sb, g_last.right, g_unverified[1])}) catch "Right: ?");
     }
     _ = AppendMenuW(menu, MF_SEPARATOR, 0, null);
 
@@ -788,10 +791,12 @@ fn showMenu(hwnd: HWND) void {
 fn updateTray() void {
     g_state.mutex.lockUncancelable(g_io);
     const reading = g_state.reading;
+    const unverified = g_state.unverified;
     const status = g_state.status;
     const model = g_state.model;
     const announce_pending = g_state.announce_connection and status == .connected and reading != null;
     g_state.mutex.unlock(g_io);
+    g_unverified = unverified;
     const paused = g_state.paused.load(.acquire);
     const one_sided = if (model) |m| m.sides() < 2 else false;
 
@@ -819,7 +824,7 @@ fn updateTray() void {
         // snapshot — matches the pre-refactor behavior and avoids announcing
         // early off a stale last-known value.
         const announce_ready = common.levelsKnown(model, r);
-        const plan = common.planNotifications(&g_state.notified_low, announce_pending, announce_ready, snapshot);
+        const plan = common.planNotifications(&g_state.notified_low, announce_pending, announce_ready, snapshot, unverified);
         for (plan.events) |ev_opt| {
             if (ev_opt) |ev| showEvent(ev, model, snapshot);
         }
@@ -842,13 +847,13 @@ fn updateTray() void {
         const tip = if (one_sided)
             std.fmt.bufPrint(&tip_buf, "{s}Battery: {s}", .{
                 header,
-                common.fmtKnownSide(&lb, g_last.left),
+                common.fmtKnownSide(&lb, g_last.left, unverified[0]),
             }) catch "dygmate"
         else
             std.fmt.bufPrint(&tip_buf, "{s}Left: {s}\nRight: {s}", .{
                 header,
-                common.fmtKnownSide(&lb, g_last.left),
-                common.fmtKnownSide(&rb, g_last.right),
+                common.fmtKnownSide(&lb, g_last.left, unverified[0]),
+                common.fmtKnownSide(&rb, g_last.right, unverified[1]),
             }) catch "dygmate";
         setUtf16(g_nid.szTip[0..], tip);
     }
@@ -856,7 +861,7 @@ fn updateTray() void {
     // Icon: the lower of the two last-known side levels. Dim to gray while
     // offline or paused; "--" only before either side has ever reported.
     const live = common.isLive(status, paused);
-    const disp = g_last.display();
+    const disp = g_last.display(common.hiddenSides(unverified));
     if (!paused and status == .missing) {
         icon_text = "?";
     } else if (disp.level) |lvl| {

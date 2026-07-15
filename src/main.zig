@@ -67,6 +67,10 @@ pub fn main(init: std.process.Init) !u8 {
     // baseline survives reconnects (a reconnect after sleep is exactly when
     // the neuron's cache reports a bogus 100%).
     var acceptor: battery.Acceptor = .{};
+    // forceRead verification pacing (watch mode); outside the reconnect loop
+    // so a failed attempt still backs off across the reconnect.
+    var verify_backoff_idx: usize = 0;
+    var verify_wait_s: u64 = 0;
 
     while (true) {
         // DISCOVER
@@ -116,10 +120,37 @@ pub fn main(init: std.process.Init) !u8 {
                 try printReading(out, raw);
                 return 0;
             }
-            const res = acceptor.feed(raw);
+            var res = acceptor.feed(raw);
+            // A pending value only an authoritative read can settle (a
+            // first-reading low, or a bogus post-wake cache): ask the neuron
+            // to re-poll the halves over RF, paced by the verification
+            // backoff — without this a genuine first-reading low would never
+            // confirm. Mirrors the tray's verification loop.
+            if (res.anyVerification() and verify_wait_s == 0) {
+                // Arm the next delay before attempting: a transport failure
+                // takes the reconnect path and must still back off.
+                verify_wait_s = battery.verify_backoff_s[verify_backoff_idx];
+                if (verify_backoff_idx + 1 < battery.verify_backoff_s.len) verify_backoff_idx += 1;
+                // An abandoned forceRead leaves its late response in the RX
+                // queue and desyncs the stream — reconnect on any error.
+                battery.forceRead(&dev) catch |err| {
+                    std.debug.print("connection lost ({s}), rescanning...\n", .{@errorName(err)});
+                    break;
+                };
+                sleepSeconds(io, battery.force_read_settle_s);
+                const araw = battery.read(&dev) catch |err| {
+                    std.debug.print("connection lost ({s}), rescanning...\n", .{@errorName(err)});
+                    break;
+                };
+                res = acceptor.feedAuthoritative(araw);
+            } else if (!res.anyVerification()) {
+                verify_backoff_idx = 0;
+                verify_wait_s = 0;
+            }
             try printReading(out, res.reading);
             const interval_s = opts.fixed_interval_s orelse battery.suggestedPollIntervalSeconds(res.reading, res.suspect);
             sleepSeconds(io, interval_s);
+            verify_wait_s -|= interval_s;
         }
     }
 }

@@ -3,6 +3,7 @@
 //! poll logic and the display formatting live in exactly one place.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const focus = @import("focus.zig");
 const battery = @import("battery.zig");
 const device = @import("device.zig");
@@ -21,6 +22,70 @@ pub const low_threshold: u8 = 20;
 // USB-powered neuron only; they never wake the sides or wear flash.
 pub const initial_poll_interval_ms: u64 = 5 * 1000;
 pub const layer_poll_interval_ms: u64 = 250;
+/// A suspend gap (sleep/hibernation) longer than this arms the acceptor's
+/// wake guard: the neuron's cache may hold bogus values after such a gap.
+pub const wake_gap_threshold_ms: u64 = 10_000;
+
+// ---------------------------------------------------------------------------
+// Wake detection.
+// ---------------------------------------------------------------------------
+/// Detects that the machine slept by comparing a suspend-inclusive with a
+/// suspend-exclusive monotonic clock: their difference grows only while the
+/// machine is suspended, so a jump in that difference between two checks is
+/// exactly the time spent asleep in between. Robust against slow polling —
+/// awake time cancels out.
+pub const WakeDetector = struct {
+    prev_suspended_ms: ?u64 = null,
+
+    pub const Samples = struct {
+        /// Monotonic milliseconds including suspended time.
+        incl_ms: u64,
+        /// Monotonic milliseconds excluding suspended time.
+        excl_ms: u64,
+    };
+
+    /// Pure core: true when the suspended time accumulated since the previous
+    /// feed exceeds the gap threshold. The first feed never fires — there is
+    /// no previous sample to compare against.
+    pub fn feed(self: *WakeDetector, s: Samples) bool {
+        const suspended = s.incl_ms -| s.excl_ms;
+        defer self.prev_suspended_ms = suspended;
+        const prev = self.prev_suspended_ms orelse return false;
+        return suspended -| prev > wake_gap_threshold_ms;
+    }
+
+    pub fn check(self: *WakeDetector, io: std.Io) bool {
+        return self.feed(sampleSuspendClocks(io));
+    }
+};
+
+/// One sample of the suspend-inclusive/-exclusive clock pair.
+///
+/// Windows cannot use the Io clocks for this: in std.Io.Threaded both
+/// `.awake` and `.boot` read the same QPC source, so their difference is
+/// always ~0 there. GetTickCount64 includes suspend + hibernation;
+/// QueryUnbiasedInterruptTime (100ns units) excludes both.
+fn sampleSuspendClocks(io: std.Io) WakeDetector.Samples {
+    if (comptime builtin.os.tag == .windows) {
+        var unbiased_100ns: u64 = 0;
+        _ = QueryUnbiasedInterruptTime(&unbiased_100ns);
+        return .{
+            .incl_ms = GetTickCount64(),
+            .excl_ms = unbiased_100ns / 10_000,
+        };
+    }
+    // Elsewhere the Io clocks are distinct sources: `.boot` (CLOCK_BOOTTIME
+    // on Linux) includes suspend, `.awake` (CLOCK_MONOTONIC) excludes it.
+    const boot = std.Io.Clock.Timestamp.now(io, .boot);
+    const awake = std.Io.Clock.Timestamp.now(io, .awake);
+    return .{
+        .incl_ms = @intCast(@divTrunc(boot.raw.nanoseconds, std.time.ns_per_ms)),
+        .excl_ms = @intCast(@divTrunc(awake.raw.nanoseconds, std.time.ns_per_ms)),
+    };
+}
+
+extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
+extern "kernel32" fn QueryUnbiasedInterruptTime(unbiased_time: *u64) callconv(.winapi) std.os.windows.BOOL;
 
 // ---------------------------------------------------------------------------
 // Color palette. Platform-neutral RGB; each platform converts to its own
@@ -53,6 +118,11 @@ pub fn iconColor(live: bool, level: u8, status: battery.Status) Rgb {
 pub const State = struct {
     mutex: std.Io.Mutex = .init,
     reading: ?battery.Reading = null,
+    /// Per side (0=left, 1=right): the side's value awaits authoritative
+    /// forceRead verification (post-wake guard or pending low). Written with
+    /// `reading` under the mutex; drives "?" rendering and mutes low-battery
+    /// notifications for that side.
+    unverified: [2]bool = .{ false, false },
     status: DeviceStatus = .missing,
     /// Detected keyboard model; null while absent. Written by the poll
     /// thread on every discovery pass (mutex-protected, like `reading`).
@@ -128,29 +198,59 @@ pub const LastKnown = struct {
     }
 
     /// Lower of the two last-known side levels, with its status. `level` is
-    /// null before either side has ever reported.
-    pub fn display(self: LastKnown) battery.SideReading {
+    /// null before either side has ever reported. A hidden side (unverified,
+    /// `.na` display mode) is skipped; both hidden yields a null level and
+    /// the existing "--"/gray rendering.
+    pub fn display(self: LastKnown, hide: [2]bool) battery.SideReading {
         var out: battery.SideReading = .{ .level = null, .status = .unknown };
-        if (self.left.level) |l| {
-            out.level = l;
-            out.status = self.left.status;
+        if (!hide[0]) {
+            if (self.left.level) |l| {
+                out.level = l;
+                out.status = self.left.status;
+            }
         }
-        if (self.right.level) |rl| {
-            if (out.level == null or rl < out.level.?) {
-                out.level = rl;
-                out.status = self.right.status;
+        if (!hide[1]) {
+            if (self.right.level) |rl| {
+                if (out.level == null or rl < out.level.?) {
+                    out.level = rl;
+                    out.status = self.right.status;
+                }
             }
         }
         return out;
     }
 };
 
+/// How to render a side whose value awaits authoritative verification:
+/// `.na` hides it entirely ("?", like Bazecor's N/A); `.last_known` keeps
+/// showing the last accepted level with a "?" suffix.
+pub const UnverifiedDisplay = enum { na, last_known };
+pub const unverified_display: UnverifiedDisplay = .na;
+
+/// Sides the icon's min-of-sides pick must skip for the configured mode.
+pub fn hiddenSides(unverified: [2]bool) [2]bool {
+    return hiddenSidesMode(unverified, unverified_display);
+}
+
+fn hiddenSidesMode(unverified: [2]bool, mode: UnverifiedDisplay) [2]bool {
+    return switch (mode) {
+        .na => unverified,
+        .last_known => .{ false, false },
+    };
+}
+
 // ---------------------------------------------------------------------------
 // Formatting helpers (no platform dependency).
 // ---------------------------------------------------------------------------
 /// Menu form of a last-known side snapshot: "{d}% (Status)" with a capitalized
-/// status word to match the menu styling; "no reading yet" if never reported.
-pub fn fmtMenuSide(buf: []u8, s: battery.SideReading) []const u8 {
+/// status word to match the menu styling; "no reading yet" if never reported;
+/// an unverified side renders per `unverified_display`.
+pub fn fmtMenuSide(buf: []u8, s: battery.SideReading, unverified: bool) []const u8 {
+    return fmtMenuSideMode(buf, s, unverified, unverified_display);
+}
+
+fn fmtMenuSideMode(buf: []u8, s: battery.SideReading, unverified: bool, mode: UnverifiedDisplay) []const u8 {
+    if (unverified and mode == .na) return "verifying…";
     const lvl = s.level orelse return "no reading yet";
     const word = s.status.label();
     var cap: [16]u8 = undefined;
@@ -159,6 +259,8 @@ pub fn fmtMenuSide(buf: []u8, s: battery.SideReading) []const u8 {
         cap[0] = std.ascii.toUpper(word[0]);
         break :blk cap[0..word.len];
     } else word;
+    if (unverified)
+        return std.fmt.bufPrint(buf, "{d}%? ({s})", .{ lvl, w }) catch buf[0..0];
     return std.fmt.bufPrint(buf, "{d}% ({s})", .{ lvl, w }) catch buf[0..0];
 }
 
@@ -172,9 +274,18 @@ pub fn fmtSide(buf: []u8, s: battery.SideReading) []const u8 {
 }
 
 /// Tooltip form of a last-known side snapshot: the real value if the side has
-/// ever reported, else a plain "no reading yet".
-pub fn fmtKnownSide(buf: []u8, s: battery.SideReading) []const u8 {
+/// ever reported, else a plain "no reading yet"; an unverified side renders
+/// per `unverified_display`.
+pub fn fmtKnownSide(buf: []u8, s: battery.SideReading, unverified: bool) []const u8 {
+    return fmtKnownSideMode(buf, s, unverified, unverified_display);
+}
+
+fn fmtKnownSideMode(buf: []u8, s: battery.SideReading, unverified: bool, mode: UnverifiedDisplay) []const u8 {
+    if (unverified and mode == .na)
+        return std.fmt.bufPrint(buf, "?% ({s})", .{s.status.label()}) catch buf[0..0];
     if (s.level) |lvl| {
+        if (unverified)
+            return std.fmt.bufPrint(buf, "{d}%? ({s})", .{ lvl, s.status.label() }) catch buf[0..0];
         return std.fmt.bufPrint(buf, "{d}% ({s})", .{ lvl, s.status.label() }) catch buf[0..0];
     }
     return "no reading yet";
@@ -283,6 +394,10 @@ pub fn fmtLowBody(buf: []u8, model: ?device.Model, side: u1, level: u8) []const 
 /// last-known value can't fire the announcement early after a reconnect. The
 /// announcement body and latch still render from the merged `snapshot`.
 ///
+/// `unverified` mutes a side that awaits authoritative verification. This is
+/// an invariant backstop: the acceptor never puts an unverified low into the
+/// snapshot in the first place.
+///
 /// - pending + ready: emit connect_status, latch the lows, report consumed.
 /// - pending + not ready: emit nothing, keep announce pending.
 /// - not pending: per-side low check against the latch (fires once per crossing).
@@ -291,6 +406,7 @@ pub fn planNotifications(
     announce_pending: bool,
     announce_ready: bool,
     snapshot: battery.Reading,
+    unverified: [2]bool,
 ) NotifyPlan {
     var plan = NotifyPlan{};
     const sides = [_]battery.SideReading{ snapshot.left, snapshot.right };
@@ -301,9 +417,14 @@ pub fn planNotifications(
 
         plan.events[0] = .{ .kind = .connect_status, .warning = hasLowBattery(snapshot) };
         // Latch every side to its current low state so the announcement doesn't
-        // double as a fresh low crossing on the next poll.
+        // double as a fresh low crossing on the next poll. An unverified side
+        // latches like a null level: its value isn't evidence yet.
         for (sides, 0..) |s, i| {
             if (s.status == .charging) {
+                latch[i] = false;
+                continue;
+            }
+            if (unverified[i]) {
                 latch[i] = false;
                 continue;
             }
@@ -325,6 +446,9 @@ pub fn planNotifications(
             latch[i] = false;
             continue;
         }
+        // Unverified: fire nothing and leave the latch untouched, so a later
+        // verified genuine low still fires exactly once.
+        if (unverified[i]) continue;
         const lvl = s.level orelse continue;
         if (lvl < low_threshold) {
             if (!latch[i]) {
@@ -361,10 +485,20 @@ pub fn runPollLoop(
     // baseline must survive reconnects. A genuinely different keyboard with a
     // higher battery just confirms over a few fast polls.
     var acceptor: battery.Acceptor = .{};
-    // Set after a user-requested forceRead: the next reading is ground truth
-    // and bypasses the gate.
+    // Set after a forceRead: the next reading is ground truth and bypasses
+    // the gate.
     var next_read_authoritative = false;
+    // Wake detection + forceRead verification state. Outside the connect
+    // loop like `acceptor`: a forceRead failure breaks to reconnect, and the
+    // retry backoff must survive that so reconnect loops never hammer RF.
+    var wake_detector: WakeDetector = .{};
+    var verify_active = false;
+    var verify_backoff_idx: usize = 0;
+    var verify_wait_ms: u64 = 0;
     while (!st.stop.load(.acquire)) {
+        // A wake can land while disconnected or paused too: guard the sides
+        // so the next connection's first reads need verification.
+        if (wake_detector.check(io)) acceptor.noteWake();
         // PAUSED: hold no port so Bazecor can use it; idle until resumed.
         if (st.paused.load(.acquire)) {
             const present = device.isDygmaPresent(io) catch false;
@@ -409,6 +543,9 @@ pub fn runPollLoop(
             continue;
         };
         defer dev.close();
+        // A reconnect between a forceRead and its authoritative read must not
+        // promote the new connection's first plain cache read to ground truth.
+        next_read_authoritative = false;
         var last_layer: ?u8 = null;
         // Per-connection last-known merge. On a plain read the neuron answers one
         // side at a time, so a single raw read almost never carries both levels;
@@ -431,6 +568,14 @@ pub fn runPollLoop(
                 setStatus(Ctx, ctx, io, st, wake, offlineStatus(still_present));
                 break;
             }
+            // ~250ms cadence → one-tick wake detection latency. Re-arm fast
+            // polling so the post-wake state is read and verified promptly
+            // rather than after a slow interval.
+            if (wake_detector.check(io)) {
+                acceptor.noteWake();
+                battery_interval_ms = initial_poll_interval_ms;
+                battery_elapsed_ms = battery_interval_ms;
+            }
             var should_post = false;
             if (battery_elapsed_ms >= battery_interval_ms) {
                 const raw = battery.read(&dev) catch {
@@ -449,9 +594,22 @@ pub fn runPollLoop(
                 st.mutex.lockUncancelable(io);
                 const announce_connection = st.status != .connected;
                 st.reading = merged;
+                st.unverified = res.needs_verification;
                 st.status = .connected;
                 if (announce_connection) st.announce_connection = true;
                 st.mutex.unlock(io);
+                // Arm the forceRead verification loop on the transition into
+                // needing it (re-arming every poll would reset the backoff
+                // and hammer RF); clear it once nothing needs verifying.
+                if (res.anyVerification()) {
+                    if (!verify_active) {
+                        verify_active = true;
+                        verify_backoff_idx = 0;
+                        verify_wait_ms = 0; // first attempt fires immediately
+                    }
+                } else {
+                    verify_active = false;
+                }
                 // Back off only once every battery-reporting side has reported
                 // this connection — the same gate as the connect announcement,
                 // so slowing down can't leave the announcement pending for a
@@ -490,7 +648,15 @@ pub fn runPollLoop(
 
             // Wait out the interval, staying responsive to stop/refresh/pause.
             const refreshed = waitForNextPoll(io, st, layer_poll_interval_ms);
-            if (refreshed) {
+            if (refreshed or (verify_active and verify_wait_ms == 0)) {
+                if (verify_active) {
+                    // Arm the next delay BEFORE attempting: a transport
+                    // failure breaks to reconnect and must still back off.
+                    // A user refresh counts as an attempt and advances the
+                    // backoff too — one forceRead either way, no double RF.
+                    verify_wait_ms = battery.verify_backoff_s[verify_backoff_idx] * std.time.ms_per_s;
+                    if (verify_backoff_idx + 1 < battery.verify_backoff_s.len) verify_backoff_idx += 1;
+                }
                 // A failed forceRead means the stream state is unknown (its
                 // late response would answer the next command) — reconnect
                 // rather than keep polling a desynced port.
@@ -511,6 +677,7 @@ pub fn runPollLoop(
                 battery_elapsed_ms = battery_interval_ms; // force a read next cycle
             } else {
                 battery_elapsed_ms += layer_poll_interval_ms;
+                verify_wait_ms -|= layer_poll_interval_ms;
             }
         }
     }
@@ -529,6 +696,7 @@ fn setStatus(
     st.status = status;
     if (status != .connected) {
         st.reading = null;
+        st.unverified = .{ false, false };
         st.announce_connection = false;
     }
     st.mutex.unlock(io);
@@ -585,29 +753,29 @@ test "planNotifications: low crossing fires once, latched afterwards" {
     var latch = [2]bool{ false, false };
     const snap = reading(15, .discharging, 80, .discharging);
 
-    const first = planNotifications(&latch, false, false, snap);
+    const first = planNotifications(&latch, false, false, snap, .{ false, false });
     try std.testing.expectEqual(@as(usize, 1), countEvents(first));
     try std.testing.expectEqual(NotifyEvent{ .kind = .low_battery, .side = 0, .level = 15, .warning = true }, first.events[0].?);
     try std.testing.expect(latch[0]);
 
     // Same low reading again: latched, no re-fire.
-    const second = planNotifications(&latch, false, false, snap);
+    const second = planNotifications(&latch, false, false, snap, .{ false, false });
     try std.testing.expectEqual(@as(usize, 0), countEvents(second));
 }
 
 test "planNotifications: recovery above threshold resets the latch" {
     var latch = [2]bool{ true, false };
-    const plan = planNotifications(&latch, false, false, reading(50, .discharging, 90, .discharging));
+    const plan = planNotifications(&latch, false, false, reading(50, .discharging, 90, .discharging), .{ false, false });
     try std.testing.expectEqual(@as(usize, 0), countEvents(plan));
     try std.testing.expect(!latch[0]); // latch cleared, so a later drop fires again
 
-    const again = planNotifications(&latch, false, false, reading(10, .discharging, 90, .discharging));
+    const again = planNotifications(&latch, false, false, reading(10, .discharging, 90, .discharging), .{ false, false });
     try std.testing.expectEqual(@as(usize, 1), countEvents(again));
 }
 
 test "planNotifications: charging side never warns and resets the latch" {
     var latch = [2]bool{ true, true };
-    const plan = planNotifications(&latch, false, false, reading(5, .charging, 8, .charging));
+    const plan = planNotifications(&latch, false, false, reading(5, .charging, 8, .charging), .{ false, false });
     try std.testing.expectEqual(@as(usize, 0), countEvents(plan));
     try std.testing.expect(!latch[0]);
     try std.testing.expect(!latch[1]);
@@ -615,7 +783,7 @@ test "planNotifications: charging side never warns and resets the latch" {
 
 test "planNotifications: both low sides fire two events" {
     var latch = [2]bool{ false, false };
-    const plan = planNotifications(&latch, false, false, reading(10, .discharging, 19, .discharging));
+    const plan = planNotifications(&latch, false, false, reading(10, .discharging, 19, .discharging), .{ false, false });
     try std.testing.expectEqual(@as(usize, 2), countEvents(plan));
     try std.testing.expectEqual(@as(u1, 0), plan.events[0].?.side.?);
     try std.testing.expectEqual(@as(u1, 1), plan.events[1].?.side.?);
@@ -623,7 +791,7 @@ test "planNotifications: both low sides fire two events" {
 
 test "planNotifications: announce with both sides known emits status and latches lows" {
     var latch = [2]bool{ false, false };
-    const plan = planNotifications(&latch, true, true, reading(15, .discharging, 90, .discharging));
+    const plan = planNotifications(&latch, true, true, reading(15, .discharging, 90, .discharging), .{ false, false });
     try std.testing.expectEqual(@as(usize, 1), countEvents(plan));
     try std.testing.expect(plan.events[0].?.kind == .connect_status);
     try std.testing.expect(plan.events[0].?.warning); // a side is low
@@ -634,7 +802,7 @@ test "planNotifications: announce with both sides known emits status and latches
 
 test "planNotifications: announce with a healthy pair is not a warning" {
     var latch = [2]bool{ false, false };
-    const plan = planNotifications(&latch, true, true, reading(80, .discharging, 90, .charging));
+    const plan = planNotifications(&latch, true, true, reading(80, .discharging, 90, .charging), .{ false, false });
     try std.testing.expect(plan.events[0].?.kind == .connect_status);
     try std.testing.expect(!plan.events[0].?.warning);
     try std.testing.expect(plan.consumed_announce);
@@ -642,7 +810,7 @@ test "planNotifications: announce with a healthy pair is not a warning" {
 
 test "planNotifications: announce with a side unknown emits nothing and stays pending" {
     var latch = [2]bool{ false, false };
-    const plan = planNotifications(&latch, true, false, reading(null, .unknown, 90, .discharging));
+    const plan = planNotifications(&latch, true, false, reading(null, .unknown, 90, .discharging), .{ false, false });
     try std.testing.expectEqual(@as(usize, 0), countEvents(plan));
     try std.testing.expect(!plan.consumed_announce);
 }
@@ -652,7 +820,7 @@ test "planNotifications: announce gates on raw readiness, not the merged snapsho
     // the raw reading isn't ready yet: the announcement must stay pending.
     var latch = [2]bool{ false, false };
     const merged = reading(50, .discharging, 80, .discharging);
-    const plan = planNotifications(&latch, true, false, merged);
+    const plan = planNotifications(&latch, true, false, merged, .{ false, false });
     try std.testing.expectEqual(@as(usize, 0), countEvents(plan));
     try std.testing.expect(!plan.consumed_announce);
 }
@@ -713,6 +881,91 @@ test "menuHeader distinguishes missing and available" {
     try std.testing.expectEqualStrings("No keyboard discovered", menuHeader(.missing, false));
     try std.testing.expectEqualStrings("Keyboard discovered, not connected", menuHeader(.available, false));
     try std.testing.expectEqualStrings("Connected", menuHeader(.connected, false));
+}
+
+test "WakeDetector: suspend gap beyond threshold fires once" {
+    var d = WakeDetector{};
+    try std.testing.expect(!d.feed(.{ .incl_ms = 1000, .excl_ms = 1000 })); // first sample
+    try std.testing.expect(!d.feed(.{ .incl_ms = 2000, .excl_ms = 2000 })); // normal tick
+    // 60s asleep: the inclusive clock advanced, the exclusive one didn't.
+    try std.testing.expect(d.feed(.{ .incl_ms = 62_000, .excl_ms = 2_000 }));
+    // Next tick after the wake: no new suspend time, no re-fire.
+    try std.testing.expect(!d.feed(.{ .incl_ms = 62_250, .excl_ms = 2_250 }));
+}
+
+test "WakeDetector: normal ticking never fires" {
+    var d = WakeDetector{};
+    var t: u64 = 0;
+    _ = d.feed(.{ .incl_ms = t, .excl_ms = t });
+    for (0..100) |_| {
+        t += 250;
+        try std.testing.expect(!d.feed(.{ .incl_ms = t, .excl_ms = t }));
+    }
+}
+
+test "WakeDetector: first sample never fires even with a huge suspend delta" {
+    var d = WakeDetector{};
+    // The process may start hours after boot with prior sleeps already in
+    // the counters — that history is not a fresh wake.
+    try std.testing.expect(!d.feed(.{ .incl_ms = 100_000_000, .excl_ms = 50_000_000 }));
+}
+
+test "WakeDetector: suspend gap at the threshold does not fire" {
+    var d = WakeDetector{};
+    _ = d.feed(.{ .incl_ms = 1000, .excl_ms = 1000 });
+    try std.testing.expect(!d.feed(.{ .incl_ms = 11_250, .excl_ms = 1_250 }));
+}
+
+test "planNotifications: unverified side fires nothing and leaves the latch untouched" {
+    var latch = [2]bool{ false, false };
+    const snap = reading(15, .discharging, 80, .discharging);
+    const muted = planNotifications(&latch, false, false, snap, .{ true, false });
+    try std.testing.expectEqual(@as(usize, 0), countEvents(muted));
+    try std.testing.expect(!latch[0]);
+
+    // Verification clears and the low is genuine: fires exactly once.
+    const fired = planNotifications(&latch, false, false, snap, .{ false, false });
+    try std.testing.expectEqual(@as(usize, 1), countEvents(fired));
+    try std.testing.expect(latch[0]);
+    const again = planNotifications(&latch, false, false, snap, .{ false, false });
+    try std.testing.expectEqual(@as(usize, 0), countEvents(again));
+}
+
+test "planNotifications: announce latches an unverified side like a null level" {
+    var latch = [2]bool{ false, false };
+    const plan = planNotifications(&latch, true, true, reading(15, .discharging, 90, .discharging), .{ true, false });
+    try std.testing.expect(plan.consumed_announce);
+    try std.testing.expect(!latch[0]);
+}
+
+test "LastKnown.display hides unverified sides" {
+    var known = LastKnown{};
+    known.merge(reading(90, .discharging, 30, .discharging));
+    // The minimum side (right) hidden: the other side shows.
+    var disp = known.display(.{ false, true });
+    try std.testing.expectEqual(@as(?u8, 90), disp.level);
+    // Both hidden: null level, the existing "--"/gray path.
+    disp = known.display(.{ true, true });
+    try std.testing.expectEqual(@as(?u8, null), disp.level);
+    // Nothing hidden: min of sides as before.
+    disp = known.display(.{ false, false });
+    try std.testing.expectEqual(@as(?u8, 30), disp.level);
+}
+
+test "hiddenSides: only .na mode hides unverified sides" {
+    try std.testing.expectEqual([2]bool{ true, false }, hiddenSidesMode(.{ true, false }, .na));
+    try std.testing.expectEqual([2]bool{ false, false }, hiddenSidesMode(.{ true, false }, .last_known));
+}
+
+test "fmt helpers render unverified sides per display mode" {
+    var buf: [48]u8 = undefined;
+    const s: battery.SideReading = .{ .level = 87, .status = .discharging };
+    try std.testing.expectEqualStrings("?% (discharging)", fmtKnownSideMode(&buf, s, true, .na));
+    try std.testing.expectEqualStrings("87%? (discharging)", fmtKnownSideMode(&buf, s, true, .last_known));
+    try std.testing.expectEqualStrings("87% (discharging)", fmtKnownSideMode(&buf, s, false, .na));
+    try std.testing.expectEqualStrings("verifying…", fmtMenuSideMode(&buf, s, true, .na));
+    try std.testing.expectEqualStrings("87%? (Discharging)", fmtMenuSideMode(&buf, s, true, .last_known));
+    try std.testing.expectEqualStrings("87% (Discharging)", fmtMenuSideMode(&buf, s, false, .na));
 }
 
 test "tooltipHeader keeps paused wording and missing wording distinct" {
