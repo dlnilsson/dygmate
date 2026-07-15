@@ -47,10 +47,10 @@ pub const fast_poll_interval_s: u64 = 30;
 pub const slow_poll_interval_s: u64 = 120;
 /// Below this level always poll fast (matches the tray's low_threshold).
 pub const low_level_fast_threshold: u8 = 20;
-/// Fuel gauges jitter a point or two with load/temperature; anything above
-/// this while discharging is an implausible upward jump.
+/// Fuel gauges jitter a point or two with load/temperature; any move beyond
+/// this in either direction between polls is implausible.
 pub const level_jump_tolerance: u8 = 3;
-/// Consecutive sightings before an implausible upward jump is accepted.
+/// Consecutive sightings before an implausible jump is accepted.
 pub const suspect_confirm_polls: u8 = 3;
 /// Consecutive sightings before an initial 100 (no baseline yet) is trusted —
 /// 100 is exactly what the post-wake bogus cache reports.
@@ -120,11 +120,12 @@ fn sleepMs(io: std.Io, ms: u64) void {
 /// neuron also transiently serves 0 (its unpopulated cache value; Bazecor
 /// refuses to render 0% for the same reason) and FOCUS_API documents status
 /// fault as "faulty or has some reading error", i.e. the level may be
-/// garbage — so a fault level is ignored and a 0 must repeat on consecutive
-/// polls before it is believed. A level also cannot genuinely rise while
-/// discharging, so an upward jump must repeat the same way. Ordinary drops
-/// are plausible and accepted immediately, but a first-ever reading below
-/// the low threshold is confirmed first (it would otherwise fire a
+/// garbage — so fault levels and a 0 while not charging are ignored the
+/// same way. A level cannot genuinely rise while discharging, and between
+/// polls it cannot genuinely move more than a point or two in either
+/// direction, so any move beyond the jump tolerance must repeat on
+/// consecutive polls before it is accepted. A first-ever reading below the
+/// low threshold is confirmed the same way (it would otherwise fire a
 /// low-battery notification off one garbage read). Charging/charged sides
 /// are trusted outright (the sides really do charge over cable while the
 /// user is away). Pure state machine: no Io, no allocator, unit-testable
@@ -193,11 +194,15 @@ pub const Acceptor = struct {
             return .{ .level = st.accepted, .status = raw.status };
         if (raw.status == .charging or raw.status == .charged)
             return acceptSide(st, raw);
-        // 0 is the neuron's unpopulated-cache value around sleep/wake; a
-        // genuinely empty side keeps reporting it and confirms below.
-        if (lvl == 0) return suspectSide(st, raw, suspect_confirm_polls);
+        // 0 is the neuron's unpopulated-cache value around sleep/wake, served
+        // persistently while a half sleeps — repetition would "confirm" it, so
+        // ignore it like disconnected/fault (Bazecor never renders 0% either).
+        // A genuinely dying half shows its last real reading until it goes
+        // disconnected; a dead-but-charging half is accepted above.
+        if (lvl == 0) return .{ .level = st.accepted, .status = raw.status };
         if (st.accepted) |acc| {
-            if (lvl <= acc +| level_jump_tolerance) return acceptSide(st, raw);
+            const diff = if (lvl > acc) lvl - acc else acc - lvl;
+            if (diff <= level_jump_tolerance) return acceptSide(st, raw);
             return suspectSide(st, raw, suspect_confirm_polls);
         }
         // No baseline to jump-gate against; an initial 100 matches the known
@@ -368,14 +373,40 @@ test "Acceptor: first reading of 100 needs confirmation unless charging" {
     try std.testing.expect(!charged.suspect);
 }
 
-test "Acceptor: drops and small drift accepted immediately" {
+test "Acceptor: small drift in either direction accepted immediately" {
     var a: Acceptor = .{};
     _ = feedLeft(&a, 45, .discharging);
-    var res = feedLeft(&a, 30, .discharging);
-    try std.testing.expectEqual(@as(?u8, 30), res.reading.left.level);
+    var res = feedLeft(&a, 43, .discharging); // within jump tolerance
+    try std.testing.expectEqual(@as(?u8, 43), res.reading.left.level);
     try std.testing.expect(!res.suspect);
-    res = feedLeft(&a, 32, .discharging); // within jump tolerance
-    try std.testing.expectEqual(@as(?u8, 32), res.reading.left.level);
+    res = feedLeft(&a, 45, .discharging);
+    try std.testing.expectEqual(@as(?u8, 45), res.reading.left.level);
+    try std.testing.expect(!res.suspect);
+}
+
+test "Acceptor: large drop held until confirmed on consecutive polls" {
+    var a: Acceptor = .{};
+    _ = feedLeft(&a, 90, .discharging);
+    var res = feedLeft(&a, 60, .discharging);
+    try std.testing.expectEqual(@as(?u8, 90), res.reading.left.level);
+    try std.testing.expect(res.suspect);
+    res = feedLeft(&a, 60, .discharging);
+    try std.testing.expectEqual(@as(?u8, 90), res.reading.left.level);
+    try std.testing.expect(res.suspect);
+    res = feedLeft(&a, 60, .discharging); // third consecutive sighting
+    try std.testing.expectEqual(@as(?u8, 60), res.reading.left.level);
+    try std.testing.expect(!res.suspect);
+}
+
+test "Acceptor: transient bogus low never displays" {
+    var a: Acceptor = .{};
+    _ = feedLeft(&a, 90, .discharging);
+    var res = feedLeft(&a, 4, .discharging);
+    try std.testing.expectEqual(@as(?u8, 90), res.reading.left.level);
+    try std.testing.expect(res.suspect);
+    // The real level returns: pending cleared, the 4 never showed.
+    res = feedLeft(&a, 90, .discharging);
+    try std.testing.expectEqual(@as(?u8, 90), res.reading.left.level);
     try std.testing.expect(!res.suspect);
 }
 
@@ -489,10 +520,10 @@ test "Acceptor: sides gate independently" {
     });
     const res = a.feed(.{
         .left = side(100, .discharging),
-        .right = side(55, .discharging),
+        .right = side(58, .discharging),
     });
     try std.testing.expectEqual(@as(?u8, 45), res.reading.left.level);
-    try std.testing.expectEqual(@as(?u8, 55), res.reading.right.level);
+    try std.testing.expectEqual(@as(?u8, 58), res.reading.right.level);
     try std.testing.expect(res.suspect);
 }
 
@@ -538,24 +569,38 @@ test "Acceptor: fault polls keep a pending streak alive" {
     try std.testing.expectEqual(@as(?u8, 100), res.reading.left.level);
 }
 
-test "Acceptor: 0 while discharging needs consecutive confirmation" {
+test "Acceptor: 0 while discharging is never accepted, however often it repeats" {
     var a: Acceptor = .{};
     _ = feedLeft(&a, 45, .discharging);
+    for (0..5) |_| {
+        const res = feedLeft(&a, 0, .discharging);
+        try std.testing.expectEqual(@as(?u8, 45), res.reading.left.level);
+        try std.testing.expect(!res.suspect);
+    }
+}
+
+test "Acceptor: first reading of 0 establishes no baseline" {
+    var a: Acceptor = .{};
     var res = feedLeft(&a, 0, .discharging);
-    try std.testing.expectEqual(@as(?u8, 45), res.reading.left.level);
-    try std.testing.expect(res.suspect);
-    res = feedLeft(&a, 0, .discharging);
-    try std.testing.expectEqual(@as(?u8, 45), res.reading.left.level);
-    res = feedLeft(&a, 0, .discharging); // third consecutive sighting
-    try std.testing.expectEqual(@as(?u8, 0), res.reading.left.level);
+    try std.testing.expectEqual(@as(?u8, null), res.reading.left.level);
+    try std.testing.expect(!res.suspect);
+    // First live reading still goes through the first-reading path untainted.
+    res = feedLeft(&a, 87, .discharging);
+    try std.testing.expectEqual(@as(?u8, 87), res.reading.left.level);
     try std.testing.expect(!res.suspect);
 }
 
-test "Acceptor: first reading of 0 is not taken at face value" {
+test "Acceptor: zero polls keep the pending streak alive" {
     var a: Acceptor = .{};
-    const res = feedLeft(&a, 0, .discharging);
-    try std.testing.expectEqual(@as(?u8, null), res.reading.left.level);
+    _ = feedLeft(&a, 45, .discharging);
+    _ = feedLeft(&a, 100, .discharging);
+    var res = feedLeft(&a, 0, .discharging);
+    try std.testing.expectEqual(@as(?u8, 45), res.reading.left.level);
     try std.testing.expect(res.suspect);
+    _ = feedLeft(&a, 100, .discharging);
+    res = feedLeft(&a, 100, .discharging);
+    try std.testing.expectEqual(@as(?u8, 100), res.reading.left.level);
+    try std.testing.expect(!res.suspect);
 }
 
 test "Acceptor: 0 while charging is accepted outright" {
