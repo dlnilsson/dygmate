@@ -554,6 +554,10 @@ pub fn runPollLoop(
         // — nothing carries across a reconnect, so the announcement can't fire off
         // a stale value.
         var known: LastKnown = .{};
+        // A user refresh re-arms the connect announcement, but only once the
+        // fresh authoritative reading is published — arming at click time would
+        // let the UI announce stale pre-refresh values during the settle window.
+        var announce_next_read = false;
         // Start fast (immediate first read); back off once both sides report.
         var battery_interval_ms: u64 = initial_poll_interval_ms;
         var battery_elapsed_ms: u64 = battery_interval_ms;
@@ -596,7 +600,8 @@ pub fn runPollLoop(
                 st.reading = merged;
                 st.unverified = res.needs_verification;
                 st.status = .connected;
-                if (announce_connection) st.announce_connection = true;
+                if (announce_connection or announce_next_read) st.announce_connection = true;
+                announce_next_read = false;
                 st.mutex.unlock(io);
                 // Arm the forceRead verification loop on the transition into
                 // needing it (re-arming every poll would reset the backoff
@@ -648,6 +653,9 @@ pub fn runPollLoop(
 
             // Wait out the interval, staying responsive to stop/refresh/pause.
             const refreshed = waitForNextPoll(io, st, layer_poll_interval_ms);
+            // Only a user refresh re-announces; the automatic verify path must
+            // not fire notifications.
+            if (refreshed) announce_next_read = true;
             if (refreshed or (verify_active and verify_wait_ms == 0)) {
                 if (verify_active) {
                     // Arm the next delay BEFORE attempting: a transport
