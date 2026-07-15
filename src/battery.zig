@@ -55,7 +55,7 @@ pub const suspect_confirm_polls: u8 = 3;
 /// Consecutive sightings before an initial 100 (no baseline yet) is trusted —
 /// 100 is exactly what the post-wake bogus cache reports.
 pub const first_reading_confirm_polls: u8 = 2;
-pub const force_read_settle_s: u64 = 2;
+pub const force_read_settle_s: u64 = 4;
 
 /// Issue the four battery read commands. Parse failures degrade to
 /// null/.unknown; only transport errors propagate (they mean the
