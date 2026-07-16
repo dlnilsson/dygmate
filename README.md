@@ -86,6 +86,71 @@ zig build run-tray-linux   # Linux
 zig build run-tray         # Windows
 ```
 
+## Status bar integration (yasb, waybar, ...)
+
+While `dygmate-tray` runs it serves its latest battery snapshot over local
+IPC, one JSON line per connection:
+
+- Windows: named pipe `\\.\pipe\dygmate`
+- Linux: unix socket `$XDG_RUNTIME_DIR/dygmate/status.sock`
+
+```sh
+# Windows
+cmd /c more < \\.\pipe\dygmate
+# Linux
+socat -u UNIX-CONNECT:$XDG_RUNTIME_DIR/dygmate/status.sock -
+```
+
+```json
+{"state":"connected","connected":true,"model":"Dygma Defy","sides":2,
+ "left":{"level":80,"status":"discharging","text":"80% (discharging)"},
+ "right":{"level":75,"status":"charging","text":"75% (charging)"},
+ "level":75,"text":"75%","low":false,"updated":1752669000}
+```
+
+`state` is `missing`/`available`/`connected`/`paused`; `level`/`text` is the
+lower of the visible sides (what the tray icon shows, `null`/`"--"` before the
+first reading); `sides` is 1 on the Sonsei; a side awaiting verification after
+wake reports `level: null` and `"?% (...)"`. On disconnect the last-known
+levels stay, marked `"connected": false`. The endpoint disappears when the
+tray exits, so a missing read means "tray not running".
+
+Readings come from the tray's plausibility-gated pipeline — the same numbers
+the tray shows — and reading the pipe never touches the keyboard's serial
+port, so it composes with the running tray (unlike polling `dygmate --once`,
+which needs the exclusive port for itself).
+
+[yasb](https://github.com/amnweb/yasb) widget (`config.yaml`; prefer `more <`
+over `type` — cmd's `type` pre-opens the path to probe it, which can race the
+pipe server's listener re-arm):
+
+```yaml
+widgets:
+  dygma:
+    type: yasb.custom.CustomWidget
+    options:
+      label: "<span></span> {data[text]}"
+      label_alt: "<span></span> L {data[left][text]}  R {data[right][text]}"
+      class_name: dygma-widget
+      exec_options:
+        run_cmd: 'cmd /c more < \\.\pipe\dygmate'
+        run_interval: 30000
+        return_format: json
+        hide_empty: true   # tray not running -> widget hidden
+      callbacks:
+        on_left: toggle_label
+```
+
+[waybar](https://github.com/Alexays/Waybar) module:
+
+```json
+"custom/dygma": {
+    "exec": "socat -u UNIX-CONNECT:$XDG_RUNTIME_DIR/dygmate/status.sock - 2>/dev/null | jq --unbuffered -c '{text: .text, tooltip: (.left.text + \" | \" + .right.text), class: (if .low then \"low\" else \"\" end)}'",
+    "return-type": "json",
+    "interval": 30
+}
+```
+
 ## Linux setup
 
 Start `dygmate-tray` from your compositor's autostart, or enable the packaged

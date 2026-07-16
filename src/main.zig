@@ -217,4 +217,5 @@ test {
     _ = @import("layer.zig");
     _ = @import("porthint.zig");
     _ = @import("config.zig");
+    _ = @import("statusserver.zig");
 }

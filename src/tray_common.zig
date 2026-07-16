@@ -8,11 +8,12 @@ const focus = @import("focus.zig");
 const battery = @import("battery.zig");
 const device = @import("device.zig");
 const layer = @import("layer.zig");
+const statusserver = @import("statusserver.zig");
 
 // ---------------------------------------------------------------------------
 // Tunables (shared with both platforms).
 // ---------------------------------------------------------------------------
-pub const low_threshold: u8 = 20;
+pub const low_threshold = statusserver.low_threshold;
 // Poll cadence. The wireless halves sleep and the neuron only serves a cached
 // value once a side has reported, so a plain read right after connect is often
 // empty. Poll fast until a side reports a real level (populates the tray within
@@ -603,6 +604,9 @@ pub fn runPollLoop(
                 if (announce_connection or announce_next_read) st.announce_connection = true;
                 announce_next_read = false;
                 st.mutex.unlock(io);
+                // Feed the external status IPC (yasb/waybar) the same
+                // accepted snapshot the UI renders.
+                statusserver.publishReading(io, found.model, merged.left, merged.right, hiddenSides(res.needs_verification));
                 // Arm the forceRead verification loop on the transition into
                 // needing it (re-arming every poll would reset the backoff
                 // and hammer RF); clear it once nothing needs verifying.
@@ -708,6 +712,13 @@ fn setStatus(
         st.announce_connection = false;
     }
     st.mutex.unlock(io);
+    // Unconditional (unlike wake): paused flips without a status change, and
+    // the re-render also keeps the snapshot's `updated` field fresh.
+    statusserver.publishConnState(io, if (st.paused.load(.acquire)) .paused else switch (status) {
+        .missing => .missing,
+        .available => .available,
+        .connected => .connected,
+    });
     if (changed) wake(ctx);
 }
 

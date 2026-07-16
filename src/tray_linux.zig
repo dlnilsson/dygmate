@@ -14,6 +14,7 @@ const layer = @import("layer.zig");
 const osd_linux = @import("osd_linux.zig");
 const config = @import("config.zig");
 const update = @import("update.zig");
+const statusserver = @import("statusserver.zig");
 
 comptime {
     if (builtin.os.tag != .linux) @compileError("tray_linux.zig is Linux-only");
@@ -261,6 +262,12 @@ fn run(init: std.process.Init) !void {
         app.state.stop.store(true, .release);
         thread.join();
     }
+
+    // Battery status IPC for external status bars (waybar etc.):
+    // {runtime_dir}/dygmate/status.sock. Stopped (and the socket unlinked)
+    // before the poll thread joins above (defers run LIFO).
+    statusserver.start(gpa, .{ .runtime_dir = runtime_dir });
+    defer statusserver.stop();
 
     // Register with the watcher (retries in the loop if it isn't up yet).
     tryRegister(&app);
@@ -1198,12 +1205,13 @@ fn openUrlWorker(app: *App) void {
 // Tests
 // ---------------------------------------------------------------------------
 test {
-    // Pull in D-Bus, shared planner, Wayland, and OSD unit tests.
+    // Pull in D-Bus, shared planner, Wayland, OSD, and status IPC unit tests.
     _ = @import("dbus.zig");
     _ = @import("tray_common.zig");
     _ = @import("wayland.zig");
     _ = @import("osd_linux.zig");
     _ = @import("update.zig");
+    _ = @import("statusserver.zig");
 }
 
 test "renderIcon fills background color at a corner pixel" {

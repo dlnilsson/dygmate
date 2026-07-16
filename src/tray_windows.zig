@@ -16,6 +16,7 @@ const device = @import("device.zig");
 const common = @import("tray_common.zig");
 const config = @import("config.zig");
 const update = @import("update.zig");
+const statusserver = @import("statusserver.zig");
 const windows = std.os.windows;
 
 // ---------------------------------------------------------------------------
@@ -642,6 +643,9 @@ pub fn main(init: std.process.Init) void {
     // One-shot GitHub update check on its own thread + isolated io.
     update.spawnCheck(init.gpa, build_options.version, &g_update);
 
+    // Battery status IPC for external status bars (\\.\pipe\dygmate).
+    statusserver.start(init.gpa, .{});
+
     var msg: MSG = undefined;
     while (GetMessageW(&msg, null, 0, 0) > 0) {
         _ = TranslateMessage(&msg);
@@ -649,6 +653,7 @@ pub fn main(init: std.process.Init) void {
     }
 
     g_state.stop.store(true, .release);
+    statusserver.stop();
     thread.join();
     if (g_nid.hIcon) |icon| _ = DestroyIcon(icon);
     _ = Shell_NotifyIconW(NIM_DELETE, &g_nid);
@@ -1086,4 +1091,8 @@ fn wakeUi(ctx: *PollCtx) void {
 
 comptime {
     if (builtin.os.tag != .windows) @compileError("tray_windows.zig is Windows-only");
+}
+
+test {
+    _ = @import("statusserver.zig");
 }
