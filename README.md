@@ -120,11 +120,16 @@ the tray shows — and reading the pipe never touches the keyboard's serial
 port, so it composes with the running tray (unlike polling `dygmate --once`,
 which needs the exclusive port for itself).
 
+## Example
+
+
+### yasb
 [yasb](https://github.com/amnweb/yasb) widget (`config.yaml`; prefer `more <`
 over `type` — cmd's `type` pre-opens the path to probe it, which can race the
 pipe server's listener re-arm):
 
 ```yaml
+# config.yaml
 widgets:
   dygma:
     type: yasb.custom.CustomWidget
@@ -140,8 +145,20 @@ widgets:
       callbacks:
         on_left: toggle_label
 ```
+```css
+/* style.css Dygma keyboard battery (dygmate) */
+.dygma-widget:hover {
+    background-color: var(--yasb-white-alpha-08);
+}
+.dygma-widget .icon {
+    padding-right: 4px;
+}
+```
+![yasb default](docs/yasb_default.png "yasb default")
+![yasb extended](docs/yasb_expanded.png "yasb extended")
 
-[waybar](https://github.com/Alexays/Waybar) module:
+---
+### [waybar](https://github.com/Alexays/Waybar) module:
 
 ```json
 "custom/dygma": {
