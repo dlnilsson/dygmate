@@ -16,6 +16,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const battery = @import("battery.zig");
 const device = @import("device.zig");
+const focus = @import("focus.zig");
 
 /// A non-charging side below this level renders `"low": true`. Single source
 /// for the tray's threshold; tray_common re-exports it.
@@ -57,6 +58,107 @@ const Snapshot = struct {
 };
 
 // ---------------------------------------------------------------------------
+// Debug events channel (\\.\pipe\dygmate-events / events.sock).
+//
+// A separate streaming endpoint for observability: connect and receive one
+// NDJSON event per line (Focus wire traffic, Acceptor verdicts, state
+// transitions, wakes, force reads). Kept apart from the frozen one-shot
+// snapshot endpoint above so status-bar consumers can never be broken by
+// debug-stream evolution.
+//
+// emit() is fire-and-forget: it renders into a fixed drop-oldest ring under a
+// dedicated mutex and returns — it never waits on a subscriber, so a slow or
+// absent `dygmate tail` can never stall the poll thread. The one events server
+// thread delivers the retained ring as backlog on connect, then streams live;
+// one subscriber at a time (a second gets refused/queued — fine for a debug
+// tool). All emits happen on the poll thread (tray_common hooks + the Focus
+// tap, which also runs there), so `emit_io` is that single thread's io.
+// ---------------------------------------------------------------------------
+const ev_slot_cap = 512;
+// ~1 min of backlog even under the 250ms layer poll (~8 events/s); 256KB
+// static, delivered to a subscriber on connect.
+const ev_ring_len = 512;
+
+const EvSlot = struct {
+    seq: u64 = 0,
+    len: usize = 0,
+    buf: [ev_slot_cap]u8 = undefined,
+};
+
+var ev_mu: std.Io.Mutex = .init;
+var ev_ring = [_]EvSlot{.{}} ** ev_ring_len;
+/// Next sequence number to assign; also the count of events ever emitted.
+var ev_head: u64 = 0;
+var events_enabled: std.atomic.Value(bool) = .init(false);
+var emit_io: std.Io = undefined;
+var ev_server_thread: ?std.Thread = null;
+var ev_sock_path: ?[]u8 = null; // Linux only
+
+/// One observable event. `@tagName` of the active field is the wire "t" value,
+/// so adding a variant is all it takes to add an event type.
+pub const Event = union(enum) {
+    focus_tx: struct { cmd: []const u8 },
+    focus_rx: struct { cmd: []const u8, resp: []const u8, ms: u64 },
+    focus_err: struct { cmd: []const u8, err: []const u8, ms: u64 },
+    reading: ReadingEvent,
+    state: struct { from: ConnState, to: ConnState },
+    force_read: struct { phase: []const u8, err: ?[]const u8 = null },
+    wake: void,
+    note: struct { msg: []const u8 },
+};
+
+/// A battery read through the Acceptor: the raw wire reading, the accepted
+/// (gated) reading, and the verdict — the whole point of having this channel.
+pub const ReadingEvent = struct {
+    raw: battery.Reading,
+    accepted: battery.Reading,
+    suspect: bool,
+    needs_verification: [2]bool,
+    authoritative: bool,
+};
+
+/// Append one event to the ring. Fire-and-forget; safe to call before the
+/// channel is enabled (no-op) and from the poll thread only.
+pub fn emit(ev: Event) void {
+    if (!events_enabled.load(.acquire)) return;
+    const io = emit_io;
+    const ts = nowMillis(io);
+    ev_mu.lockUncancelable(io);
+    defer ev_mu.unlock(io);
+    const slot = &ev_ring[@intCast(ev_head % ev_ring_len)];
+    slot.seq = ev_head;
+    slot.len = renderEvent(&slot.buf, ev_head, ts, ev).len;
+    ev_head += 1;
+}
+
+// Convenience wrappers so tray_common stays declarative and never constructs
+// Event literals inline.
+pub fn emitReading(r: ReadingEvent) void {
+    emit(.{ .reading = r });
+}
+pub fn emitForceRead(phase: []const u8, err: ?[]const u8) void {
+    emit(.{ .force_read = .{ .phase = phase, .err = err } });
+}
+pub fn emitWake() void {
+    emit(.wake);
+}
+
+/// Focus wire-tap: installed as `focus.tap` in `start`, invoked on the poll
+/// thread inside `focus.request`.
+fn focusTap(t: focus.Tap) void {
+    switch (t.kind) {
+        .tx => emit(.{ .focus_tx = .{ .cmd = t.cmd } }),
+        .rx => emit(.{ .focus_rx = .{ .cmd = t.cmd, .resp = t.resp, .ms = t.ms } }),
+        .err => emit(.{ .focus_err = .{ .cmd = t.cmd, .err = t.err, .ms = t.ms } }),
+    }
+}
+
+fn nowMillis(io: std.Io) i64 {
+    const ts = std.Io.Clock.Timestamp.now(io, .real);
+    return @intCast(@divTrunc(ts.raw.nanoseconds, std.time.ns_per_ms));
+}
+
+// ---------------------------------------------------------------------------
 // Publishing (called from the tray poll thread).
 // ---------------------------------------------------------------------------
 /// Publish an accepted (plausibility-gated) reading. Merges per field like
@@ -69,7 +171,7 @@ pub fn publishReading(
     hide: [2]bool,
 ) void {
     mu.lockUncancelable(io);
-    defer mu.unlock(io);
+    const prev = snap.state;
     snap.state = .connected;
     snap.model = model;
     mergeSide(&snap.left, left);
@@ -77,16 +179,20 @@ pub fn publishReading(
     snap.hide = hide;
     snap.updated = nowSeconds(io);
     json_len = render(&json_buf, snap).len;
+    mu.unlock(io);
+    if (prev != .connected) emit(.{ .state = .{ .from = prev, .to = .connected } });
 }
 
 /// Publish a connection-state change. Levels and model stay as last known so
 /// the bar can keep showing them; `connected: false` marks them stale.
 pub fn publishConnState(io: std.Io, state: ConnState) void {
     mu.lockUncancelable(io);
-    defer mu.unlock(io);
+    const prev = snap.state;
     snap.state = state;
     snap.updated = nowSeconds(io);
     json_len = render(&json_buf, snap).len;
+    mu.unlock(io);
+    if (prev != state) emit(.{ .state = .{ .from = prev, .to = state } });
 }
 
 fn mergeSide(dst: *battery.SideReading, src: battery.SideReading) void {
@@ -102,39 +208,73 @@ fn nowSeconds(io: std.Io) i64 {
 // ---------------------------------------------------------------------------
 // Lifecycle.
 // ---------------------------------------------------------------------------
-/// Spawn the IPC server thread. Any failure leaves the tray fully functional
-/// with no status feed (update.spawnCheck idiom).
-pub fn start(gpa: std.mem.Allocator, opts: StartOptions) void {
+/// Spawn the IPC server threads (snapshot + debug events) and install the
+/// Focus wire-tap. `io` is the tray's poll-thread io, used for emit
+/// timestamps. Must be called before the poll thread is spawned so the tap and
+/// `emit_io` are visible to it via the spawn happens-before barrier. Any
+/// failure leaves the tray fully functional with no feeds (update.spawnCheck
+/// idiom).
+pub fn start(io: std.Io, gpa: std.mem.Allocator, opts: StartOptions) void {
     if (server_thread != null) return;
     srv_gpa = gpa;
+    emit_io = io;
     // Pre-spawn, still single-threaded: render the initial "missing" snapshot
     // without the mutex so an early client sees valid JSON.
     json_len = render(&json_buf, snap).len;
     if (comptime builtin.os.tag == .windows) {
         server_thread = std.Thread.spawn(.{}, serveWindows, .{gpa}) catch null;
+        ev_server_thread = std.Thread.spawn(.{}, serveEventsWindows, .{gpa}) catch null;
     } else {
-        const p = std.fmt.allocPrint(gpa, "{s}/dygmate/status.sock", .{opts.runtime_dir}) catch return;
-        sock_path = p;
-        server_thread = std.Thread.spawn(.{}, serveLinux, .{gpa}) catch {
-            gpa.free(p);
-            sock_path = null;
-            return;
-        };
+        if (std.fmt.allocPrint(gpa, "{s}/dygmate/status.sock", .{opts.runtime_dir})) |p| {
+            sock_path = p;
+            if (std.Thread.spawn(.{}, serveLinux, .{gpa})) |t| {
+                server_thread = t;
+            } else |_| {
+                gpa.free(p);
+                sock_path = null;
+            }
+        } else |_| {}
+        if (std.fmt.allocPrint(gpa, "{s}/dygmate/events.sock", .{opts.runtime_dir})) |p| {
+            ev_sock_path = p;
+            if (std.Thread.spawn(.{}, serveEventsLinux, .{gpa})) |t| {
+                ev_server_thread = t;
+            } else |_| {
+                gpa.free(p);
+                ev_sock_path = null;
+            }
+        } else |_| {}
     }
+    // Install the tap and open the gate last, so no event can be emitted
+    // before the machinery above is in place.
+    focus.tap = &focusTap;
+    events_enabled.store(true, .release);
 }
 
-/// Stop and join the server thread. Windows unblocks the blocking
+/// Stop and join the server threads. Windows unblocks a blocking
 /// ConnectNamedPipe with a throwaway client connection; Linux wakes from its
-/// bounded accept-poll within 500ms on its own.
+/// bounded accept/serve polls within 500ms on its own.
 pub fn stop() void {
-    const t = server_thread orelse return;
+    events_enabled.store(false, .release);
     stop_flag.store(true, .release);
-    if (comptime builtin.os.tag == .windows) unblockConnect();
-    t.join();
-    server_thread = null;
+    if (comptime builtin.os.tag == .windows) {
+        if (server_thread != null) unblockConnect(win.pipe_name);
+        if (ev_server_thread != null) unblockConnect(win.events_pipe_name);
+    }
+    if (server_thread) |t| {
+        t.join();
+        server_thread = null;
+    }
+    if (ev_server_thread) |t| {
+        t.join();
+        ev_server_thread = null;
+    }
     if (sock_path) |p| {
         srv_gpa.free(p);
         sock_path = null;
+    }
+    if (ev_sock_path) |p| {
+        srv_gpa.free(p);
+        ev_sock_path = null;
     }
 }
 
@@ -164,6 +304,7 @@ const win = if (builtin.os.tag == .windows) struct {
     const BOOL = windows.BOOL;
 
     const pipe_name = std.unicode.utf8ToUtf16LeStringLiteral("\\\\.\\pipe\\dygmate");
+    const events_pipe_name = std.unicode.utf8ToUtf16LeStringLiteral("\\\\.\\pipe\\dygmate-events");
 
     const PIPE_ACCESS_OUTBOUND: DWORD = 0x00000002;
     // dwPipeMode: byte type/read mode and blocking waits are all 0.
@@ -244,17 +385,19 @@ fn serveWindows(gpa: std.mem.Allocator) void {
     }
 }
 
-/// Unblock the server's ConnectNamedPipe by connecting as a throwaway client
-/// and draining the served line. The bounded retry covers the window where
-/// the server sits between CloseHandle and the next CreateNamedPipeW; if the
-/// server is in its error backoff instead, it re-checks stop_flag within a
-/// second on its own and join() returns then.
-fn unblockConnect() void {
+/// Unblock a server's ConnectNamedPipe by connecting as a throwaway client and
+/// draining whatever it sends. The bounded retry covers the window where the
+/// server sits between CloseHandle and the next CreateNamedPipeW; if the server
+/// is in its error backoff instead, it re-checks stop_flag within a second on
+/// its own and join() returns then. Works for both the one-shot snapshot pipe
+/// and the streaming events pipe: once stop_flag is set the served loop returns
+/// promptly, and reading here drains any bytes it wrote on the way out.
+fn unblockConnect(pipe_name: [*:0]const u16) void {
     var attempts: usize = 0;
     while (attempts < 20) : (attempts += 1) {
-        const h = win.CreateFileW(win.pipe_name, win.GENERIC_READ, 0, null, win.OPEN_EXISTING, 0, null);
+        const h = win.CreateFileW(pipe_name, win.GENERIC_READ, 0, null, win.OPEN_EXISTING, 0, null);
         if (h != std.os.windows.INVALID_HANDLE_VALUE) {
-            var buf: [json_cap]u8 = undefined;
+            var buf: [ev_slot_cap]u8 = undefined;
             var n: win.DWORD = 0;
             while (win.ReadFile(h, &buf, buf.len, &n, null).toBool() and n != 0) {}
             std.os.windows.CloseHandle(h);
@@ -310,6 +453,144 @@ fn writeAll(io: std.Io, stream: std.Io.net.Stream, bytes: []const u8) !void {
         const n = try io.vtable.netWrite(io.userdata, stream.socket.handle, bytes[off..], (&empty)[0..1], 0);
         if (n == 0) return error.ConnectionClosed;
         off += n;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Events server: streams the ring to one subscriber at a time.
+// ---------------------------------------------------------------------------
+const Poll_ms = 100;
+
+/// The subscriber's cursor: which ring events it still owes the client.
+const NextEvent = union(enum) {
+    none,
+    event: usize, // rendered length copied into the caller's buffer
+    dropped: u64, // events lost to ring overwrite since the last poll
+};
+
+/// Where a freshly connected subscriber starts: the oldest event still in the
+/// ring, so it sees recent history as backlog before the live stream.
+fn subStart(io: std.Io) u64 {
+    ev_mu.lockUncancelable(io);
+    defer ev_mu.unlock(io);
+    return if (ev_head > ev_ring_len) ev_head - ev_ring_len else 0;
+}
+
+/// Advance the cursor by one event, copying its bytes into `out`. Returns
+/// `.dropped` when the ring lapped the cursor (slow client), `.none` when
+/// caught up.
+fn nextEvent(io: std.Io, cur: *u64, out: *[ev_slot_cap]u8) NextEvent {
+    ev_mu.lockUncancelable(io);
+    defer ev_mu.unlock(io);
+    if (cur.* >= ev_head) return .none;
+    const oldest = if (ev_head > ev_ring_len) ev_head - ev_ring_len else 0;
+    if (cur.* < oldest) {
+        const n = oldest - cur.*;
+        cur.* = oldest;
+        return .{ .dropped = n };
+    }
+    const slot = &ev_ring[@intCast(cur.* % ev_ring_len)];
+    @memcpy(out[0..slot.len], slot.buf[0..slot.len]);
+    cur.* += 1;
+    return .{ .event = slot.len };
+}
+
+fn droppedLine(buf: []u8, n: u64) []const u8 {
+    return std.fmt.bufPrint(buf, "{{\"t\":\"dropped\",\"seq\":0,\"ts\":0,\"n\":{d}}}\n", .{n}) catch buf[0..0];
+}
+
+fn serveEventsWindows(gpa: std.mem.Allocator) void {
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    while (!stop_flag.load(.acquire)) {
+        // Single instance, one subscriber at a time; a second concurrent client
+        // gets ERROR_PIPE_BUSY. No keep-a-listener probe race like the snapshot
+        // pipe — `dygmate tail` opens once with CreateFile and streams.
+        const h = win.CreateNamedPipeW(win.events_pipe_name, win.PIPE_ACCESS_OUTBOUND, win.PIPE_REJECT_REMOTE_CLIENTS, 1, ev_slot_cap, 0, 0, null);
+        if (h == std.os.windows.INVALID_HANDLE_VALUE) {
+            sleepMs(io, 1000);
+            continue;
+        }
+        const ok = win.ConnectNamedPipe(h, null).toBool() or win.GetLastError() == win.ERROR_PIPE_CONNECTED;
+        if (stop_flag.load(.acquire)) {
+            std.os.windows.CloseHandle(h);
+            break;
+        }
+        if (ok) streamEventsWindows(io, h);
+        _ = win.DisconnectNamedPipe(h);
+        std.os.windows.CloseHandle(h);
+    }
+}
+
+fn streamEventsWindows(io: std.Io, h: win.HANDLE) void {
+    var cur = subStart(io);
+    while (!stop_flag.load(.acquire)) {
+        var line: [ev_slot_cap]u8 = undefined;
+        switch (nextEvent(io, &cur, &line)) {
+            .none => sleepMs(io, Poll_ms),
+            .event => |len| if (!writeAllWin(h, line[0..len])) return,
+            .dropped => |n| {
+                var buf: [64]u8 = undefined;
+                if (!writeAllWin(h, droppedLine(&buf, n))) return;
+            },
+        }
+    }
+}
+
+/// Write to the pipe; false on any failure (client gone -> re-accept).
+fn writeAllWin(h: win.HANDLE, bytes: []const u8) bool {
+    var off: usize = 0;
+    while (off < bytes.len) {
+        var written: win.DWORD = 0;
+        if (!win.WriteFile(h, bytes.ptr + off, @intCast(bytes.len - off), &written, null).toBool()) return false;
+        if (written == 0) return false;
+        off += written;
+    }
+    return true;
+}
+
+fn serveEventsLinux(gpa: std.mem.Allocator) void {
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const path = ev_sock_path orelse return;
+    if (std.fs.path.dirname(path)) |dir| std.Io.Dir.cwd().createDirPath(io, dir) catch {};
+    std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const ua = std.Io.net.UnixAddress.init(path) catch return;
+    var server = ua.listen(io, .{}) catch return;
+    defer {
+        server.deinit(io);
+        std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    }
+
+    while (!stop_flag.load(.acquire)) {
+        var fds = [_]std.posix.pollfd{
+            .{ .fd = server.socket.handle, .events = std.posix.POLL.IN, .revents = 0 },
+        };
+        const n = std.posix.poll(&fds, 500) catch break;
+        if (n == 0) continue;
+        const stream = server.accept(io) catch continue;
+        streamEventsLinux(io, stream);
+        stream.close(io);
+    }
+}
+
+fn streamEventsLinux(io: std.Io, stream: std.Io.net.Stream) void {
+    var cur = subStart(io);
+    while (!stop_flag.load(.acquire)) {
+        var line: [ev_slot_cap]u8 = undefined;
+        switch (nextEvent(io, &cur, &line)) {
+            .none => sleepMs(io, Poll_ms),
+            .event => |len| writeAll(io, stream, line[0..len]) catch return,
+            .dropped => |n| {
+                var buf: [64]u8 = undefined;
+                writeAll(io, stream, droppedLine(&buf, n)) catch return;
+            },
+        }
     }
 }
 
@@ -416,6 +697,92 @@ fn isLow(s: Snapshot, sides: u8) bool {
         if (lvl < low_threshold) return true;
     }
     return false;
+}
+
+// ---------------------------------------------------------------------------
+// Event rendering (pure). One NDJSON line per event, envelope first:
+//   {"t":<type>,"seq":N,"ts":<unix_ms>, <type-specific fields>}\n
+// ---------------------------------------------------------------------------
+fn renderEvent(out: []u8, seq: u64, ts: i64, ev: Event) []const u8 {
+    var w = std.Io.Writer.fixed(out);
+    writeEvent(&w, seq, ts, ev) catch return out[0..0];
+    return w.buffered();
+}
+
+fn writeEvent(w: *std.Io.Writer, seq: u64, ts: i64, ev: Event) !void {
+    try w.print("{{\"t\":\"{s}\",\"seq\":{d},\"ts\":{d}", .{ @tagName(ev), seq, ts });
+    switch (ev) {
+        .focus_tx => |e| {
+            try w.writeAll(",\"cmd\":");
+            try jsonStr(w, e.cmd);
+        },
+        .focus_rx => |e| {
+            try w.writeAll(",\"cmd\":");
+            try jsonStr(w, e.cmd);
+            try w.writeAll(",\"resp\":");
+            try jsonStr(w, e.resp);
+            try w.print(",\"ms\":{d}", .{e.ms});
+        },
+        .focus_err => |e| {
+            try w.writeAll(",\"cmd\":");
+            try jsonStr(w, e.cmd);
+            try w.writeAll(",\"err\":");
+            try jsonStr(w, e.err);
+            try w.print(",\"ms\":{d}", .{e.ms});
+        },
+        .reading => |e| {
+            try w.writeAll(",\"raw\":");
+            try writeReadingJson(w, e.raw);
+            try w.writeAll(",\"accepted\":");
+            try writeReadingJson(w, e.accepted);
+            try w.print(
+                ",\"suspect\":{s},\"authoritative\":{s},\"needs_verification\":[{s},{s}]",
+                .{ boolStr(e.suspect), boolStr(e.authoritative), boolStr(e.needs_verification[0]), boolStr(e.needs_verification[1]) },
+            );
+        },
+        .state => |e| {
+            try w.print(",\"from\":\"{s}\",\"to\":\"{s}\"", .{ @tagName(e.from), @tagName(e.to) });
+        },
+        .force_read => |e| {
+            try w.writeAll(",\"phase\":");
+            try jsonStr(w, e.phase);
+            if (e.err) |er| {
+                try w.writeAll(",\"err\":");
+                try jsonStr(w, er);
+            }
+        },
+        .wake => {},
+        .note => |e| {
+            try w.writeAll(",\"msg\":");
+            try jsonStr(w, e.msg);
+        },
+    }
+    try w.writeAll("}\n");
+}
+
+/// Emit a properly quoted+escaped JSON string (neuron responses are arbitrary
+/// bytes, so this must not be skipped for `resp`).
+fn jsonStr(w: *std.Io.Writer, s: []const u8) !void {
+    try std.json.Stringify.value(s, .{}, w);
+}
+
+fn writeReadingJson(w: *std.Io.Writer, r: battery.Reading) !void {
+    try w.writeAll("{\"left\":");
+    try writeSideJson(w, r.left);
+    try w.writeAll(",\"right\":");
+    try writeSideJson(w, r.right);
+    try w.writeByte('}');
+}
+
+fn writeSideJson(w: *std.Io.Writer, s: battery.SideReading) !void {
+    try w.writeAll("{\"level\":");
+    if (s.level) |l| try w.print("{d}", .{l}) else try w.writeAll("null");
+    // status.label() is a fixed safelist word — no escaping needed.
+    try w.print(",\"status\":\"{s}\"}}", .{s.status.label()});
+}
+
+fn boolStr(b: bool) []const u8 {
+    return if (b) "true" else "false";
 }
 
 // ---------------------------------------------------------------------------
@@ -536,4 +903,63 @@ test "mergeSide keeps the last real value per field" {
     mergeSide(&dst, side(76, .unknown));
     try std.testing.expectEqual(@as(?u8, 76), dst.level);
     try std.testing.expectEqual(battery.Status.charging, dst.status);
+}
+
+test "renderEvent: focus_rx carries cmd, resp, ms" {
+    var buf: [ev_slot_cap]u8 = undefined;
+    const out = renderEvent(&buf, 7, 1752669000123, .{
+        .focus_rx = .{ .cmd = "wireless.battery.left.level", .resp = "87", .ms = 4 },
+    });
+    try std.testing.expectEqualStrings(
+        "{\"t\":\"focus_rx\",\"seq\":7,\"ts\":1752669000123," ++
+            "\"cmd\":\"wireless.battery.left.level\",\"resp\":\"87\",\"ms\":4}\n",
+        out,
+    );
+}
+
+test "renderEvent: reading nests raw/accepted with null levels and the verdict" {
+    var buf: [ev_slot_cap]u8 = undefined;
+    const out = renderEvent(&buf, 0, 0, .{ .reading = .{
+        .raw = .{ .left = side(100, .disconnected), .right = side(null, .unknown) },
+        .accepted = .{ .left = side(null, .disconnected), .right = side(null, .unknown) },
+        .suspect = false,
+        .needs_verification = .{ true, false },
+        .authoritative = false,
+    } });
+    try std.testing.expectEqualStrings(
+        "{\"t\":\"reading\",\"seq\":0,\"ts\":0," ++
+            "\"raw\":{\"left\":{\"level\":100,\"status\":\"disconnected\"},\"right\":{\"level\":null,\"status\":\"?\"}}," ++
+            "\"accepted\":{\"left\":{\"level\":null,\"status\":\"disconnected\"},\"right\":{\"level\":null,\"status\":\"?\"}}," ++
+            "\"suspect\":false,\"authoritative\":false,\"needs_verification\":[true,false]}\n",
+        out,
+    );
+}
+
+test "renderEvent: state transition and bare wake" {
+    var buf: [ev_slot_cap]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "{\"t\":\"state\",\"seq\":1,\"ts\":2,\"from\":\"connected\",\"to\":\"missing\"}\n",
+        renderEvent(&buf, 1, 2, .{ .state = .{ .from = .connected, .to = .missing } }),
+    );
+    try std.testing.expectEqualStrings(
+        "{\"t\":\"wake\",\"seq\":3,\"ts\":4}\n",
+        renderEvent(&buf, 3, 4, .wake),
+    );
+}
+
+test "renderEvent: focus_err escapes arbitrary response bytes" {
+    var buf: [ev_slot_cap]u8 = undefined;
+    // A quote in the payload must be escaped so the line stays valid JSON.
+    const out = renderEvent(&buf, 0, 0, .{
+        .focus_rx = .{ .cmd = "layer.state", .resp = "a\"b", .ms = 1 },
+    });
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"resp\":\"a\\\"b\"") != null);
+}
+
+test "droppedLine renders a valid marker" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "{\"t\":\"dropped\",\"seq\":0,\"ts\":0,\"n\":5}\n",
+        droppedLine(&buf, 5),
+    );
 }

@@ -499,7 +499,10 @@ pub fn runPollLoop(
     while (!st.stop.load(.acquire)) {
         // A wake can land while disconnected or paused too: guard the sides
         // so the next connection's first reads need verification.
-        if (wake_detector.check(io)) acceptor.noteWake();
+        if (wake_detector.check(io)) {
+            acceptor.noteWake();
+            statusserver.emitWake();
+        }
         // PAUSED: hold no port so Bazecor can use it; idle until resumed.
         if (st.paused.load(.acquire)) {
             const present = device.isDygmaPresent(io) catch false;
@@ -578,6 +581,7 @@ pub fn runPollLoop(
             // rather than after a slow interval.
             if (wake_detector.check(io)) {
                 acceptor.noteWake();
+                statusserver.emitWake();
                 battery_interval_ms = initial_poll_interval_ms;
                 battery_elapsed_ms = battery_interval_ms;
             }
@@ -589,11 +593,21 @@ pub fn runPollLoop(
                     setStatus(Ctx, ctx, io, st, wake, offlineStatus(still_present));
                     break;
                 };
+                const authoritative_read = next_read_authoritative;
                 const res = if (next_read_authoritative)
                     acceptor.feedAuthoritative(raw)
                 else
                     acceptor.feed(raw);
                 next_read_authoritative = false;
+                // Expose the raw wire reading, the gated result, and the
+                // verdict on the debug events channel.
+                statusserver.emitReading(.{
+                    .raw = raw,
+                    .accepted = res.reading,
+                    .suspect = res.suspect,
+                    .needs_verification = res.needs_verification,
+                    .authoritative = authoritative_read,
+                });
                 known.merge(res.reading);
                 const merged: battery.Reading = .{ .left = known.left, .right = known.right };
                 st.mutex.lockUncancelable(io);
@@ -672,13 +686,16 @@ pub fn runPollLoop(
                 // A failed forceRead means the stream state is unknown (its
                 // late response would answer the next command) — reconnect
                 // rather than keep polling a desynced port.
-                battery.forceRead(&dev) catch {
+                statusserver.emitForceRead("issued", null);
+                battery.forceRead(&dev) catch |e| {
+                    statusserver.emitForceRead("failed", @errorName(e));
                     const still_present = device.isDygmaPresent(io) catch false;
                     resetLayerState(st);
                     setStatus(Ctx, ctx, io, st, wake, offlineStatus(still_present));
                     break;
                 };
                 sleepMs(io, st, battery.force_read_settle_s * 1000);
+                statusserver.emitForceRead("settled", null);
                 next_read_authoritative = true;
                 // Re-arm fast polling: if the sides were asleep the refresh
                 // read comes back empty, and staying on the slow interval

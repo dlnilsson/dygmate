@@ -255,6 +255,13 @@ fn run(init: std.process.Init) !void {
     try requestName(&app);
     dlog("acquired bus name {s}", .{app.item_name});
 
+    // Battery status IPC for external status bars (waybar etc.):
+    // {runtime_dir}/dygmate/{status,events}.sock. Started before the poll
+    // thread so the Focus wire-tap and emit io are visible to it via the spawn
+    // happens-before barrier; stopped after it joins (defers run LIFO).
+    statusserver.start(io, gpa, .{ .runtime_dir = runtime_dir });
+    defer statusserver.stop();
+
     // Background serial poll thread. It only touches State + the eventfd, never
     // the D-Bus socket, so all bus I/O stays on this (the main) thread.
     const thread = try std.Thread.spawn(.{}, pollThread, .{&app});
@@ -262,12 +269,6 @@ fn run(init: std.process.Init) !void {
         app.state.stop.store(true, .release);
         thread.join();
     }
-
-    // Battery status IPC for external status bars (waybar etc.):
-    // {runtime_dir}/dygmate/status.sock. Stopped (and the socket unlinked)
-    // before the poll thread joins above (defers run LIFO).
-    statusserver.start(gpa, .{ .runtime_dir = runtime_dir });
-    defer statusserver.stop();
 
     // Register with the watcher (retries in the loop if it isn't up yet).
     tryRegister(&app);

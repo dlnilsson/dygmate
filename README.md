@@ -151,6 +151,53 @@ widgets:
 }
 ```
 
+## Debugging: the events feed
+
+`dygmate-tray` also serves a live **debug events** stream — a separate endpoint
+from the status snapshot above — so you can watch what the neuron actually
+sends without a log file:
+
+- Windows: named pipe `\\.\pipe\dygmate-events`
+- Linux: unix socket `$XDG_RUNTIME_DIR/dygmate/events.sock`
+
+Tail it with the CLI (a read-only client — it never touches the serial port, so
+it runs alongside the tray):
+
+```sh
+dygmate tail          # pretty, hides the 250ms layer poll
+dygmate tail --all    # include the layer-state poll traffic
+dygmate tail --raw    # NDJSON, one event per line, for jq
+```
+
+```text
+20:14:17.139 reading    raw L100/R?  ->  acc L?/R?  [suspect]
+20:14:32.708 reading    raw L100/R?  ->  acc L100/R?
+20:14:33.001 state      missing -> connected
+20:14:41.550 focus_rx   <- wireless.battery.left.level = "87" (1ms)
+20:15:02.114 force_read  forceRead issued
+```
+
+Each line is one NDJSON event (envelope `{"t","seq","ts", ...}`):
+
+- `focus_tx` / `focus_rx` / `focus_err` — every Focus command sent to the
+  neuron and its response (with round-trip ms), i.e. the raw wire.
+- `reading` — a battery read through the plausibility gate: the `raw` wire
+  reading, the `accepted` (gated) reading, and the verdict (`suspect`,
+  `needs_verification`, `authoritative`). This is where you see the neuron's
+  bogus post-wake `100` being held until it's confirmed.
+- `state` — connection-state transitions (`missing`/`available`/`connected`/`paused`).
+- `force_read` — the RF re-poll lifecycle (`issued`/`settled`/`failed`).
+- `wake` — the machine woke; the sides are re-guarded.
+- `dropped` — the events ring lapped a slow reader (n events lost).
+
+The endpoint serves one subscriber at a time and replays the last ~1 min of
+retained events as backlog on connect, then streams live. Pipe the raw form to
+`jq` to filter, e.g. only battery reads:
+
+```sh
+dygmate tail --raw | jq -c 'select(.t == "reading")'
+```
+
 ## Linux setup
 
 Start `dygmate-tray` from your compositor's autostart, or enable the packaged

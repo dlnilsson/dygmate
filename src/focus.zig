@@ -15,6 +15,25 @@ pub const Error = error{ Timeout, ResponseTooLong, PortError, InvalidCommand };
 /// When true, every exchange is dumped to stderr (--debug).
 pub var debug = false;
 
+/// Optional wire-level observer for the debug/events channel. Set once before
+/// any request runs (the tray installs it before spawning the poll thread) and
+/// never mutated concurrently, so the read in `request` needs no atomics. Null
+/// for the CLI and for anyone who never opts in — a single nullable check per
+/// request, and requests happen every 30-120s, so this is not a hot path.
+pub var tap: ?*const fn (Tap) void = null;
+
+/// One observed Focus exchange. `resp`/`ms` are meaningful for `.rx`; `err`/`ms`
+/// for `.err`. The slices borrow the caller's buffers and are only valid for
+/// the duration of the tap call — the observer must copy anything it keeps.
+pub const Tap = struct {
+    pub const Kind = enum { tx, rx, err };
+    kind: Kind,
+    cmd: []const u8,
+    resp: []const u8 = "",
+    err: []const u8 = "",
+    ms: u64 = 0,
+};
+
 /// Per-read driver timeout: silence for this long means the device is gone.
 const read_timeout_ms = 2000;
 /// Overall deadline per request, guards against trickle input.
@@ -50,12 +69,26 @@ pub const Focus = struct {
     /// wears out the chip — this client is read-only by design.
     pub fn request(self: *Focus, cmd: []const u8, out: []u8) Error![]const u8 {
         if (!isReadOnlyCommand(cmd)) return error.InvalidCommand;
+        const start = Io.Clock.Timestamp.now(self.io, .awake);
+        if (tap) |t| t(.{ .kind = .tx, .cmd = cmd });
+        const result = self.exchange(cmd, out, start);
+        if (tap) |t| {
+            const ms = elapsedMs(self.io, start);
+            if (result) |resp|
+                t(.{ .kind = .rx, .cmd = cmd, .resp = resp, .ms = ms })
+            else |e|
+                t(.{ .kind = .err, .cmd = cmd, .err = @errorName(e), .ms = ms });
+        }
+        return result;
+    }
+
+    /// The wire exchange itself; `request` wraps it with the optional tap.
+    fn exchange(self: *Focus, cmd: []const u8, out: []u8, start: Io.Clock.Timestamp) Error![]const u8 {
         self.scanner.reset();
         self.writeAllPort(cmd) catch return error.PortError;
         self.writeAllPort("\n") catch return error.PortError;
 
         var out_len: usize = 0;
-        const start = Io.Clock.Timestamp.now(self.io, .awake);
 
         while (true) {
             while (self.scanner.nextLine()) |line| {
@@ -114,6 +147,11 @@ pub const Focus = struct {
         }
     }
 };
+
+fn elapsedMs(io: Io, start: Io.Clock.Timestamp) u64 {
+    const elapsed = start.durationTo(Io.Clock.Timestamp.now(io, .awake));
+    return @intCast(@divTrunc(elapsed.raw.nanoseconds, std.time.ns_per_ms));
+}
 
 pub fn isReadOnlyCommand(cmd: []const u8) bool {
     return std.mem.eql(u8, cmd, "wireless.battery.left.level") or

@@ -5,6 +5,7 @@ const focus = @import("focus.zig");
 const battery = @import("battery.zig");
 const device = @import("device.zig");
 const porthint = @import("porthint.zig");
+const tail = @import("tail.zig");
 
 const rescan_delay_s = 3;
 // Bazecor polls at 5s continuously; bare reads only touch the USB-powered
@@ -27,6 +28,13 @@ const usage =
     \\  --version          Print version and exit.
     \\  -h, --help         Show this help.
     \\
+    \\Commands:
+    \\  tail [--all] [--raw]
+    \\                     Stream the running tray's debug events (Focus wire
+    \\                     traffic, Acceptor verdicts, state changes). Hides the
+    \\                     250ms layer poll unless --all; --raw emits NDJSON for
+    \\                     piping to jq.
+    \\
 ;
 
 const Options = struct {
@@ -40,6 +48,23 @@ pub fn main(init: std.process.Init) !u8 {
     const alloc = init.gpa;
 
     const args = try init.minimal.args.toSlice(init.arena.allocator());
+
+    // Subcommand: `dygmate tail` streams the running tray's debug events feed.
+    // A read-only client of the events socket — no serial port involved.
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "tail")) {
+        var topts = tail.Options{};
+        for (args[2..]) |arg| {
+            if (std.mem.eql(u8, arg, "--raw")) {
+                topts.raw = true;
+            } else if (std.mem.eql(u8, arg, "--all")) {
+                topts.all = true;
+            } else {
+                std.debug.print("{s}", .{usage});
+                return 2;
+            }
+        }
+        return tail.run(io, alloc, init.environ_map, topts);
+    }
 
     var stdout_buf: [256]u8 = undefined;
     var stdout_file = std.Io.File.stdout();
@@ -218,4 +243,5 @@ test {
     _ = @import("porthint.zig");
     _ = @import("config.zig");
     _ = @import("statusserver.zig");
+    _ = @import("tail.zig");
 }

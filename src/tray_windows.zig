@@ -634,17 +634,20 @@ pub fn main(init: std.process.Init) void {
     g_nid.uFlags = NIF_TIP | NIF_SHOWTIP;
     _ = Shell_NotifyIconW(NIM_MODIFY, &g_nid);
 
+    // Battery status IPC for external status bars (\\.\pipe\dygmate) plus the
+    // debug events feed. Started before the poll thread so the Focus wire-tap
+    // and emit io are visible to it via the spawn happens-before barrier.
+    statusserver.start(init.io, init.gpa, .{});
+
     var ctx = PollCtx{ .io = init.io, .gpa = init.gpa, .hwnd = hwnd, .state = &g_state };
     const thread = std.Thread.spawn(.{}, pollLoop, .{&ctx}) catch {
+        statusserver.stop();
         _ = Shell_NotifyIconW(NIM_DELETE, &g_nid);
         return;
     };
 
     // One-shot GitHub update check on its own thread + isolated io.
     update.spawnCheck(init.gpa, build_options.version, &g_update);
-
-    // Battery status IPC for external status bars (\\.\pipe\dygmate).
-    statusserver.start(init.gpa, .{});
 
     var msg: MSG = undefined;
     while (GetMessageW(&msg, null, 0, 0) > 0) {
