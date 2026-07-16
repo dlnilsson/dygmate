@@ -15,6 +15,38 @@ switch layers.
 
 ## Install
 
+### Windows
+
+Until dygmate is on winget, paste this in PowerShell — it downloads the latest
+release, verifies it against `SHA256SUMS.txt`, and installs to
+`%LOCALAPPDATA%\Programs\dygmate`.
+
+Download, verify, and extract:
+
+```powershell
+$d="$env:LOCALAPPDATA\Programs\dygmate"; New-Item -Force -ItemType Directory $d | Out-Null
+$rel=curl.exe -s https://api.github.com/repos/dlnilsson/dygmate/releases/latest | ConvertFrom-Json
+curl.exe -sL -o "$env:TEMP\dygmate.zip" $rel.assets.Where({$_.name -like '*windows-x86_64.zip'}).browser_download_url
+$sums=curl.exe -sL $rel.assets.Where({$_.name -eq 'SHA256SUMS.txt'}).browser_download_url
+if ((Get-FileHash "$env:TEMP\dygmate.zip").Hash -notin ($sums -split '\s+')) { throw 'SHA256 mismatch' }
+tar.exe -xf "$env:TEMP\dygmate.zip" -C $d
+```
+
+To update to the latest release later, just re-run this block.
+
+Add it to your user `PATH`:
+
+```powershell
+if (([Environment]::GetEnvironmentVariable('Path','User') -split ';') -notcontains $d) { [Environment]::SetEnvironmentVariable('Path', "$([Environment]::GetEnvironmentVariable('Path','User'));$d", 'User') }
+```
+
+Create a Startup shortcut and launch the tray:
+
+```powershell
+$s=(New-Object -ComObject WScript.Shell).CreateShortcut("$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup\dygmate-tray.lnk"); $s.TargetPath="$d\dygmate-tray.exe"; $s.Save()
+Start-Process "$d\dygmate-tray.exe"
+```
+
 ### Linux
 
 #### AUR
