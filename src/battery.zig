@@ -102,14 +102,30 @@ fn readStatus(f: *focus.Focus, cmd: []const u8, buf: []u8) Status {
 /// sides' RF link. Mirrors battery.Read in the Go tray; forceRead is a manual,
 /// user-triggered action only (see forceRead below).
 pub fn read(f: *focus.Focus) focus.Error!Reading {
-    const r = try readAll(f);
-    if (r.left.status != .disconnected and r.right.status != .disconnected) return r;
+    const first = try readAll(f);
+    if (first.left.status != .disconnected and first.right.status != .disconnected) return first;
     sleepMs(f.io, 500);
     // A transport error mid-retry poisons the stream: the abandoned command's
     // response arrives later and answers the NEXT command, shifting every
     // response after it by one (a status "2" then parses as a 2% level).
     // Propagate so the caller reconnects — reopening flushes the port.
-    return readAll(f);
+    const second = try readAll(f);
+    return .{
+        .left = mergeRetrySide(first.left, second.left),
+        .right = mergeRetrySide(first.right, second.right),
+    };
+}
+
+/// Merge one side across the disconnect-retry pair. The retry exists to catch
+/// a momentary RF drop that recovered (its fresh fields win), but its answers
+/// are often empty — an empty retry field must not erase the first read's
+/// explicit "4", or the Acceptor never learns the side is disconnected and
+/// accepts the stale cached level that "4" just exposed.
+fn mergeRetrySide(first: SideReading, second: SideReading) SideReading {
+    return .{
+        .level = second.level orelse first.level,
+        .status = if (second.status == .unknown) first.status else second.status,
+    };
 }
 
 /// Ask the neuron to re-poll both sides over RF (Bazecor's "Force read"
@@ -132,10 +148,14 @@ fn sleepMs(io: std.Io, ms: u64) void {
 }
 
 /// Plausibility gate for battery levels. While a half is asleep or out of RF
-/// contact the neuron persistently serves a bogus cached 100% with status
-/// "disconnected" on every plain read — not transiently, but until the half
-/// actually wakes — so a disconnected side's level is never evidence of
-/// anything and is ignored outright. Around sleep/wake transitions the
+/// contact the neuron persistently serves a bogus cached 100% on every plain
+/// read — not transiently, but until the half actually wakes — so a
+/// disconnected side's level is never evidence of anything and is ignored
+/// outright. The "disconnected" status itself only peeks through on some of
+/// those reads (most carry an empty status), so an explicit "4" also latches
+/// the side (`SideState.disconnected`), drops its pending streak (any level
+/// repetition around a disconnect is cache repetition), and keeps
+/// unknown-status levels distrusted until an explicit live status returns. Around sleep/wake transitions the
 /// neuron also transiently serves 0 (its unpopulated cache value; Bazecor
 /// refuses to render 0% for the same reason) and FOCUS_API documents status
 /// fault as "faulty or has some reading error", i.e. the level may be
@@ -166,6 +186,14 @@ pub const Acceptor = struct {
         /// untrustworthy, so any out-of-tolerance value needs authoritative
         /// verification. Cleared by any accepted level.
         wake_guard: bool = false,
+        /// Set by an explicit "disconnected" status (4): the side is out of
+        /// RF contact and the neuron serves a stale cached level for it on
+        /// every read — usually with an EMPTY status, so the disconnect is
+        /// only visible on the occasional read where the "4" peeks through.
+        /// While set, a level arriving with an unknown status is the same
+        /// stale cache and is ignored like a disconnected one. Cleared by
+        /// any explicit live status (discharging/charging/charged).
+        disconnected: bool = false,
     };
 
     /// Invariant: `reading` only carries accepted levels, so an unverified
@@ -251,17 +279,35 @@ pub const Acceptor = struct {
     }
 
     fn feedSide(st: *SideState, raw: SideReading) SideReading {
+        switch (raw.status) {
+            // An explicit "4": the side is out of RF contact, so its level is
+            // the neuron's stale cache — and so were any recent levels that
+            // arrived with an empty status. Drop the pending streak (cache
+            // repetition must never confirm) and latch the side disconnected
+            // until an explicit live status proves it back.
+            .disconnected => {
+                st.disconnected = true;
+                st.pending = null;
+                st.pending_count = 0;
+                return .{ .level = st.accepted, .status = raw.status };
+            },
+            // Any explicit live status is proof the side answers again.
+            .discharging, .charging, .charged => st.disconnected = false,
+            .fault, .unknown => {},
+        }
         // A sleeping half answers with an empty payload; that's routine, not
         // evidence for or against a pending suspect — keep the streak.
         const lvl = raw.level orelse
             return .{ .level = st.accepted, .status = raw.status };
-        // A disconnected side's level is the neuron's stale cache (the bogus
-        // post-wake 100 is served persistently in this state, so repetition
-        // would "confirm" it) — ignore it exactly like an empty payload: no
-        // accept, no baseline, no streak advance. Fault means "faulty or has
-        // some reading error" (FOCUS_API), so its level gets the same
-        // treatment.
-        if (raw.status == .disconnected or raw.status == .fault)
+        // Fault means "faulty or has some reading error" (FOCUS_API), so its
+        // level may be garbage — ignore it exactly like an empty payload: no
+        // accept, no baseline, no streak advance.
+        if (raw.status == .fault)
+            return .{ .level = st.accepted, .status = raw.status };
+        // While disconnect-latched, a level with an empty status is the same
+        // stale cache the explicit "4" just exposed (the neuron serves it
+        // persistently, mostly WITHOUT the status) — ignore it likewise.
+        if (raw.status == .unknown and st.disconnected)
             return .{ .level = st.accepted, .status = raw.status };
         if (raw.status == .charging or raw.status == .charged)
             return acceptSide(st, raw);
@@ -295,7 +341,24 @@ pub const Acceptor = struct {
     }
 
     fn acceptAuthoritativeSide(st: *SideState, raw: SideReading) SideReading {
-        if (raw.status == .disconnected or raw.status == .fault)
+        switch (raw.status) {
+            // The re-poll did NOT reach this side: same as the plain-read
+            // path — its level is stale cache, and the pending streak that
+            // asked for this verification was built on that cache too.
+            .disconnected => {
+                st.disconnected = true;
+                st.pending = null;
+                st.pending_count = 0;
+                return .{ .level = st.accepted, .status = raw.status };
+            },
+            .discharging, .charging, .charged => st.disconnected = false,
+            .fault, .unknown => {},
+        }
+        if (raw.status == .fault)
+            return .{ .level = st.accepted, .status = raw.status };
+        // Latched with no status: the re-poll gave no proof the side is back,
+        // so its level is not ground truth — hold like the plain-read path.
+        if (raw.status == .unknown and st.disconnected)
             return .{ .level = st.accepted, .status = raw.status };
         // forceRead briefly blanks the neuron's cache, so even a post-refresh
         // 0 is "no data yet" rather than ground truth — unless the side says
@@ -586,17 +649,60 @@ test "Acceptor: disconnected reading establishes no baseline" {
     try std.testing.expect(!res.suspect);
 }
 
-test "Acceptor: disconnected polls keep the pending streak alive" {
+test "Acceptor: an explicit disconnect resets the pending streak" {
     var a: Acceptor = .{};
     _ = feedLeft(&a, 45, .discharging);
-    _ = feedLeft(&a, 100, .discharging);
+    _ = feedLeft(&a, 100, .discharging); // pending 100, count 1
+    _ = feedLeft(&a, 100, .discharging); // count 2 — one short of confirming
+    // A "4" reveals those 100s as disconnect cache: the streak is dropped,
+    // so the next sighting cannot be the confirming third.
     var res = feedLeft(&a, 100, .disconnected);
     try std.testing.expectEqual(@as(?u8, 45), res.reading.left.level);
-    try std.testing.expect(res.suspect);
+    try std.testing.expect(!res.suspect);
+    // Live-status sightings restart the streak from scratch.
     _ = feedLeft(&a, 100, .discharging);
     res = feedLeft(&a, 100, .discharging);
+    try std.testing.expectEqual(@as(?u8, 45), res.reading.left.level);
+    try std.testing.expect(res.suspect);
+    res = feedLeft(&a, 100, .discharging); // third consecutive live sighting
     try std.testing.expectEqual(@as(?u8, 100), res.reading.left.level);
     try std.testing.expect(!res.suspect);
+}
+
+test "Acceptor: after a disconnect, unknown-status levels are distrusted" {
+    // The tail-log failure mode: the neuron reports "4" once, then keeps
+    // serving the bogus cached 100 with an EMPTY status on later polls —
+    // repetition of that cache must never confirm it.
+    var a: Acceptor = .{};
+    _ = feedLeft(&a, 40, .discharging);
+    _ = feedLeft(&a, 100, .disconnected);
+    for (0..5) |_| {
+        const res = feedLeft(&a, 100, .unknown);
+        try std.testing.expectEqual(@as(?u8, 40), res.reading.left.level);
+        try std.testing.expect(!res.suspect);
+    }
+    // An explicit live status clears the latch; normal gating resumes.
+    const res = feedLeft(&a, 39, .discharging);
+    try std.testing.expectEqual(@as(?u8, 39), res.reading.left.level);
+    try std.testing.expect(!res.suspect);
+}
+
+test "Acceptor: read-retry merge keeps the first read's disconnect evidence" {
+    // The 500ms retry often answers with all-empty fields; the merged reading
+    // must still carry the first attempt's "4" (and its level for context).
+    const merged = mergeRetrySide(
+        side(100, .disconnected),
+        side(null, .unknown),
+    );
+    try std.testing.expectEqual(@as(?u8, 100), merged.level);
+    try std.testing.expectEqual(Status.disconnected, merged.status);
+    // A retry that recovered wins with its fresh fields.
+    const recovered = mergeRetrySide(
+        side(100, .disconnected),
+        side(42, .discharging),
+    );
+    try std.testing.expectEqual(@as(?u8, 42), recovered.level);
+    try std.testing.expectEqual(Status.discharging, recovered.status);
 }
 
 test "Acceptor: feedAuthoritative holds a disconnected side's cached level" {
@@ -808,7 +914,6 @@ test "Acceptor: held authoritative answers keep verification pending" {
     _ = feedLeft(&a, 15, .discharging);
     const held = [_]SideReading{
         side(null, .unknown),
-        side(100, .disconnected),
         side(3, .fault),
         side(0, .discharging),
     };
@@ -817,6 +922,28 @@ test "Acceptor: held authoritative answers keep verification pending" {
         try std.testing.expectEqual(@as(?u8, 90), res.reading.left.level);
         try std.testing.expect(res.needs_verification[0]);
     }
+}
+
+test "Acceptor: an authoritative disconnect settles verification by dropping the pending value" {
+    // The re-poll proved the side unreachable: the pending low was disconnect
+    // cache, not evidence — verification must stop (retrying forceRead at an
+    // absent half only hammers RF) and the held value must never display.
+    var a: Acceptor = .{};
+    _ = feedLeft(&a, 90, .discharging);
+    _ = feedLeft(&a, 15, .discharging);
+    const res = a.feedAuthoritative(.{
+        .left = side(100, .disconnected),
+        .right = side(null, .unknown),
+    });
+    try std.testing.expectEqual(@as(?u8, 90), res.reading.left.level);
+    try std.testing.expectEqual(Status.disconnected, res.reading.left.status);
+    try std.testing.expect(!res.anyVerification());
+    // Latched: the post-refresh cache echo with an empty status stays held.
+    const echo = a.feedAuthoritative(.{
+        .left = side(100, .unknown),
+        .right = side(null, .unknown),
+    });
+    try std.testing.expectEqual(@as(?u8, 90), echo.reading.left.level);
 }
 
 test "Acceptor: noteWake clears the pending streak and guards the sides" {
