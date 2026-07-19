@@ -170,11 +170,14 @@ pub const LineScanner = struct {
     len: usize = 0,
     scan: usize = 0,
 
-    /// Next complete line, without its '\n' and with any trailing '\r'
-    /// trimmed (tolerates both "\r\n" and bare "\n"). Null = need more data.
+    /// Next complete line, without its '\n' and with trailing whitespace
+    /// trimmed (tolerates both "\r\n" and bare "\n"). The firmware pads some
+    /// responses with a trailing space ("40 \r\n"); trimming it here keeps the
+    /// raw `resp` in the debug feed clean and lets the "." terminator match a
+    /// padded ". ". Null = need more data.
     pub fn nextLine(self: *LineScanner) ?[]const u8 {
         const nl = std.mem.indexOfScalarPos(u8, self.buf[0..self.len], self.scan, '\n') orelse return null;
-        const line = std.mem.trimEnd(u8, self.buf[self.scan..nl], "\r");
+        const line = std.mem.trimEnd(u8, self.buf[self.scan..nl], " \t\r");
         self.scan = nl + 1;
         return line;
     }
@@ -272,6 +275,15 @@ test "scanner: data split across reads" {
     push(&s, "\n.\r\n");
     try std.testing.expectEqualStrings("87", s.nextLine().?);
     try std.testing.expectEqualStrings(".", s.nextLine().?);
+}
+
+test "scanner: trims firmware trailing-space padding" {
+    var s = LineScanner{};
+    push(&s, "40 \r\n. \r\n");
+    try std.testing.expectEqualStrings("40", s.nextLine().?);
+    // A padded terminator still reads as "." for the exchange loop's match.
+    try std.testing.expectEqualStrings(".", s.nextLine().?);
+    try std.testing.expectEqual(null, s.nextLine());
 }
 
 test "scanner: bare newlines and empty payload" {
