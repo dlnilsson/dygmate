@@ -112,13 +112,12 @@ socat -u UNIX-CONNECT:$XDG_RUNTIME_DIR/dygmate/status.sock -
 lower of the visible sides (what the tray icon shows, `null`/`"--"` before the
 first reading); `sides` is 1 on the Sonsei; a side awaiting verification after
 wake reports `level: null` and `"?% (...)"`. When every battery-reporting side
-is `disconnected` while `connected` (RF link down — an empty `.status` response
-counts as disconnected too), each side keeps its last-known level but the
-aggregate `level`/`text` reads `null`/`"?"`, matching the tray icon's `?`; the
-stale per-side number is no longer surfaced as the headline. On disconnect at
-the USB level the last-known levels stay, marked `"connected": false`. The
-endpoint disappears when the tray exits, so a missing read means "tray not
-running".
+is explicitly `disconnected` (firmware status `4`) while `connected`, each side
+keeps its last-known level but the aggregate `level`/`text` reads `null`/`"?"`,
+matching the tray icon's `?`; the stale per-side number is no longer surfaced as
+the headline. On disconnect at the USB level the last-known levels stay, marked
+`"connected": false`. The endpoint disappears when the tray exits, so a missing
+read means "tray not running".
 
 Readings come from the tray's plausibility-gated pipeline — the same numbers
 the tray shows — and reading the pipe never touches the keyboard's serial

@@ -63,6 +63,16 @@ pub const Focus = struct {
         self.port.close(self.io);
     }
 
+    /// Drop any buffered/late RX data and reset the line scanner. Used when an
+    /// optional read (battery status) is abandoned on error and we keep the
+    /// connection instead of reconnecting: it clears the abandoned command's
+    /// pending response so it can't answer — and desync — the next exchange.
+    /// Best-effort; a flush failure is ignored.
+    pub fn flushInput(self: *Focus) void {
+        serial.flushSerialPort(self.port, .input) catch {};
+        self.scanner.reset();
+    }
+
     /// Send a bare Focus command and return its payload (lines joined by
     /// '\n', written into `out`). Only argument-less commands are allowed:
     /// `<command> <data>` is a setter that writes the keyboard's flash and

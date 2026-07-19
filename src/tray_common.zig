@@ -179,21 +179,21 @@ pub fn tooltipHeader(status: DeviceStatus, paused: bool) []const u8 {
 // ---------------------------------------------------------------------------
 // Last-known-good per-side snapshot (UI thread only).
 // ---------------------------------------------------------------------------
-/// The wireless halves sleep and report a null level between polls; rather
-/// than show "?%", we keep the last real level for each field independently.
-/// `level == null` / `status == .unknown` means that field has never reported
-/// yet. An empty status response is a real state — the RF link is down — so it
-/// parses to `.disconnected` (see battery.parseStatus), not `.unknown`.
+/// The wireless halves sleep and report a null level between polls, and the
+/// neuron intermittently returns an empty payload for a field even while
+/// connected; rather than show "?%", we keep the last real value for each
+/// field independently. `level == null` / `status == .unknown` means that field
+/// has no fresh value (never reported yet, or a transient empty read).
 pub const LastKnown = struct {
     left: battery.SideReading = .{ .level = null, .status = .unknown },
     right: battery.SideReading = .{ .level = null, .status = .unknown },
 
     /// Merge a live reading, keeping each field's last real value: a sleeping
     /// half often answers one field (e.g. level=100) while the other's status
-    /// reads back `.unknown` (unparseable/never-reported); skipping `.unknown`
-    /// avoids clobbering a real "charging" with "?". A `.disconnected` status
-    /// (explicit "4" or an empty response) is a genuine state change and does
-    /// merge — that's what drives the "?" icon once both sides are down.
+    /// reads back `.unknown` (empty/unparseable/never-reported); skipping
+    /// `.unknown` avoids clobbering a real "charging" with "?". Only an explicit
+    /// `.disconnected` status (firmware code "4") merges — that's what drives
+    /// the "?" icon once both sides are down.
     pub fn merge(self: *LastKnown, r: battery.Reading) void {
         if (r.left.level != null) self.left.level = r.left.level;
         if (r.left.status != .unknown) self.left.status = r.left.status;
@@ -263,7 +263,10 @@ fn hiddenSidesMode(unverified: [2]bool, mode: UnverifiedDisplay) [2]bool {
 // ---------------------------------------------------------------------------
 /// Menu form of a last-known side snapshot: "{d}% (Status)" with a capitalized
 /// status word to match the menu styling; "no reading yet" if never reported;
-/// an unverified side renders per `unverified_display`.
+/// an unverified side renders per `unverified_display`. When the level is known
+/// but the status isn't (the neuron often answers the level and leaves the
+/// status empty), the status suffix is dropped entirely — "{d}%" — rather than
+/// showing a meaningless "(?)".
 pub fn fmtMenuSide(buf: []u8, s: battery.SideReading, unverified: bool) []const u8 {
     return fmtMenuSideMode(buf, s, unverified, unverified_display);
 }
@@ -271,6 +274,9 @@ pub fn fmtMenuSide(buf: []u8, s: battery.SideReading, unverified: bool) []const 
 fn fmtMenuSideMode(buf: []u8, s: battery.SideReading, unverified: bool, mode: UnverifiedDisplay) []const u8 {
     if (unverified and mode == .na) return "verifying…";
     const lvl = s.level orelse return "no reading yet";
+    const marker: []const u8 = if (unverified) "?" else "";
+    if (s.status == .unknown)
+        return std.fmt.bufPrint(buf, "{d}%{s}", .{ lvl, marker }) catch buf[0..0];
     const word = s.status.label();
     var cap: [16]u8 = undefined;
     const w = if (word.len > 0 and word.len <= cap.len) blk: {
@@ -278,17 +284,20 @@ fn fmtMenuSideMode(buf: []u8, s: battery.SideReading, unverified: bool, mode: Un
         cap[0] = std.ascii.toUpper(word[0]);
         break :blk cap[0..word.len];
     } else word;
-    if (unverified)
-        return std.fmt.bufPrint(buf, "{d}%? ({s})", .{ lvl, w }) catch buf[0..0];
-    return std.fmt.bufPrint(buf, "{d}% ({s})", .{ lvl, w }) catch buf[0..0];
+    return std.fmt.bufPrint(buf, "{d}%{s} ({s})", .{ lvl, marker, w }) catch buf[0..0];
 }
 
 /// Tooltip/CLI form: "{d}% (status)" with a lowercase status word; "?%" if the
-/// side has no level yet.
+/// side has no level yet. A known level with an unknown status drops the suffix
+/// ("{d}%") — the neuron frequently returns a level with an empty status.
 pub fn fmtSide(buf: []u8, s: battery.SideReading) []const u8 {
     if (s.level) |lvl| {
+        if (s.status == .unknown)
+            return std.fmt.bufPrint(buf, "{d}%", .{lvl}) catch buf[0..0];
         return std.fmt.bufPrint(buf, "{d}% ({s})", .{ lvl, s.status.label() }) catch buf[0..0];
     }
+    // No level at all: keep the "?% (status)" form — this is the "no data"
+    // path, distinct from "level known, status empty".
     return std.fmt.bufPrint(buf, "?% ({s})", .{s.status.label()}) catch buf[0..0];
 }
 
@@ -303,9 +312,11 @@ fn fmtKnownSideMode(buf: []u8, s: battery.SideReading, unverified: bool, mode: U
     if (unverified and mode == .na)
         return std.fmt.bufPrint(buf, "?% ({s})", .{s.status.label()}) catch buf[0..0];
     if (s.level) |lvl| {
-        if (unverified)
-            return std.fmt.bufPrint(buf, "{d}%? ({s})", .{ lvl, s.status.label() }) catch buf[0..0];
-        return std.fmt.bufPrint(buf, "{d}% ({s})", .{ lvl, s.status.label() }) catch buf[0..0];
+        const marker: []const u8 = if (unverified) "?" else "";
+        // Level without a status (empty status response) drops the suffix.
+        if (s.status == .unknown)
+            return std.fmt.bufPrint(buf, "{d}%{s}", .{ lvl, marker }) catch buf[0..0];
+        return std.fmt.bufPrint(buf, "{d}%{s} ({s})", .{ lvl, marker, s.status.label() }) catch buf[0..0];
     }
     return "no reading yet";
 }
@@ -1012,7 +1023,7 @@ test "LastKnown.allSidesDisconnected: both reporting sides down" {
     known.merge(reading(80, .disconnected, 75, .discharging));
     try std.testing.expect(!known.allSidesDisconnected(.defy_wireless));
     try std.testing.expect(!known.allSidesDisconnected(null));
-    // Both down (empty status parses to .disconnected too): "?" territory.
+    // Both explicitly disconnected (firmware code "4"): "?" territory.
     known.merge(reading(80, .disconnected, 75, .disconnected));
     try std.testing.expect(known.allSidesDisconnected(.defy_wireless));
     try std.testing.expect(known.allSidesDisconnected(null));
@@ -1048,6 +1059,24 @@ test "fmt helpers render unverified sides per display mode" {
     try std.testing.expectEqualStrings("verifying…", fmtMenuSideMode(&buf, s, true, .na));
     try std.testing.expectEqualStrings("87%? (Discharging)", fmtMenuSideMode(&buf, s, true, .last_known));
     try std.testing.expectEqualStrings("87% (Discharging)", fmtMenuSideMode(&buf, s, false, .na));
+}
+
+test "fmt helpers drop the status suffix when the level is known but status isn't" {
+    var buf: [48]u8 = undefined;
+    // The neuron often answers the level and leaves the status empty
+    // (parsed as .unknown): show just "{d}%", never "{d}% (?)".
+    const s: battery.SideReading = .{ .level = 40, .status = .unknown };
+    try std.testing.expectEqualStrings("40%", fmtSide(&buf, s));
+    try std.testing.expectEqualStrings("40%", fmtKnownSideMode(&buf, s, false, .na));
+    try std.testing.expectEqualStrings("40%", fmtMenuSideMode(&buf, s, false, .na));
+    // Unverified still carries its "?" marker, just without the status suffix.
+    try std.testing.expectEqualStrings("40%?", fmtKnownSideMode(&buf, s, true, .last_known));
+    try std.testing.expectEqualStrings("40%?", fmtMenuSideMode(&buf, s, true, .last_known));
+    // A known status is unaffected.
+    const known: battery.SideReading = .{ .level = 40, .status = .discharging };
+    try std.testing.expectEqualStrings("40% (discharging)", fmtSide(&buf, known));
+    // No level at all keeps the "?% (status)" no-data form.
+    try std.testing.expectEqualStrings("?% (?)", fmtSide(&buf, .{ .level = null, .status = .unknown }));
 }
 
 test "tooltipHeader keeps paused wording and missing wording distinct" {

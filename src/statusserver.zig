@@ -630,10 +630,11 @@ fn render(out: []u8, s: Snapshot) []const u8 {
     const left = displaySide(&lbuf, s.left, s.hide[0]);
     const right = displaySide(&rbuf, s.right, s.hide[1]);
 
-    // Both battery-reporting halves out of RF contact while connected: their
-    // last-known levels are stale cache, so the aggregate reads "?" like the
-    // tray icon (each side still shows its own last-known value below). Gated
-    // on `connected` so paused/available keep showing the last-known number.
+    // Both battery-reporting halves explicitly disconnected (firmware code "4")
+    // while connected: their last-known levels are stale cache, so the aggregate
+    // reads "?" like the tray icon (each side still shows its own last-known
+    // value below). Gated on `connected` so paused/available keep showing the
+    // last-known number.
     const all_disconnected = s.state == .connected and
         s.left.status == .disconnected and
         (sides < 2 or s.right.status == .disconnected);
@@ -674,16 +675,17 @@ fn render(out: []u8, s: Snapshot) []const u8 {
 /// Per-side JSON view: "{d}% (status)" like tray_common.fmtSide (duplicated
 /// here — importing tray_common would be an import cycle); a hidden
 /// (unverified) side renders as if it had no level, mirroring the tray's
-/// "?" display.
+/// "?" display. A known level with an unknown status (the neuron often answers
+/// the level and leaves the status empty) drops the suffix — "{d}%".
 fn displaySide(buf: []u8, s: battery.SideReading, hidden: bool) Side {
     const word = s.status.label();
     if (!hidden) {
         if (s.level) |lvl| {
-            return .{
-                .level = lvl,
-                .status = word,
-                .text = std.fmt.bufPrint(buf, "{d}% ({s})", .{ lvl, word }) catch "?",
-            };
+            const text = if (s.status == .unknown)
+                std.fmt.bufPrint(buf, "{d}%", .{lvl}) catch "?"
+            else
+                std.fmt.bufPrint(buf, "{d}% ({s})", .{ lvl, word }) catch "?";
+            return .{ .level = lvl, .status = word, .text = text };
         }
     }
     return .{
@@ -918,6 +920,18 @@ test "render: both sides disconnected while connected reads '?' aggregate" {
     // Each side still carries its own last-known value.
     try std.testing.expect(std.mem.indexOf(u8, out, "\"left\":{\"level\":80,\"status\":\"disconnected\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"right\":{\"level\":75,\"status\":\"disconnected\"") != null);
+}
+
+test "render: a level with an empty status drops the '(?)' suffix" {
+    var buf: [json_cap]u8 = undefined;
+    const out = render(&buf, .{
+        .state = .connected,
+        .model = .defy_wireless,
+        .left = side(40, .unknown), // level known, status empty
+        .right = side(50, .discharging),
+    });
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"left\":{\"level\":40,\"status\":\"?\",\"text\":\"40%\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"right\":{\"level\":50,\"status\":\"discharging\",\"text\":\"50% (discharging)\"}") != null);
 }
 
 test "render: one side disconnected keeps the other's level" {

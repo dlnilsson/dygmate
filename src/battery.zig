@@ -60,22 +60,38 @@ pub const force_read_settle_s: u64 = 4;
 /// immediately, each further attempt waits the next entry (last repeats).
 pub const verify_backoff_s = [_]u64{ 5, 15, 45, 120 };
 
-/// Issue the four battery read commands. Parse failures degrade to
-/// null/.unknown; only transport errors propagate (they mean the
-/// connection is gone and the caller should reconnect). Reads the neuron's
-/// cached values — callers should use `read` for the disconnected-side retry.
+/// Issue the four battery read commands. The per-side level is the payload we
+/// need: a parse failure degrades to null, and a transport error propagates
+/// (the connection is gone — the caller reconnects, which flushes a desynced
+/// port). The status is optional/nice-to-have: it is read best-effort AFTER
+/// both levels (see `readStatus`), so a slow or failing status can never drop
+/// or delay a level in the same cycle. Reads the neuron's cached values —
+/// callers should use `read` for the disconnected-side retry.
 pub fn readAll(f: *focus.Focus) focus.Error!Reading {
     var buf: [256]u8 = undefined;
+    // Both levels first (required, order matters — a status read is best-effort
+    // and must not sit between the two level reads).
+    const left_level = parseLevel(try f.request("wireless.battery.left.level", &buf));
+    const right_level = parseLevel(try f.request("wireless.battery.right.level", &buf));
     return .{
-        .left = .{
-            .level = parseLevel(try f.request("wireless.battery.left.level", &buf)),
-            .status = parseStatus(try f.request("wireless.battery.left.status", &buf)),
-        },
-        .right = .{
-            .level = parseLevel(try f.request("wireless.battery.right.level", &buf)),
-            .status = parseStatus(try f.request("wireless.battery.right.status", &buf)),
-        },
+        .left = .{ .level = left_level, .status = readStatus(f, "wireless.battery.left.status", &buf) },
+        .right = .{ .level = right_level, .status = readStatus(f, "wireless.battery.right.status", &buf) },
     };
+}
+
+/// Read one side's status best-effort. Status is optional: a transport error
+/// (timeout / port error) yields `.unknown` instead of propagating, so it
+/// never fails or blocks the whole reading. On error the port's RX buffer is
+/// flushed so the abandoned command's late response can't desync the next
+/// read; any residual mis-read is contained by the Acceptor's plausibility
+/// gate. An empty payload already parses to `.unknown` without erroring, so the
+/// common neuron false-negative costs nothing here.
+fn readStatus(f: *focus.Focus, cmd: []const u8, buf: []u8) Status {
+    const resp = f.request(cmd, buf) catch {
+        f.flushInput();
+        return .unknown;
+    };
+    return parseStatus(resp);
 }
 
 /// One poll of both halves, with Bazecor's single retry: if either side comes
@@ -351,12 +367,12 @@ pub fn parseLevel(payload: []const u8) ?u8 {
 
 pub fn parseStatus(payload: []const u8) Status {
     const t = std.mem.trim(u8, payload, " \t\r\n");
-    // An empty status response means the neuron returned nothing for this
-    // side — the RF link to the half is down, same as an explicit status 4
-    // (disconnected). This also arms the single retry in `read` (a momentary
-    // drop is re-read once before it sticks). Non-empty but unparseable
-    // garbage stays `.unknown`.
-    if (t.len == 0) return .disconnected;
+    // An empty (or otherwise unparseable) status response is `.unknown`, not a
+    // disconnect: the neuron intermittently returns nothing for a read even
+    // while both halves are connected and in use (a transient false negative /
+    // RF lag). `.unknown` is skipped by the last-known merges, so such a read
+    // holds the last real value instead of flipping the tray to "?". A genuine
+    // disconnect reports the explicit code "4".
     const v = std.fmt.parseInt(u8, t, 10) catch return .unknown;
     return switch (v) {
         0 => .discharging,
@@ -399,10 +415,12 @@ test "parseStatus trims surrounding whitespace" {
     try std.testing.expectEqual(Status.charging, parseStatus(" 1\r\n"));
 }
 
-test "parseStatus treats an empty response as disconnected" {
-    try std.testing.expectEqual(Status.disconnected, parseStatus(""));
-    try std.testing.expectEqual(Status.disconnected, parseStatus("   "));
-    try std.testing.expectEqual(Status.disconnected, parseStatus("\r\n"));
+test "parseStatus treats an empty/unparseable response as unknown" {
+    // Empty is a transient neuron false negative, not a disconnect — `.unknown`
+    // is skipped by the last-known merges, so it holds the last real value.
+    try std.testing.expectEqual(Status.unknown, parseStatus(""));
+    try std.testing.expectEqual(Status.unknown, parseStatus("   "));
+    try std.testing.expectEqual(Status.unknown, parseStatus("\r\n"));
 }
 
 test "suggestedPollIntervalSeconds: fast when suspect, unknown, or low" {
