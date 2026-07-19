@@ -179,18 +179,21 @@ pub fn tooltipHeader(status: DeviceStatus, paused: bool) []const u8 {
 // ---------------------------------------------------------------------------
 // Last-known-good per-side snapshot (UI thread only).
 // ---------------------------------------------------------------------------
-/// The wireless halves sleep and report a null level and/or empty status
-/// between polls; rather than show "?%", we keep the last real value for each
-/// field independently. `level == null` / `status == .unknown` means that
-/// field has never reported yet.
+/// The wireless halves sleep and report a null level between polls; rather
+/// than show "?%", we keep the last real level for each field independently.
+/// `level == null` / `status == .unknown` means that field has never reported
+/// yet. An empty status response is a real state — the RF link is down — so it
+/// parses to `.disconnected` (see battery.parseStatus), not `.unknown`.
 pub const LastKnown = struct {
     left: battery.SideReading = .{ .level = null, .status = .unknown },
     right: battery.SideReading = .{ .level = null, .status = .unknown },
 
     /// Merge a live reading, keeping each field's last real value: a sleeping
-    /// half often answers one field (e.g. level=100) while the other comes
-    /// back empty/unknown; clobbering a real "charging" with that "?" is the
-    /// stale-status bug we avoid here.
+    /// half often answers one field (e.g. level=100) while the other's status
+    /// reads back `.unknown` (unparseable/never-reported); skipping `.unknown`
+    /// avoids clobbering a real "charging" with "?". A `.disconnected` status
+    /// (explicit "4" or an empty response) is a genuine state change and does
+    /// merge — that's what drives the "?" icon once both sides are down.
     pub fn merge(self: *LastKnown, r: battery.Reading) void {
         if (r.left.level != null) self.left.level = r.left.level;
         if (r.left.status != .unknown) self.left.status = r.left.status;
@@ -219,6 +222,21 @@ pub const LastKnown = struct {
             }
         }
         return out;
+    }
+
+    /// True when every battery-reporting side's last-known status is
+    /// `.disconnected`: the halves are out of RF contact, so each side's
+    /// last-known level is stale cache and the icon should show "?" rather
+    /// than a misleading number. A 1-sided model (Sonsei) reports only on the
+    /// left channel, so only that side is consulted; a null model (--port
+    /// override) assumes two sides. A side that has never reported (status
+    /// `.unknown`) is not disconnected — that stays the "--"/never-reported
+    /// path.
+    pub fn allSidesDisconnected(self: LastKnown, model: ?device.Model) bool {
+        if (self.left.status != .disconnected) return false;
+        const m = model orelse return self.right.status == .disconnected;
+        if (m.sides() < 2) return true;
+        return self.right.status == .disconnected;
     }
 };
 
@@ -986,6 +1004,34 @@ test "LastKnown.display hides unverified sides" {
     // Nothing hidden: min of sides as before.
     disp = known.display(.{ false, false });
     try std.testing.expectEqual(@as(?u8, 30), disp.level);
+}
+
+test "LastKnown.allSidesDisconnected: both reporting sides down" {
+    var known = LastKnown{};
+    // One side still discharging: not all disconnected.
+    known.merge(reading(80, .disconnected, 75, .discharging));
+    try std.testing.expect(!known.allSidesDisconnected(.defy_wireless));
+    try std.testing.expect(!known.allSidesDisconnected(null));
+    // Both down (empty status parses to .disconnected too): "?" territory.
+    known.merge(reading(80, .disconnected, 75, .disconnected));
+    try std.testing.expect(known.allSidesDisconnected(.defy_wireless));
+    try std.testing.expect(known.allSidesDisconnected(null));
+}
+
+test "LastKnown.allSidesDisconnected: one-sided model consults only the left channel" {
+    var known = LastKnown{};
+    // Sonsei reports on the left channel only; right stays unknown forever.
+    known.merge(reading(80, .disconnected, null, .unknown));
+    try std.testing.expect(known.allSidesDisconnected(.sonsei));
+    // A null model assumes two sides, so the never-reported right holds it off.
+    try std.testing.expect(!known.allSidesDisconnected(null));
+}
+
+test "LastKnown.allSidesDisconnected: a never-reported side is not disconnected" {
+    var known = LastKnown{};
+    // Fresh state: nothing has reported, so this is the "--" path, not "?".
+    try std.testing.expect(!known.allSidesDisconnected(.defy_wireless));
+    try std.testing.expect(!known.allSidesDisconnected(null));
 }
 
 test "hiddenSides: only .na mode hides unverified sides" {

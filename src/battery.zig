@@ -351,6 +351,12 @@ pub fn parseLevel(payload: []const u8) ?u8 {
 
 pub fn parseStatus(payload: []const u8) Status {
     const t = std.mem.trim(u8, payload, " \t\r\n");
+    // An empty status response means the neuron returned nothing for this
+    // side — the RF link to the half is down, same as an explicit status 4
+    // (disconnected). This also arms the single retry in `read` (a momentary
+    // drop is re-read once before it sticks). Non-empty but unparseable
+    // garbage stays `.unknown`.
+    if (t.len == 0) return .disconnected;
     const v = std.fmt.parseInt(u8, t, 10) catch return .unknown;
     return switch (v) {
         0 => .discharging,
@@ -385,6 +391,18 @@ test "parseStatus maps firmware codes" {
     try std.testing.expectEqual(Status.disconnected, parseStatus("4"));
     try std.testing.expectEqual(Status.unknown, parseStatus("9"));
     try std.testing.expectEqual(Status.unknown, parseStatus("x"));
+}
+
+test "parseStatus trims surrounding whitespace" {
+    // The firmware pads some responses ("4 "); the trim keeps them mapping.
+    try std.testing.expectEqual(Status.disconnected, parseStatus("4 "));
+    try std.testing.expectEqual(Status.charging, parseStatus(" 1\r\n"));
+}
+
+test "parseStatus treats an empty response as disconnected" {
+    try std.testing.expectEqual(Status.disconnected, parseStatus(""));
+    try std.testing.expectEqual(Status.disconnected, parseStatus("   "));
+    try std.testing.expectEqual(Status.disconnected, parseStatus("\r\n"));
 }
 
 test "suggestedPollIntervalSeconds: fast when suspect, unknown, or low" {

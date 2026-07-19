@@ -630,15 +630,25 @@ fn render(out: []u8, s: Snapshot) []const u8 {
     const left = displaySide(&lbuf, s.left, s.hide[0]);
     const right = displaySide(&rbuf, s.right, s.hide[1]);
 
+    // Both battery-reporting halves out of RF contact while connected: their
+    // last-known levels are stale cache, so the aggregate reads "?" like the
+    // tray icon (each side still shows its own last-known value below). Gated
+    // on `connected` so paused/available keep showing the last-known number.
+    const all_disconnected = s.state == .connected and
+        s.left.status == .disconnected and
+        (sides < 2 or s.right.status == .disconnected);
+
     // Min over visible, battery-reporting sides — the tray icon's number.
     // A hidden side already reads null out of displaySide.
-    var level: ?u8 = left.level;
-    if (sides > 1) {
+    var level: ?u8 = if (all_disconnected) null else left.level;
+    if (!all_disconnected and sides > 1) {
         if (right.level) |rl| {
             if (level == null or rl < level.?) level = rl;
         }
     }
-    const text: []const u8 = if (level) |l|
+    const text: []const u8 = if (all_disconnected)
+        "?"
+    else if (level) |l|
         std.fmt.bufPrint(&tbuf, "{d}%", .{l}) catch "--"
     else
         "--";
@@ -891,6 +901,46 @@ test "render: disconnect keeps last-known levels with connected:false" {
     const out = render(&buf, s);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"state\":\"missing\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"connected\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"level\":75") != null);
+}
+
+test "render: both sides disconnected while connected reads '?' aggregate" {
+    var buf: [json_cap]u8 = undefined;
+    const out = render(&buf, .{
+        .state = .connected,
+        .model = .defy_wireless,
+        // Last-known levels survive per side; the aggregate goes to "?".
+        .left = side(80, .disconnected),
+        .right = side(75, .disconnected),
+    });
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"level\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"text\":\"?\"") != null);
+    // Each side still carries its own last-known value.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"left\":{\"level\":80,\"status\":\"disconnected\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"right\":{\"level\":75,\"status\":\"disconnected\"") != null);
+}
+
+test "render: one side disconnected keeps the other's level" {
+    var buf: [json_cap]u8 = undefined;
+    const out = render(&buf, .{
+        .state = .connected,
+        .model = .defy_wireless,
+        .left = side(80, .disconnected),
+        .right = side(75, .discharging),
+    });
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"level\":75") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"text\":\"75%\"") != null);
+}
+
+test "render: both disconnected but not connected keeps last-known number" {
+    var buf: [json_cap]u8 = undefined;
+    const out = render(&buf, .{
+        .state = .available,
+        .model = .defy_wireless,
+        .left = side(80, .disconnected),
+        .right = side(75, .disconnected),
+    });
+    // Paused/available surfaces keep the last-known number (gray), not "?".
     try std.testing.expect(std.mem.indexOf(u8, out, "\"level\":75") != null);
 }
 

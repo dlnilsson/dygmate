@@ -536,6 +536,10 @@ fn rebuildAndNotify(app: *App) void {
     const disp = app.last.display(tray_common.hiddenSides(unverified));
     if (!paused and status == .missing) {
         renderIcon(&app.icon_buf, "?", tray_common.palette.gray);
+    } else if (live and app.last.allSidesDisconnected(model)) {
+        // Both halves out of RF contact: their last-known levels are stale
+        // cache, so show "?" (gray) rather than a misleading number.
+        renderIcon(&app.icon_buf, "?", tray_common.palette.gray);
     } else if (disp.level) |lvl| {
         var num_buf: [4]u8 = undefined;
         const txt = std.fmt.bufPrint(&num_buf, "{d}", .{lvl}) catch "--";
