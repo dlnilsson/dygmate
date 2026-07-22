@@ -731,10 +731,10 @@ fn showMenu(hwnd: HWND) void {
     var sb: [24]u8 = undefined;
     appendMenuText(menu, MF_GRAYED, 0, conn_text);
     if (one_sided) {
-        appendMenuText(menu, MF_GRAYED, 0, std.fmt.bufPrint(&lb, "Battery: {s}", .{common.fmtMenuSide(&sb, g_last.left, g_unverified[0])}) catch "Battery: ?");
+        appendMenuText(menu, MF_GRAYED, 0, std.fmt.bufPrint(&lb, "Battery: {s}", .{common.fmtMenuSide(&sb, g_last.leftText(), g_unverified[0])}) catch "Battery: ?");
     } else {
-        appendMenuText(menu, MF_GRAYED, 0, std.fmt.bufPrint(&lb, "Left: {s}", .{common.fmtMenuSide(&sb, g_last.left, g_unverified[0])}) catch "Left: ?");
-        appendMenuText(menu, MF_GRAYED, 0, std.fmt.bufPrint(&rb, "Right: {s}", .{common.fmtMenuSide(&sb, g_last.right, g_unverified[1])}) catch "Right: ?");
+        appendMenuText(menu, MF_GRAYED, 0, std.fmt.bufPrint(&lb, "Left: {s}", .{common.fmtMenuSide(&sb, g_last.leftText(), g_unverified[0])}) catch "Left: ?");
+        appendMenuText(menu, MF_GRAYED, 0, std.fmt.bufPrint(&rb, "Right: {s}", .{common.fmtMenuSide(&sb, g_last.rightText(), g_unverified[1])}) catch "Right: ?");
     }
     _ = AppendMenuW(menu, MF_SEPARATOR, 0, null);
 
@@ -855,13 +855,13 @@ fn updateTray() void {
         const tip = if (one_sided)
             std.fmt.bufPrint(&tip_buf, "{s}Battery: {s}", .{
                 header,
-                common.fmtKnownSide(&lb, g_last.left, unverified[0]),
+                common.fmtKnownSide(&lb, g_last.leftText(), unverified[0]),
             }) catch "dygmate"
         else
             std.fmt.bufPrint(&tip_buf, "{s}Left: {s}\nRight: {s}", .{
                 header,
-                common.fmtKnownSide(&lb, g_last.left, unverified[0]),
-                common.fmtKnownSide(&rb, g_last.right, unverified[1]),
+                common.fmtKnownSide(&lb, g_last.leftText(), unverified[0]),
+                common.fmtKnownSide(&rb, g_last.rightText(), unverified[1]),
             }) catch "dygmate";
         setUtf16(g_nid.szTip[0..], tip);
     }

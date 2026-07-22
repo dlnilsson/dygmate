@@ -187,18 +187,40 @@ pub fn tooltipHeader(status: DeviceStatus, paused: bool) []const u8 {
 pub const LastKnown = struct {
     left: battery.SideReading = .{ .level = null, .status = .unknown },
     right: battery.SideReading = .{ .level = null, .status = .unknown },
+    /// Status as of the most recent merge, refreshed every call regardless of
+    /// value — unlike `left`/`right.status` above, an empty read drops this
+    /// straight to `.unknown`. Backs `leftText`/`rightText` only: the tray
+    /// menu and tooltip should never show a stale status word (e.g.
+    /// "Disconnected") sitting next to a level that's otherwise reading fine
+    /// again, the way `left`/`right.status` would (see their doc comment).
+    left_now: battery.Status = .unknown,
+    right_now: battery.Status = .unknown,
 
     /// Merge a live reading, keeping each field's last real value: a sleeping
     /// half often answers one field (e.g. level=100) while the other's status
     /// reads back `.unknown` (empty/unparseable/never-reported); skipping
     /// `.unknown` avoids clobbering a real "charging" with "?". Only an explicit
     /// `.disconnected` status (firmware code "4") merges — that's what drives
-    /// the "?" icon once both sides are down.
+    /// the "?" icon once both sides are down, and what notifications key off
+    /// of to avoid a false low-battery alert on a momentarily-empty status.
     pub fn merge(self: *LastKnown, r: battery.Reading) void {
         if (r.left.level != null) self.left.level = r.left.level;
         if (r.left.status != .unknown) self.left.status = r.left.status;
+        self.left_now = r.left.status;
         if (r.right.level != null) self.right.level = r.right.level;
         if (r.right.status != .unknown) self.right.status = r.right.status;
+        self.right_now = r.right.status;
+    }
+
+    /// Text-display snapshot for a side: the sticky last-known level paired
+    /// with the CURRENT read's status rather than the sticky one, so
+    /// `fmtMenuSide`/`fmtKnownSide` drop the "(word)" suffix the moment a
+    /// poll's status comes back empty instead of leaving an old one behind.
+    pub fn leftText(self: LastKnown) battery.SideReading {
+        return .{ .level = self.left.level, .status = self.left_now };
+    }
+    pub fn rightText(self: LastKnown) battery.SideReading {
+        return .{ .level = self.right.level, .status = self.right_now };
     }
 
     /// Lower of the two last-known side levels, with its status. `level` is
@@ -1015,6 +1037,25 @@ test "LastKnown.display hides unverified sides" {
     // Nothing hidden: min of sides as before.
     disp = known.display(.{ false, false });
     try std.testing.expectEqual(@as(?u8, 30), disp.level);
+}
+
+test "LastKnown.leftText/rightText drop a stale status once the read comes back empty" {
+    // Reproduces the tail-log failure mode: a side goes explicitly
+    // "disconnected" once, then keeps answering with a real level but an
+    // empty status on every later poll (RF-flaky, not actually down anymore).
+    var known = LastKnown{};
+    known.merge(reading(70, .disconnected, 100, .disconnected));
+    var buf: [24]u8 = undefined;
+    try std.testing.expectEqualStrings("70% (disconnected)", fmtSide(&buf, known.leftText()));
+    try std.testing.expectEqualStrings("100% (disconnected)", fmtSide(&buf, known.rightText()));
+    // A later poll answers the levels again but the status field is empty —
+    // the text view must show the bare percentage, not the stale status.
+    known.merge(reading(70, .unknown, 100, .unknown));
+    try std.testing.expectEqualStrings("70%", fmtSide(&buf, known.leftText()));
+    try std.testing.expectEqualStrings("100%", fmtSide(&buf, known.rightText()));
+    // But the sticky field (and therefore the "?" icon gate) still remembers
+    // the disconnect across that empty poll.
+    try std.testing.expect(known.allSidesDisconnected(.defy_wireless));
 }
 
 test "LastKnown.allSidesDisconnected: both reporting sides down" {

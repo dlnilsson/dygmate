@@ -554,12 +554,12 @@ fn rebuildAndNotify(app: *App) void {
     const one_sided = if (model) |m| m.sides() < 2 else false;
     const tip = if (one_sided)
         std.fmt.bufPrint(&app.tip_body, "Battery: {s}", .{
-            tray_common.fmtKnownSide(&lb, app.last.left, unverified[0]),
+            tray_common.fmtKnownSide(&lb, app.last.leftText(), unverified[0]),
         }) catch app.tip_body[0..0]
     else
         std.fmt.bufPrint(&app.tip_body, "Left: {s}\nRight: {s}", .{
-            tray_common.fmtKnownSide(&lb, app.last.left, unverified[0]),
-            tray_common.fmtKnownSide(&rb, app.last.right, unverified[1]),
+            tray_common.fmtKnownSide(&lb, app.last.leftText(), unverified[0]),
+            tray_common.fmtKnownSide(&rb, app.last.rightText(), unverified[1]),
         }) catch app.tip_body[0..0];
     app.tip_body_len = tip.len;
 
@@ -906,12 +906,12 @@ fn buildMenuItems(app: *App, buf: *[3][48]u8, out: *[11]MenuItem) []const MenuIt
     out[n] = .{ .id = .status, .label = header, .enabled = false };
     n += 1;
     if (one_sided) {
-        const battery_label: []const u8 = std.fmt.bufPrint(&buf[0], "Battery: {s}", .{tray_common.fmtMenuSide(&sb, app.last.left, app.unverified[0])}) catch "Battery: ?";
+        const battery_label: []const u8 = std.fmt.bufPrint(&buf[0], "Battery: {s}", .{tray_common.fmtMenuSide(&sb, app.last.leftText(), app.unverified[0])}) catch "Battery: ?";
         out[n] = .{ .id = .left, .label = battery_label, .enabled = false };
         n += 1;
     } else {
-        const left_label: []const u8 = std.fmt.bufPrint(&buf[0], "Left: {s}", .{tray_common.fmtMenuSide(&sb, app.last.left, app.unverified[0])}) catch "Left: ?";
-        const right_label: []const u8 = std.fmt.bufPrint(&buf[1], "Right: {s}", .{tray_common.fmtMenuSide(&sb, app.last.right, app.unverified[1])}) catch "Right: ?";
+        const left_label: []const u8 = std.fmt.bufPrint(&buf[0], "Left: {s}", .{tray_common.fmtMenuSide(&sb, app.last.leftText(), app.unverified[0])}) catch "Left: ?";
+        const right_label: []const u8 = std.fmt.bufPrint(&buf[1], "Right: {s}", .{tray_common.fmtMenuSide(&sb, app.last.rightText(), app.unverified[1])}) catch "Right: ?";
         out[n] = .{ .id = .left, .label = left_label, .enabled = false };
         n += 1;
         out[n] = .{ .id = .right, .label = right_label, .enabled = false };
