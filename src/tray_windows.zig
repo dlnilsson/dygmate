@@ -822,19 +822,26 @@ fn updateTray() void {
         const r = reading.?;
         g_last.merge(r);
 
-        // Drive notifications from the merged snapshot, not the raw reading: a
-        // charging side that momentarily reports an empty status would otherwise
-        // look ".unknown" (i.e. "not charging") and fire a false low-battery
-        // warning. The snapshot carries the last real status per side.
+        // Drive notification LOGIC from the sticky-status snapshot, not the raw
+        // reading: a charging side that momentarily reports an empty status
+        // would otherwise look ".unknown" (i.e. "not charging") and fire a
+        // false low-battery warning. The snapshot carries the last real status
+        // per side.
         const snapshot: battery.Reading = .{ .left = g_last.left, .right = g_last.right };
+        // Render the notification BODY from the fresh-status view (leftText/
+        // rightText), exactly like the menu and tooltip: the sticky status
+        // clings to an old "disconnected" long after the level reads fine
+        // again, so the body must drop that stale suffix the moment a poll's
+        // status comes back empty ("40%", not "40% (disconnected)").
+        const display: battery.Reading = .{ .left = g_last.leftText(), .right = g_last.rightText() };
         // Gate the announcement on the raw reading (fresh levels present for
-        // every battery-reporting side), but render/latch from the merged
-        // snapshot — matches the pre-refactor behavior and avoids announcing
-        // early off a stale last-known value.
+        // every battery-reporting side), but latch from the sticky snapshot —
+        // matches the pre-refactor behavior and avoids announcing early off a
+        // stale last-known value.
         const announce_ready = common.levelsKnown(model, r);
         const plan = common.planNotifications(&g_state.notified_low, announce_pending, announce_ready, snapshot, unverified);
         for (plan.events) |ev_opt| {
-            if (ev_opt) |ev| showEvent(ev, model, snapshot);
+            if (ev_opt) |ev| showEvent(ev, model, display);
         }
         if (plan.consumed_announce) {
             g_state.mutex.lockUncancelable(g_io);

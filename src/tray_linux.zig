@@ -503,18 +503,24 @@ fn rebuildAndNotify(app: *App) void {
         const r = reading.?;
         app.last.merge(r);
 
-        // Notifications run off the merged snapshot (last real per-side status),
-        // not the raw reading, so a momentarily-empty charging status can't fire
-        // a false low-battery warning. Mirrors the Windows tray.
+        // Notification LOGIC runs off the sticky-status snapshot (last real
+        // per-side status), not the raw reading, so a momentarily-empty charging
+        // status can't fire a false low-battery warning. Mirrors the Windows tray.
         const snapshot: battery.Reading = .{ .left = app.last.left, .right = app.last.right };
+        // Render the notification BODY from the fresh-status view (leftText/
+        // rightText), exactly like the menu and tooltip: the sticky status
+        // clings to an old "disconnected" long after the level reads fine again,
+        // so the body must drop that stale suffix once a poll's status comes back
+        // empty ("40%", not "40% (disconnected)").
+        const display: battery.Reading = .{ .left = app.last.leftText(), .right = app.last.rightText() };
         // Gate the announcement on the raw reading (fresh levels present for
-        // every battery-reporting side), but render/latch from the merged
-        // snapshot — a stale last-known value surviving a reconnect must not
-        // fire the announcement early.
+        // every battery-reporting side), but latch from the sticky snapshot — a
+        // stale last-known value surviving a reconnect must not fire the
+        // announcement early.
         const announce_ready = tray_common.levelsKnown(model, r);
         const plan = tray_common.planNotifications(&app.state.notified_low, announce_pending, announce_ready, snapshot, unverified);
         for (plan.events) |ev_opt| {
-            if (ev_opt) |ev| sendNotification(app, ev, snapshot);
+            if (ev_opt) |ev| sendNotification(app, ev, display);
         }
         if (plan.consumed_announce) {
             app.state.mutex.lockUncancelable(app.io);
