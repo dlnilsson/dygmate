@@ -125,12 +125,12 @@ pub fn renderIcon(out: *IconBuf, text: []const u8, color: tray_common.Rgb) void 
 /// Used in place of the number while the keyboard is on the cable (blue icon):
 /// the gauge level is unreliable there, so a battery symbol is clearer than a
 /// misleading percentage.
-pub fn renderBattery(out: *IconBuf, color: tray_common.Rgb) void {
+pub fn renderBattery(out: *IconBuf, glyph_src: []const u8, color: tray_common.Rgb) void {
     var y: usize = 0;
     while (y < icon_px) : (y += 1) {
         var x: usize = 0;
         while (x < icon_px) : (x += 1) {
-            putPixel(out, x, y, tray_common.batteryPixel(icon_px, x, y, color));
+            putPixel(out, x, y, tray_common.batteryPixel(glyph_src, icon_px, x, y, color));
         }
     }
 }
@@ -560,11 +560,14 @@ fn rebuildAndNotify(app: *App) void {
         // Both halves out of RF contact: their last-known levels are stale
         // cache, so show "?" (gray) rather than a misleading number.
         renderIcon(&app.icon_buf, "?", tray_common.palette.gray);
+    } else if (live and app.last.allSidesFull(model)) {
+        // Both sides topped off → the full 🔋 glyph, regardless of status.
+        renderBattery(&app.icon_buf, tray_common.battery_full_rgba, tray_common.iconColor(live, 100, disp.status));
     } else if (disp.level) |lvl| {
         const color = tray_common.iconColor(live, lvl, disp.status);
-        if (live and disp.status.onCable()) {
-            // On the cable: a battery glyph instead of the unreliable percentage.
-            renderBattery(&app.icon_buf, color);
+        if (live and disp.status == .charging) {
+            // Charging (and not yet full): the battery-with-bolt glyph.
+            renderBattery(&app.icon_buf, tray_common.battery_charging_rgba, color);
         } else {
             var num_buf: [4]u8 = undefined;
             const txt = std.fmt.bufPrint(&num_buf, "{d}", .{lvl}) catch "--";

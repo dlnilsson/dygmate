@@ -1,8 +1,10 @@
-//! Generates `src/assets/battery.rgba` — the anti-aliased 32x32 RGBA source for
-//! the tray's on-cable battery glyph. The tray embeds that blob (@embedFile),
-//! area-downscales it to 16/22px and alpha-composites it over the icon
-//! background, so Zig needs no PNG decoder at runtime. Re-run after changing the
-//! shape below:
+//! Generates the tray's on-cable battery glyphs as anti-aliased 32x32 RGBA:
+//!   * src/assets/battery.rgba          — solid battery (full/charged, 🔋)
+//!   * src/assets/battery_charging.rgba — same battery with a lightning-bolt
+//!                                         knockout (charging)
+//! The tray embeds these (@embedFile), area-downscales to 16/22px and
+//! alpha-composites over the icon background, so Zig needs no PNG decoder at
+//! runtime. Re-run after changing a shape below:
 //!
 //!     zig run tools/gen_battery.zig
 //!
@@ -32,8 +34,35 @@ fn inside(px: f64, py: f64) bool {
     return dx * dx + dy * dy <= r * r;
 }
 
-pub fn main() !void {
-    var pixels: [N * N * 4]u8 = undefined;
+/// Lightning-bolt polygon (source-pixel coords), knocked out of the body for
+/// the charging glyph. Point-in-polygon via ray casting.
+fn inBolt(px: f64, py: f64) bool {
+    const v = [_][2]f64{
+        .{ 14.35, 11.0 }, // top
+        .{ 11.55, 16.8 }, // mid-left
+        .{ 13.44, 16.8 },
+        .{ 12.60, 21.0 }, // bottom tip
+        .{ 16.45, 15.2 }, // upper-right
+        .{ 14.56, 15.2 },
+    };
+    var in = false;
+    var j: usize = v.len - 1;
+    var i: usize = 0;
+    while (i < v.len) : (i += 1) {
+        const yi = v[i][1];
+        const yj = v[j][1];
+        if ((yi > py) != (yj > py)) {
+            const xint = (v[j][0] - v[i][0]) * (py - yi) / (yj - yi) + v[i][0];
+            if (px < xint) in = !in;
+        }
+        j = i;
+    }
+    return in;
+}
+
+/// Rasterize the battery into `pixels` (white RGB, alpha = supersampled edge
+/// coverage). When `bolt`, the lightning polygon is knocked back out.
+fn render(pixels: *[N * N * 4]u8, bolt: bool) void {
     var y: usize = 0;
     while (y < N) : (y += 1) {
         var x: usize = 0;
@@ -45,7 +74,7 @@ pub fn main() !void {
                 while (sx < SS) : (sx += 1) {
                     const px = @as(f64, @floatFromInt(x)) + (@as(f64, @floatFromInt(sx)) + 0.5) / @as(f64, SS);
                     const py = @as(f64, @floatFromInt(y)) + (@as(f64, @floatFromInt(sy)) + 0.5) / @as(f64, SS);
-                    if (inside(px, py)) hits += 1;
+                    if (inside(px, py) and !(bolt and inBolt(px, py))) hits += 1;
                 }
             }
             const a: u8 = @intCast(hits * 255 / (SS * SS));
@@ -56,6 +85,13 @@ pub fn main() !void {
             pixels[i + 3] = a;
         }
     }
+}
+
+pub fn main() !void {
+    var full: [N * N * 4]u8 = undefined;
+    var charging: [N * N * 4]u8 = undefined;
+    render(&full, false);
+    render(&charging, true);
 
     var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer threaded.deinit();
@@ -63,8 +99,13 @@ pub fn main() !void {
 
     var dir = std.Io.Dir.cwd();
     dir.createDirPath(io, "src/assets") catch {};
-    var file = try dir.createFile(io, "src/assets/battery.rgba", .{});
+    try write(io, dir, "src/assets/battery.rgba", &full);
+    try write(io, dir, "src/assets/battery_charging.rgba", &charging);
+}
+
+fn write(io: std.Io, dir: std.Io.Dir, path: []const u8, bytes: []const u8) !void {
+    var file = try dir.createFile(io, path, .{});
     defer file.close(io);
-    try file.writePositionalAll(io, &pixels, 0);
-    std.debug.print("wrote src/assets/battery.rgba ({d} bytes)\n", .{pixels.len});
+    try file.writePositionalAll(io, bytes, 0);
+    std.debug.print("wrote {s} ({d} bytes)\n", .{ path, bytes.len });
 }

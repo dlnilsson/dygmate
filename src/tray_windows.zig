@@ -627,7 +627,7 @@ pub fn main(init: std.process.Init) void {
     g_nid.uID = 1;
     g_nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
     g_nid.uCallbackMessage = WM_TRAYICON;
-    g_nid.hIcon = makeTextIcon("?", col_gray, false);
+    g_nid.hIcon = makeTextIcon("?", col_gray, null);
     setUtf16(g_nid.szTip[0..], "No keyboard discovered - last known:\nLeft: no reading yet\nRight: no reading yet");
     _ = Shell_NotifyIconW(NIM_ADD, &g_nid);
     g_nid.uVersion = NOTIFYICON_VERSION_4;
@@ -812,7 +812,7 @@ fn updateTray() void {
     var icon_text: []const u8 = "--";
     var color: COLORREF = col_gray;
     var num_buf: [4]u8 = undefined;
-    var draw_battery = false;
+    var battery_glyph: ?[]const u8 = null;
 
     // Refresh each side's last-known snapshot from a live reading, and run the
     // notification logic. Tooltip + icon below render from the snapshots, so
@@ -885,17 +885,21 @@ fn updateTray() void {
         // Both halves out of RF contact: their last-known levels are stale
         // cache, so show "?" (gray) rather than a misleading number.
         icon_text = "?";
+    } else if (live and g_last.allSidesFull(model)) {
+        // Both sides topped off → the full 🔋 glyph, regardless of status.
+        color = toColorRef(common.iconColor(live, 100, disp.status));
+        battery_glyph = common.battery_full_rgba;
     } else if (disp.level) |lvl| {
         color = toColorRef(common.iconColor(live, lvl, disp.status));
-        if (live and disp.status.onCable()) {
-            // On the cable: a battery glyph instead of the unreliable percentage.
-            draw_battery = true;
+        if (live and disp.status == .charging) {
+            // Charging (and not yet full): the battery-with-bolt glyph.
+            battery_glyph = common.battery_charging_rgba;
         } else {
             icon_text = std.fmt.bufPrint(&num_buf, "{d}", .{lvl}) catch "?";
         }
     }
 
-    const new_icon = makeTextIcon(icon_text, color, draw_battery);
+    const new_icon = makeTextIcon(icon_text, color, battery_glyph);
     const old_icon = g_nid.hIcon;
     g_nid.hIcon = new_icon;
     g_nid.uFlags = NIF_ICON | NIF_TIP | NIF_SHOWTIP;
@@ -1044,7 +1048,7 @@ fn paintOsd(hwnd: HWND) void {
 
 /// Render `text` centered on a solid `color` 16x16 icon. Caller owns the
 /// returned HICON (DestroyIcon). Returns null on any GDI failure.
-fn makeTextIcon(text: []const u8, color: COLORREF, draw_battery: bool) ?HICON {
+fn makeTextIcon(text: []const u8, color: COLORREF, battery_glyph: ?[]const u8) ?HICON {
     const screen = GetDC(null) orelse return null;
     defer _ = ReleaseDC(null, screen);
     const mdc = CreateCompatibleDC(screen) orelse return null;
@@ -1065,7 +1069,7 @@ fn makeTextIcon(text: []const u8, color: COLORREF, draw_battery: bool) ?HICON {
         _ = DeleteObject(@ptrCast(brush));
     }
 
-    if (draw_battery) {
+    if (battery_glyph) |glyph| {
         // Composite the shared battery glyph over the background pixel-by-pixel
         // (256 px) so it matches the Linux tray exactly; GDI text can't render
         // the 🔋 emoji. COLORREF is 0x00BBGGRR — unpack it back to an Rgb.
@@ -1079,7 +1083,7 @@ fn makeTextIcon(text: []const u8, color: COLORREF, draw_battery: bool) ?HICON {
         while (yy < n) : (yy += 1) {
             var xx: usize = 0;
             while (xx < n) : (xx += 1) {
-                const px = common.batteryPixel(n, xx, yy, bg);
+                const px = common.batteryPixel(glyph, n, xx, yy, bg);
                 _ = SetPixelV(mdc, @intCast(xx), @intCast(yy), rgb(px.r, px.g, px.b));
             }
         }
