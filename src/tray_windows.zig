@@ -881,10 +881,6 @@ fn updateTray() void {
     const disp = g_last.display(common.hiddenSides(unverified));
     if (!paused and status == .missing) {
         icon_text = "?";
-    } else if (live and g_last.allSidesDisconnected(model)) {
-        // Both halves out of RF contact: their last-known levels are stale
-        // cache, so show "?" (gray) rather than a misleading number.
-        icon_text = "?";
     } else if (live and g_last.allSidesFull(model)) {
         // Both sides topped off → the full 🔋 glyph, regardless of status.
         color = toColorRef(common.iconColor(live, 100, disp.status));

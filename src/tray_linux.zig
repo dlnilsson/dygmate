@@ -556,10 +556,6 @@ fn rebuildAndNotify(app: *App) void {
     const disp = app.last.display(tray_common.hiddenSides(unverified));
     if (!paused and status == .missing) {
         renderIcon(&app.icon_buf, "?", tray_common.palette.gray);
-    } else if (live and app.last.allSidesDisconnected(model)) {
-        // Both halves out of RF contact: their last-known levels are stale
-        // cache, so show "?" (gray) rather than a misleading number.
-        renderIcon(&app.icon_buf, "?", tray_common.palette.gray);
     } else if (live and app.last.allSidesFull(model)) {
         // Both sides topped off → the full 🔋 glyph, regardless of status.
         renderBattery(&app.icon_buf, tray_common.battery_full_rgba, tray_common.iconColor(live, 100, disp.status));

@@ -307,21 +307,6 @@ pub const LastKnown = struct {
         return out;
     }
 
-    /// True when every battery-reporting side's last-known status is
-    /// `.disconnected`: the halves are out of RF contact, so each side's
-    /// last-known level is stale cache and the icon should show "?" rather
-    /// than a misleading number. A 1-sided model (Sonsei) reports only on the
-    /// left channel, so only that side is consulted; a null model (--port
-    /// override) assumes two sides. A side that has never reported (status
-    /// `.unknown`) is not disconnected — that stays the "--"/never-reported
-    /// path.
-    pub fn allSidesDisconnected(self: LastKnown, model: ?device.Model) bool {
-        if (self.left.status != .disconnected) return false;
-        const m = model orelse return self.right.status == .disconnected;
-        if (m.sides() < 2) return true;
-        return self.right.status == .disconnected;
-    }
-
     /// True when every battery-reporting side's last-known level is 100% —
     /// the trigger for the full 🔋 icon, independent of `wireless.status` (the
     /// keyboard is topped off whether or not it's still on the cable). Mirrors
@@ -357,6 +342,17 @@ fn hiddenSidesMode(unverified: [2]bool, mode: UnverifiedDisplay) [2]bool {
 // ---------------------------------------------------------------------------
 // Formatting helpers (no platform dependency).
 // ---------------------------------------------------------------------------
+/// Whether a side's status is surfaced as a "(word)" suffix next to the level.
+/// `wireless.battery.*.status` is best-effort and unreliable (FOCUS_API): only
+/// the live `discharging`/`charging` states are shown. `.unknown` (empty read),
+/// `.disconnected` (a false "4" fires even while the keyboard is actively in
+/// use) and `.fault` (reading error) are treated as no status at all — the bare
+/// last-known level is shown instead of a misleading word. `.charged` is handled
+/// separately by each formatter ("full").
+fn statusHasWord(st: battery.Status) bool {
+    return st == .discharging or st == .charging;
+}
+
 /// Menu form of a last-known side snapshot: "{d}% (Status)" with a capitalized
 /// status word to match the menu styling; "no reading yet" if never reported;
 /// an unverified side renders per `unverified_display`. When the level is known
@@ -374,7 +370,7 @@ fn fmtMenuSideMode(buf: []u8, s: battery.SideReading, unverified: bool, mode: Un
     if (unverified and mode == .na) return "verifying…";
     const lvl = s.level orelse return "no reading yet";
     const marker: []const u8 = if (unverified) "?" else "";
-    if (s.status == .unknown)
+    if (!statusHasWord(s.status))
         return std.fmt.bufPrint(buf, "{d}%{s}", .{ lvl, marker }) catch buf[0..0];
     const word = s.status.label();
     var cap: [16]u8 = undefined;
@@ -394,13 +390,14 @@ fn fmtMenuSideMode(buf: []u8, s: battery.SideReading, unverified: bool, mode: Un
 pub fn fmtSide(buf: []u8, s: battery.SideReading) []const u8 {
     if (s.status == .charged) return s.status.label();
     if (s.level) |lvl| {
-        if (s.status == .unknown)
+        if (!statusHasWord(s.status))
             return std.fmt.bufPrint(buf, "{d}%", .{lvl}) catch buf[0..0];
         return std.fmt.bufPrint(buf, "{d}% ({s})", .{ lvl, s.status.label() }) catch buf[0..0];
     }
-    // No level at all: keep the "?% (status)" form — this is the "no data"
-    // path, distinct from "level known, status empty".
-    return std.fmt.bufPrint(buf, "?% ({s})", .{s.status.label()}) catch buf[0..0];
+    // No level at all: the "no data" path. An unreliable status (disconnected/
+    // fault/empty) renders as "?" rather than a misleading word.
+    const word: []const u8 = if (statusHasWord(s.status)) s.status.label() else "?";
+    return std.fmt.bufPrint(buf, "?% ({s})", .{word}) catch buf[0..0];
 }
 
 /// Tooltip form of a last-known side snapshot: the real value if the side has
@@ -412,12 +409,14 @@ pub fn fmtKnownSide(buf: []u8, s: battery.SideReading, unverified: bool) []const
 
 fn fmtKnownSideMode(buf: []u8, s: battery.SideReading, unverified: bool, mode: UnverifiedDisplay) []const u8 {
     if (s.status == .charged) return s.status.label(); // "full", no percentage
-    if (unverified and mode == .na)
-        return std.fmt.bufPrint(buf, "?% ({s})", .{s.status.label()}) catch buf[0..0];
+    if (unverified and mode == .na) {
+        const word: []const u8 = if (statusHasWord(s.status)) s.status.label() else "?";
+        return std.fmt.bufPrint(buf, "?% ({s})", .{word}) catch buf[0..0];
+    }
     if (s.level) |lvl| {
         const marker: []const u8 = if (unverified) "?" else "";
-        // Level without a status (empty status response) drops the suffix.
-        if (s.status == .unknown)
+        // An unreliable/empty status (unknown/disconnected/fault) drops the suffix.
+        if (!statusHasWord(s.status))
             return std.fmt.bufPrint(buf, "{d}%{s}", .{ lvl, marker }) catch buf[0..0];
         return std.fmt.bufPrint(buf, "{d}%{s} ({s})", .{ lvl, marker, s.status.label() }) catch buf[0..0];
     }
@@ -1142,51 +1141,31 @@ test "LastKnown.display hides unverified sides" {
     try std.testing.expectEqual(@as(?u8, 30), disp.level);
 }
 
-test "LastKnown.leftText/rightText drop a stale status once the read comes back empty" {
-    // Reproduces the tail-log failure mode: a side goes explicitly
-    // "disconnected" once, then keeps answering with a real level but an
-    // empty status on every later poll (RF-flaky, not actually down anymore).
+test "fmtSide never surfaces an unreliable status (disconnected/fault)" {
+    // wireless.battery.*.status is best-effort (FOCUS_API): a false "4" fires
+    // even while the keyboard is in use, so the disconnect must not reach the
+    // UI. A disconnected/fault side renders as just its last-known level.
+    var buf: [24]u8 = undefined;
+    try std.testing.expectEqualStrings("70%", fmtSide(&buf, .{ .level = 70, .status = .disconnected }));
+    try std.testing.expectEqualStrings("42%", fmtSide(&buf, .{ .level = 42, .status = .fault }));
+    // A live discharging/charging status still shows its word.
+    try std.testing.expectEqualStrings("55% (discharging)", fmtSide(&buf, .{ .level = 55, .status = .discharging }));
+    try std.testing.expectEqualStrings("80% (charging)", fmtSide(&buf, .{ .level = 80, .status = .charging }));
+    // No level + unreliable status stays "?% (?)", never "?% (disconnected)".
+    try std.testing.expectEqualStrings("?% (?)", fmtSide(&buf, .{ .level = null, .status = .disconnected }));
+}
+
+test "LastKnown.leftText/rightText carry the level, never a disconnected word" {
     var known = LastKnown{};
     known.merge(reading(70, .disconnected, 100, .disconnected));
     var buf: [24]u8 = undefined;
-    try std.testing.expectEqualStrings("70% (disconnected)", fmtSide(&buf, known.leftText()));
-    try std.testing.expectEqualStrings("100% (disconnected)", fmtSide(&buf, known.rightText()));
-    // A later poll answers the levels again but the status field is empty —
-    // the text view must show the bare percentage, not the stale status.
+    // Disconnected is unreliable → the tray shows the last-known level only.
+    try std.testing.expectEqualStrings("70%", fmtSide(&buf, known.leftText()));
+    try std.testing.expectEqualStrings("100%", fmtSide(&buf, known.rightText()));
+    // A later empty-status poll keeps showing the level too.
     known.merge(reading(70, .unknown, 100, .unknown));
     try std.testing.expectEqualStrings("70%", fmtSide(&buf, known.leftText()));
     try std.testing.expectEqualStrings("100%", fmtSide(&buf, known.rightText()));
-    // But the sticky field (and therefore the "?" icon gate) still remembers
-    // the disconnect across that empty poll.
-    try std.testing.expect(known.allSidesDisconnected(.defy_wireless));
-}
-
-test "LastKnown.allSidesDisconnected: both reporting sides down" {
-    var known = LastKnown{};
-    // One side still discharging: not all disconnected.
-    known.merge(reading(80, .disconnected, 75, .discharging));
-    try std.testing.expect(!known.allSidesDisconnected(.defy_wireless));
-    try std.testing.expect(!known.allSidesDisconnected(null));
-    // Both explicitly disconnected (firmware code "4"): "?" territory.
-    known.merge(reading(80, .disconnected, 75, .disconnected));
-    try std.testing.expect(known.allSidesDisconnected(.defy_wireless));
-    try std.testing.expect(known.allSidesDisconnected(null));
-}
-
-test "LastKnown.allSidesDisconnected: one-sided model consults only the left channel" {
-    var known = LastKnown{};
-    // Sonsei reports on the left channel only; right stays unknown forever.
-    known.merge(reading(80, .disconnected, null, .unknown));
-    try std.testing.expect(known.allSidesDisconnected(.sonsei));
-    // A null model assumes two sides, so the never-reported right holds it off.
-    try std.testing.expect(!known.allSidesDisconnected(null));
-}
-
-test "LastKnown.allSidesDisconnected: a never-reported side is not disconnected" {
-    var known = LastKnown{};
-    // Fresh state: nothing has reported, so this is the "--" path, not "?".
-    try std.testing.expect(!known.allSidesDisconnected(.defy_wireless));
-    try std.testing.expect(!known.allSidesDisconnected(null));
 }
 
 test "hiddenSides: only .na mode hides unverified sides" {

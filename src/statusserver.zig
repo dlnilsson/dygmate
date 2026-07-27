@@ -54,9 +54,9 @@ const Snapshot = struct {
     /// Fresh (current-poll) status per side, refreshed every publish and
     /// dropped to `.unknown` on an empty read — mirrors LastKnown.left_now/
     /// right_now. Backs the per-side display (status + text) so a stale
-    /// "disconnected"/"charging" suffix never clings to a level reading fine
-    /// again, while the sticky `left`/`right.status` above still drive the "?"
-    /// aggregate and the low gate.
+    /// "charging" suffix never clings to a level reading fine again. The sticky
+    /// `left`/`right.status` above still drive the low gate. (A `.disconnected`
+    /// status is never surfaced — it's unreliable, FOCUS_API.)
     left_now: battery.Status = .unknown,
     right_now: battery.Status = .unknown,
     /// Per side (0=left, 1=right): the value awaits authoritative
@@ -644,32 +644,22 @@ fn render(out: []u8, s: Snapshot) []const u8 {
 
     const sides: u8 = if (s.model) |m| m.sides() else 2;
     // Per-side display uses the FRESH status (sticky level + `*_now`), mirroring
-    // LastKnown.leftText/rightText: a stale "disconnected"/"charging" suffix is
-    // dropped the moment a poll's status comes back empty. The sticky
-    // `s.left/right.status` still drive `all_disconnected` and `isLow` below.
+    // LastKnown.leftText/rightText. `wireless.battery.*.status` is best-effort
+    // and unreliable (FOCUS_API), so `displaySide` never surfaces a
+    // disconnected/fault/empty word — a false "disconnected" while the keyboard
+    // is in use must not reach the bar. The last-known level always shows.
     const left = displaySide(&lbuf, .{ .level = s.left.level, .status = s.left_now }, s.hide[0]);
     const right = displaySide(&rbuf, .{ .level = s.right.level, .status = s.right_now }, s.hide[1]);
 
-    // Both battery-reporting halves explicitly disconnected (firmware code "4")
-    // while connected: their last-known levels are stale cache, so the aggregate
-    // reads "?" like the tray icon (each side still shows its own last-known
-    // value below). Gated on `connected` so paused/available keep showing the
-    // last-known number.
-    const all_disconnected = s.state == .connected and
-        s.left.status == .disconnected and
-        (sides < 2 or s.right.status == .disconnected);
-
     // Min over visible, battery-reporting sides — the tray icon's number.
     // A hidden side already reads null out of displaySide.
-    var level: ?u8 = if (all_disconnected) null else left.level;
-    if (!all_disconnected and sides > 1) {
+    var level: ?u8 = left.level;
+    if (sides > 1) {
         if (right.level) |rl| {
             if (level == null or rl < level.?) level = rl;
         }
     }
-    const text: []const u8 = if (all_disconnected)
-        "?"
-    else if (level) |l|
+    const text: []const u8 = if (level) |l|
         std.fmt.bufPrint(&tbuf, "{d}%", .{l}) catch "--"
     else
         "--";
@@ -692,23 +682,35 @@ fn render(out: []u8, s: Snapshot) []const u8 {
     return w.buffered();
 }
 
-/// Per-side JSON view: "{d}% (status)" like tray_common.fmtSide (duplicated
-/// here — importing tray_common would be an import cycle); a hidden
-/// (unverified) side renders as if it had no level, mirroring the tray's
-/// "?" display. A known level with an unknown status (the neuron often answers
-/// the level and leaves the status empty) drops the suffix — "{d}%". A full
-/// (charged) side renders its `text` as just "full": the percentage is
-/// unreliable on the cable (FOCUS_API) and "{d}% (full)" is self-contradictory.
-/// The numeric `level` is still reported for consumers that want it.
+/// Whether a side's status is surfaced as a "(word)" suffix. Mirrors
+/// tray_common.statusHasWord (can't import — that would be an import cycle):
+/// `wireless.battery.*.status` is best-effort/unreliable (FOCUS_API), so only
+/// `discharging`/`charging` are shown; `.unknown`/`.disconnected`/`.fault`
+/// render as the bare level (`.charged` is handled separately as "full").
+fn statusHasWord(st: battery.Status) bool {
+    return st == .discharging or st == .charging;
+}
+
+/// Per-side JSON view: "{d}% (status)" like tray_common.fmtSide; a hidden
+/// (unverified) side renders as if it had no level, mirroring the tray's "?"
+/// display. An unreliable status (unknown/disconnected/fault) drops the suffix
+/// and reports `status:"?"` — a false "disconnected" while the keyboard is in
+/// use must not reach the bar. A full (charged) side renders its `text` as
+/// "full" (the percentage is unreliable on the cable). The numeric `level` is
+/// still reported for consumers that want it.
 fn displaySide(buf: []u8, s: battery.SideReading, hidden: bool) Side {
-    const word = s.status.label();
+    const has_word = statusHasWord(s.status);
+    const word: []const u8 = if (has_word) s.status.label() else "?";
     if (!hidden) {
-        if (s.status == .charged) return .{ .level = s.level, .status = word, .text = word };
+        if (s.status == .charged) {
+            const full = s.status.label(); // "full"
+            return .{ .level = s.level, .status = full, .text = full };
+        }
         if (s.level) |lvl| {
-            const text = if (s.status == .unknown)
-                std.fmt.bufPrint(buf, "{d}%", .{lvl}) catch "?"
+            const text = if (has_word)
+                std.fmt.bufPrint(buf, "{d}% ({s})", .{ lvl, word }) catch "?"
             else
-                std.fmt.bufPrint(buf, "{d}% ({s})", .{ lvl, word }) catch "?";
+                std.fmt.bufPrint(buf, "{d}%", .{lvl}) catch "?";
             return .{ .level = lvl, .status = word, .text = text };
         }
     }
@@ -959,24 +961,26 @@ test "render: disconnect keeps last-known levels with connected:false" {
     try std.testing.expect(std.mem.indexOf(u8, out, "\"level\":75") != null);
 }
 
-test "render: both sides disconnected while connected reads '?' aggregate" {
+test "render: both sides disconnected still shows last-known, never surfaces disconnect" {
     var buf: [json_cap]u8 = undefined;
     const out = render(&buf, .{
         .state = .connected,
         .model = .defy_wireless,
-        // Last-known levels survive per side; the aggregate goes to "?".
         .left = side(80, .disconnected),
         .right = side(75, .disconnected),
-        // Both explicitly disconnected on THIS poll — the fresh status carries
-        // the "4" too, so each side keeps its "(disconnected)" suffix.
+        // A false "4" fires even while the keyboard is in use (status is
+        // unreliable, FOCUS_API), so it must not reach the bar.
         .left_now = .disconnected,
         .right_now = .disconnected,
     });
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"level\":null") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"text\":\"?\"") != null);
-    // Each side still carries its own last-known value.
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"left\":{\"level\":80,\"status\":\"disconnected\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"right\":{\"level\":75,\"status\":\"disconnected\"") != null);
+    // The aggregate keeps the last-known min number, not "?".
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"level\":75") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"text\":\"75%\"") != null);
+    // Each side drops the disconnected word (status "?", bare level text).
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"left\":{\"level\":80,\"status\":\"?\",\"text\":\"80%\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"right\":{\"level\":75,\"status\":\"?\",\"text\":\"75%\"}") != null);
+    // "disconnected" never appears in the user-facing snapshot.
+    try std.testing.expect(std.mem.indexOf(u8, out, "disconnected") == null);
 }
 
 test "render: a level with an empty status drops the '(?)' suffix" {
