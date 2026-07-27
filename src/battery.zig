@@ -26,6 +26,14 @@ pub const Status = enum {
             .unknown => "?",
         };
     }
+
+    /// True while the cable is connected (charging or just-charged). FOCUS_API
+    /// marks the fuel-gauge level inaccurate in these states, so low readings
+    /// and low-battery alerts are gated on this rather than on `.charging`
+    /// alone.
+    pub fn onCable(self: Status) bool {
+        return self == .charging or self == .charged;
+    }
 };
 
 pub const SideReading = struct {
@@ -169,8 +177,11 @@ fn sleepMs(io: std.Io, ms: u64) void {
 /// repetition of a cache adds no information, so a value that would newly
 /// cross below the low threshold (or any out-of-tolerance value while a
 /// side is wake-guarded) is held until an authoritative post-forceRead read
-/// settles it. Charging/charged sides are trusted outright (the sides
-/// really do charge over cable while the user is away). Pure state machine:
+/// settles it. Charging/charged sides are trusted outright only at/above the
+/// low threshold (the sides really do charge over cable while the user is
+/// away); a sub-threshold charging level is the gauge's documented-inaccurate
+/// range and is held for verification like any low so it can't bake a false low
+/// into the baseline. Pure state machine:
 /// no Io, no allocator, unit-testable without hardware.
 pub const Acceptor = struct {
     left: SideState = .{},
@@ -309,8 +320,25 @@ pub const Acceptor = struct {
         // persistently, mostly WITHOUT the status) — ignore it likewise.
         if (raw.status == .unknown and st.disconnected)
             return .{ .level = st.accepted, .status = raw.status };
-        if (raw.status == .charging or raw.status == .charged)
-            return acceptSide(st, raw);
+        if (raw.status.onCable()) {
+            // A level at/above the low threshold (and any upward charging
+            // progress) is trusted outright — the side really does gain charge
+            // over the cable.
+            if (lvl >= low_level_fast_threshold) return acceptSide(st, raw);
+            // Below the low threshold the gauge is in its documented-inaccurate
+            // range (FOCUS_API): its misreads skew low. Accepting one would bake
+            // a false low into the baseline and fire a low-battery alert once
+            // the status reads back non-charging. A value within tolerance of an
+            // already-accepted low is that same stable low re-reported — keep it
+            // (never re-verify). Otherwise hold it for an authoritative
+            // post-forceRead read, exactly like a low discharging reading;
+            // plain-read repetition of a bad gauge value can never confirm it.
+            if (st.accepted) |acc| {
+                const diff = if (lvl > acc) lvl - acc else acc - lvl;
+                if (diff <= level_jump_tolerance) return acceptSide(st, raw);
+            }
+            return suspectSide(st, raw, null);
+        }
         // 0 is the neuron's unpopulated-cache value around sleep/wake, served
         // persistently while a half sleeps — repetition would "confirm" it, so
         // ignore it like disconnected/fault (Bazecor never renders 0% either).
@@ -818,12 +846,71 @@ test "Acceptor: zero polls keep the pending streak alive" {
     try std.testing.expect(!res.suspect);
 }
 
-test "Acceptor: 0 while charging is accepted outright" {
+test "Acceptor: a sub-threshold charging level is held, not trusted outright" {
+    // FOCUS_API marks the gauge inaccurate on the cable; a below-low-threshold
+    // charging reading is that bogus range and must never bake a false low into
+    // the baseline (that's what later fires a spurious low-battery alert).
     var a: Acceptor = .{};
     _ = feedLeft(&a, 45, .discharging);
-    const res = feedLeft(&a, 0, .charging);
-    try std.testing.expectEqual(@as(?u8, 0), res.reading.left.level);
+    for ([_]Status{ .charging, .charged }) |cable| {
+        for ([_]?u8{ 0, 1, 5 }) |lvl| {
+            const res = feedLeft(&a, lvl, cable);
+            try std.testing.expectEqual(@as(?u8, 45), res.reading.left.level);
+            try std.testing.expect(res.suspect);
+            try std.testing.expect(res.needs_verification[0]);
+        }
+    }
+}
+
+test "Acceptor: a first-ever sub-threshold charging reading needs verification" {
+    // No baseline yet: an initial charging low is held for an authoritative
+    // read rather than accepted (a bogus post-connect cache reads low too).
+    var a: Acceptor = .{};
+    var res = feedLeft(&a, 3, .charging);
+    try std.testing.expectEqual(@as(?u8, null), res.reading.left.level);
+    try std.testing.expect(res.needs_verification[0]);
+    // An authoritative read settles it (charging genuinely reads that low), so
+    // the forceRead retry loop can end.
+    res = a.feedAuthoritative(.{ .left = side(3, .charging), .right = side(null, .unknown) });
+    try std.testing.expectEqual(@as(?u8, 3), res.reading.left.level);
+    try std.testing.expect(!res.anyVerification());
+}
+
+test "Acceptor: an already-accepted charging low keeps showing without re-verifying" {
+    // A genuinely low-and-charging side (settled authoritatively) must keep
+    // rendering and must not re-arm forceRead on every stable/near poll.
+    var a: Acceptor = .{};
+    _ = feedLeft(&a, 90, .discharging);
+    _ = feedLeft(&a, 5, .discharging); // held low
+    _ = a.feedAuthoritative(.{ .left = side(5, .discharging), .right = side(null, .unknown) });
+    for ([_]u8{ 5, 6, 4 }) |lvl| { // stable + a point of charge either way
+        const res = feedLeft(&a, lvl, .charging);
+        try std.testing.expectEqual(@as(?u8, lvl), res.reading.left.level);
+        try std.testing.expect(!res.suspect);
+        try std.testing.expect(!res.needs_verification[0]);
+    }
+}
+
+test "Acceptor: a charging level at/above the low threshold still accepts outright" {
+    // Regression guard: the charging fast-path for plausible/upward levels is
+    // untouched — only the sub-threshold case is gated.
+    var a: Acceptor = .{};
+    _ = feedLeft(&a, 45, .discharging);
+    var res = feedLeft(&a, 80, .charging);
+    try std.testing.expectEqual(@as(?u8, 80), res.reading.left.level);
     try std.testing.expect(!res.suspect);
+    res = feedLeft(&a, 90, .charged);
+    try std.testing.expectEqual(@as(?u8, 90), res.reading.left.level);
+    try std.testing.expect(!res.suspect);
+}
+
+test "Status.onCable is true only for charging and charged" {
+    try std.testing.expect(Status.charging.onCable());
+    try std.testing.expect(Status.charged.onCable());
+    try std.testing.expect(!Status.discharging.onCable());
+    try std.testing.expect(!Status.fault.onCable());
+    try std.testing.expect(!Status.disconnected.onCable());
+    try std.testing.expect(!Status.unknown.onCable());
 }
 
 test "Acceptor: first reading below the low threshold needs authoritative verification" {

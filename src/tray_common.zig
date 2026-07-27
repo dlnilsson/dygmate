@@ -107,7 +107,10 @@ pub const palette = struct {
 /// paused (dim to gray). Mirrors the Windows tray's original color ladder.
 pub fn iconColor(live: bool, level: u8, status: battery.Status) Rgb {
     if (!live) return palette.gray;
-    if (status == .charging) return palette.blue;
+    // On the cable (charging or full) the icon is blue — the gauge level is
+    // unreliable there (FOCUS_API), so the red/amber "low" rungs would be
+    // misleading while the keyboard is plugged in.
+    if (status.onCable()) return palette.blue;
     if (level >= 50) return palette.green;
     if (level >= low_threshold) return palette.amber;
     return palette.red;
@@ -294,6 +297,9 @@ pub fn fmtMenuSide(buf: []u8, s: battery.SideReading, unverified: bool) []const 
 }
 
 fn fmtMenuSideMode(buf: []u8, s: battery.SideReading, unverified: bool, mode: UnverifiedDisplay) []const u8 {
+    // A full (charged) side shows just "Full" — the percentage is unreliable on
+    // the cable (FOCUS_API) and "{d}% (Full)" is self-contradictory.
+    if (s.status == .charged) return "Full";
     if (unverified and mode == .na) return "verifying…";
     const lvl = s.level orelse return "no reading yet";
     const marker: []const u8 = if (unverified) "?" else "";
@@ -311,8 +317,11 @@ fn fmtMenuSideMode(buf: []u8, s: battery.SideReading, unverified: bool, mode: Un
 
 /// Tooltip/CLI form: "{d}% (status)" with a lowercase status word; "?%" if the
 /// side has no level yet. A known level with an unknown status drops the suffix
-/// ("{d}%") — the neuron frequently returns a level with an empty status.
+/// ("{d}%") — the neuron frequently returns a level with an empty status. A full
+/// (charged) side renders just "full": its percentage is unreliable on the cable
+/// (FOCUS_API) and "{d}% (full)" reads as a contradiction.
 pub fn fmtSide(buf: []u8, s: battery.SideReading) []const u8 {
+    if (s.status == .charged) return s.status.label();
     if (s.level) |lvl| {
         if (s.status == .unknown)
             return std.fmt.bufPrint(buf, "{d}%", .{lvl}) catch buf[0..0];
@@ -331,6 +340,7 @@ pub fn fmtKnownSide(buf: []u8, s: battery.SideReading, unverified: bool) []const
 }
 
 fn fmtKnownSideMode(buf: []u8, s: battery.SideReading, unverified: bool, mode: UnverifiedDisplay) []const u8 {
+    if (s.status == .charged) return s.status.label(); // "full", no percentage
     if (unverified and mode == .na)
         return std.fmt.bufPrint(buf, "?% ({s})", .{s.status.label()}) catch buf[0..0];
     if (s.level) |lvl| {
@@ -396,12 +406,13 @@ pub fn levelsKnown(model: ?device.Model, r: battery.Reading) bool {
     return m.sides() < 2 or r.right.level != null;
 }
 
-/// Any non-charging side below the low threshold — drives warning urgency on
-/// the connect announcement.
+/// Any off-cable side below the low threshold — drives warning urgency on
+/// the connect announcement. Charging/charged sides are skipped: FOCUS_API
+/// marks the gauge inaccurate on the cable.
 pub fn hasLowBattery(r: battery.Reading) bool {
     const sides = [_]battery.SideReading{ r.left, r.right };
     for (sides) |s| {
-        if (s.status == .charging) continue;
+        if (s.status.onCable()) continue;
         const lvl = s.level orelse continue;
         if (lvl < low_threshold) return true;
     }
@@ -472,7 +483,7 @@ pub fn planNotifications(
         // double as a fresh low crossing on the next poll. An unverified side
         // latches like a null level: its value isn't evidence yet.
         for (sides, 0..) |s, i| {
-            if (s.status == .charging) {
+            if (s.status.onCable()) {
                 latch[i] = false;
                 continue;
             }
@@ -490,11 +501,11 @@ pub fn planNotifications(
         return plan;
     }
 
-    // Per-side low crossing: fire once when a non-charging side drops below the
-    // threshold; reset the latch when it charges or recovers.
+    // Per-side low crossing: fire once when a side that's off the cable drops
+    // below the threshold; reset the latch when it's on the cable or recovers.
     var idx: usize = 0;
     for (sides, 0..) |s, i| {
-        if (s.status == .charging) {
+        if (s.status.onCable()) {
             latch[i] = false;
             continue;
         }
@@ -871,6 +882,24 @@ test "planNotifications: charging side never warns and resets the latch" {
     try std.testing.expect(!latch[1]);
 }
 
+test "planNotifications: charged (full) side never warns either" {
+    // `.charged` (firmware code 2) means the cable is still connected, so a low
+    // reading paired with it is the same inaccurate-on-cable case as charging.
+    var latch = [2]bool{ true, true };
+    const plan = planNotifications(&latch, false, false, reading(5, .charged, 8, .charged), .{ false, false });
+    try std.testing.expectEqual(@as(usize, 0), countEvents(plan));
+    try std.testing.expect(!latch[0]);
+    try std.testing.expect(!latch[1]);
+}
+
+test "planNotifications: a low charged side does not warn the connect announcement" {
+    var latch = [2]bool{ false, false };
+    const plan = planNotifications(&latch, true, true, reading(5, .charged, 90, .discharging), .{ false, false });
+    try std.testing.expect(plan.events[0].?.kind == .connect_status);
+    try std.testing.expect(!plan.events[0].?.warning); // charged side skipped by hasLowBattery
+    try std.testing.expect(!latch[0]);
+}
+
 test "planNotifications: both low sides fire two events" {
     var latch = [2]bool{ false, false };
     const plan = planNotifications(&latch, false, false, reading(10, .discharging, 19, .discharging), .{ false, false });
@@ -1121,6 +1150,34 @@ test "fmt helpers drop the status suffix when the level is known but status isn'
     try std.testing.expectEqualStrings("40% (discharging)", fmtSide(&buf, known));
     // No level at all keeps the "?% (status)" no-data form.
     try std.testing.expectEqualStrings("?% (?)", fmtSide(&buf, .{ .level = null, .status = .unknown }));
+}
+
+test "iconColor: on the cable is always blue, off-cable follows the level ladder" {
+    // Plugged in (charging or full): blue regardless of the unreliable level,
+    // so a low gauge read never paints the icon red while on the cable.
+    try std.testing.expectEqual(palette.blue, iconColor(true, 1, .charging));
+    try std.testing.expectEqual(palette.blue, iconColor(true, 1, .charged));
+    try std.testing.expectEqual(palette.blue, iconColor(true, 95, .charged));
+    // Off the cable: the usual green/amber/red ladder.
+    try std.testing.expectEqual(palette.green, iconColor(true, 80, .discharging));
+    try std.testing.expectEqual(palette.amber, iconColor(true, 30, .discharging));
+    try std.testing.expectEqual(palette.red, iconColor(true, 5, .discharging));
+    // Offline/paused dims to gray whatever the status.
+    try std.testing.expectEqual(palette.gray, iconColor(false, 80, .charging));
+}
+
+test "fmt helpers omit the percentage for a full (charged) side" {
+    var buf: [48]u8 = undefined;
+    // "1% (full)" is self-contradictory — a full side shows just the word.
+    const full: battery.SideReading = .{ .level = 1, .status = .charged };
+    try std.testing.expectEqualStrings("full", fmtSide(&buf, full));
+    try std.testing.expectEqualStrings("full", fmtKnownSideMode(&buf, full, false, .na));
+    try std.testing.expectEqualStrings("Full", fmtMenuSideMode(&buf, full, false, .na));
+    // The word wins over the unverified marker and a null level alike.
+    try std.testing.expectEqualStrings("full", fmtKnownSideMode(&buf, full, true, .last_known));
+    const full_null: battery.SideReading = .{ .level = null, .status = .charged };
+    try std.testing.expectEqualStrings("full", fmtSide(&buf, full_null));
+    try std.testing.expectEqualStrings("Full", fmtMenuSideMode(&buf, full_null, false, .na));
 }
 
 test "tooltipHeader keeps paused wording and missing wording distinct" {

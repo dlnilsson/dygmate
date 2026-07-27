@@ -696,10 +696,14 @@ fn render(out: []u8, s: Snapshot) []const u8 {
 /// here — importing tray_common would be an import cycle); a hidden
 /// (unverified) side renders as if it had no level, mirroring the tray's
 /// "?" display. A known level with an unknown status (the neuron often answers
-/// the level and leaves the status empty) drops the suffix — "{d}%".
+/// the level and leaves the status empty) drops the suffix — "{d}%". A full
+/// (charged) side renders its `text` as just "full": the percentage is
+/// unreliable on the cable (FOCUS_API) and "{d}% (full)" is self-contradictory.
+/// The numeric `level` is still reported for consumers that want it.
 fn displaySide(buf: []u8, s: battery.SideReading, hidden: bool) Side {
     const word = s.status.label();
     if (!hidden) {
+        if (s.status == .charged) return .{ .level = s.level, .status = word, .text = word };
         if (s.level) |lvl| {
             const text = if (s.status == .unknown)
                 std.fmt.bufPrint(buf, "{d}%", .{lvl}) catch "?"
@@ -715,7 +719,7 @@ fn displaySide(buf: []u8, s: battery.SideReading, hidden: bool) Side {
     };
 }
 
-/// Any visible, battery-reporting, non-charging side below the threshold —
+/// Any visible, battery-reporting, off-cable side below the threshold —
 /// mirrors tray_common.hasLowBattery plus the hidden/sides gating.
 fn isLow(s: Snapshot, sides: u8) bool {
     const list = [_]struct { r: battery.SideReading, off: bool }{
@@ -724,7 +728,7 @@ fn isLow(s: Snapshot, sides: u8) bool {
     };
     for (list) |e| {
         if (e.off) continue;
-        if (e.r.status == .charging) continue;
+        if (e.r.status.onCable()) continue;
         const lvl = e.r.level orelse continue;
         if (lvl < low_threshold) return true;
     }
@@ -913,6 +917,31 @@ test "render: low fires for a visible non-charging side under the threshold" {
         .right = side(90, .discharging),
     });
     try std.testing.expect(std.mem.indexOf(u8, charging_low, "\"low\":false") != null);
+
+    // `.charged` (full, still on the cable) is skipped just like charging.
+    const charged_low = render(&buf, .{
+        .state = .connected,
+        .model = .defy_wireless,
+        .left = side(15, .charged),
+        .right = side(90, .discharging),
+    });
+    try std.testing.expect(std.mem.indexOf(u8, charged_low, "\"low\":false") != null);
+}
+
+test "render: a full (charged) side omits the percentage in its text" {
+    var buf: [json_cap]u8 = undefined;
+    const out = render(&buf, .{
+        .state = .connected,
+        .model = .defy_wireless,
+        .left = side(1, .charged),
+        .right = side(1, .charged),
+        .left_now = .charged,
+        .right_now = .charged,
+    });
+    // "{d}% (full)" would be misleading — the side text is just "full" (the
+    // numeric level stays available for consumers that want it).
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"left\":{\"level\":1,\"status\":\"full\",\"text\":\"full\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"right\":{\"level\":1,\"status\":\"full\",\"text\":\"full\"}") != null);
 }
 
 test "render: disconnect keeps last-known levels with connected:false" {
@@ -957,6 +986,9 @@ test "render: a level with an empty status drops the '(?)' suffix" {
         .model = .defy_wireless,
         .left = side(40, .unknown), // level known, status empty
         .right = side(50, .discharging),
+        // Per-side text renders from the fresh `*_now` status: left stays empty
+        // (drops the suffix), right carries its live status.
+        .right_now = .discharging,
     });
     try std.testing.expect(std.mem.indexOf(u8, out, "\"left\":{\"level\":40,\"status\":\"?\",\"text\":\"40%\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"right\":{\"level\":50,\"status\":\"discharging\",\"text\":\"50% (discharging)\"}") != null);
