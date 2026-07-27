@@ -130,8 +130,7 @@ pub fn renderBattery(out: *IconBuf, color: tray_common.Rgb) void {
     while (y < icon_px) : (y += 1) {
         var x: usize = 0;
         while (x < icon_px) : (x += 1) {
-            const c = if (tray_common.batteryMask(icon_px, x, y)) tray_common.palette.text else color;
-            putPixel(out, x, y, c);
+            putPixel(out, x, y, tray_common.batteryPixel(icon_px, x, y, color));
         }
     }
 }

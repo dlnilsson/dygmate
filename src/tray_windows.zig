@@ -1066,14 +1066,21 @@ fn makeTextIcon(text: []const u8, color: COLORREF, draw_battery: bool) ?HICON {
     }
 
     if (draw_battery) {
-        // Draw the shared battery glyph pixel-by-pixel (256 px) so it matches
-        // the Linux tray exactly; GDI text can't render the 🔋 emoji.
+        // Composite the shared battery glyph over the background pixel-by-pixel
+        // (256 px) so it matches the Linux tray exactly; GDI text can't render
+        // the 🔋 emoji. COLORREF is 0x00BBGGRR — unpack it back to an Rgb.
+        const bg = common.Rgb{
+            .r = @intCast(color & 0xFF),
+            .g = @intCast((color >> 8) & 0xFF),
+            .b = @intCast((color >> 16) & 0xFF),
+        };
         const n: usize = @intCast(icon_size);
         var yy: usize = 0;
         while (yy < n) : (yy += 1) {
             var xx: usize = 0;
             while (xx < n) : (xx += 1) {
-                if (common.batteryMask(n, xx, yy)) _ = SetPixelV(mdc, @intCast(xx), @intCast(yy), col_text);
+                const px = common.batteryPixel(n, xx, yy, bg);
+                _ = SetPixelV(mdc, @intCast(xx), @intCast(yy), rgb(px.r, px.g, px.b));
             }
         }
     } else {
