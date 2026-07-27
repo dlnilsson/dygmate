@@ -203,6 +203,9 @@ pub const State = struct {
     /// UI-thread-only: latched per side (0=left, 1=right) so a low-battery
     /// notification fires once per crossing, not every poll.
     notified_low: [2]bool = .{ false, false },
+    /// UI-thread-only: wall-clock ms of the last notification actually fired,
+    /// backing the `notify_cooldown_ms` sanity check in `planNotifications`.
+    last_notified_ms: ?i64 = null,
 };
 
 pub const DeviceStatus = enum {
@@ -518,6 +521,21 @@ pub fn fmtLowBody(buf: []u8, model: ?device.Model, side: u1, level: u8) []const 
     return std.fmt.bufPrint(buf, "{s} side at {d}%", .{ name, level }) catch buf[0..0];
 }
 
+/// Wall-clock milliseconds, for spacing `planNotifications` calls against
+/// `notify_cooldown_ms`.
+pub fn nowMs(io: std.Io) i64 {
+    const ts = std.Io.Clock.Timestamp.now(io, .real);
+    return @intCast(@divTrunc(ts.raw.nanoseconds, std.time.ns_per_ms));
+}
+
+/// Sanity backstop: desktop notifications never fire more often than this,
+/// regardless of how many latch crossings or reconnect announcements pile up
+/// (e.g. a flapping connection re-announcing every poll). An event suppressed
+/// by the cooldown is dropped outright, not queued: the latch/announce state
+/// still advances as if it had fired, so it does not retry once the cooldown
+/// clears.
+pub const notify_cooldown_ms: i64 = 10_000;
+
 /// Decide which notifications to fire and mutate the per-side latch. Pure: no
 /// platform calls. Mirrors the Windows updateTray decision flow exactly.
 ///
@@ -531,6 +549,12 @@ pub fn fmtLowBody(buf: []u8, model: ?device.Model, side: u1, level: u8) []const 
 /// an invariant backstop: the acceptor never puts an unverified low into the
 /// snapshot in the first place.
 ///
+/// `now_ms`/`last_notified_ms` back the `notify_cooldown_ms` sanity check: no
+/// event fires within `notify_cooldown_ms` of the last one that did — a
+/// crossing/announcement inside the window is dropped, not queued. Both
+/// events in the same call (e.g. two sides crossing low together) still fire
+/// together — the cooldown is evaluated once per call, not per event.
+///
 /// - pending + ready: emit connect_status, latch the lows, report consumed.
 /// - pending + not ready: emit nothing, keep announce pending.
 /// - not pending: per-side low check against the latch (fires once per crossing).
@@ -540,15 +564,21 @@ pub fn planNotifications(
     announce_ready: bool,
     snapshot: battery.Reading,
     unverified: [2]bool,
+    now_ms: i64,
+    last_notified_ms: *?i64,
 ) NotifyPlan {
     var plan = NotifyPlan{};
     const sides = [_]battery.SideReading{ snapshot.left, snapshot.right };
+    const cooled_down = if (last_notified_ms.*) |last| now_ms - last >= notify_cooldown_ms else true;
 
     if (announce_pending) {
         // A side hasn't reported a fresh level yet: stay pending, fire nothing.
         if (!announce_ready) return plan;
 
-        plan.events[0] = .{ .kind = .connect_status, .warning = hasLowBattery(snapshot) };
+        // Cooldown backstop: the latch still advances as though the
+        // announcement fired, so a suppressed announcement is dropped
+        // outright rather than retried on the next poll.
+        if (cooled_down) plan.events[0] = .{ .kind = .connect_status, .warning = hasLowBattery(snapshot) };
         // Latch every side to its current low state so the announcement doesn't
         // double as a fresh low crossing on the next poll. An unverified side
         // latches like a null level: its value isn't evidence yet.
@@ -568,6 +598,7 @@ pub fn planNotifications(
             latch[i] = lvl < low_threshold;
         }
         plan.consumed_announce = true;
+        if (cooled_down) last_notified_ms.* = now_ms;
         return plan;
     }
 
@@ -585,14 +616,19 @@ pub fn planNotifications(
         const lvl = s.level orelse continue;
         if (lvl < low_threshold) {
             if (!latch[i]) {
+                // Latch regardless of the cooldown: a suppressed crossing is
+                // dropped, not retried once the cooldown clears.
                 latch[i] = true;
-                plan.events[idx] = .{ .kind = .low_battery, .side = @intCast(i), .level = lvl, .warning = true };
-                idx += 1;
+                if (cooled_down) {
+                    plan.events[idx] = .{ .kind = .low_battery, .side = @intCast(i), .level = lvl, .warning = true };
+                    idx += 1;
+                }
             }
         } else {
             latch[i] = false;
         }
     }
+    if (idx > 0) last_notified_ms.* = now_ms;
     return plan;
 }
 
@@ -922,31 +958,34 @@ fn countEvents(plan: NotifyPlan) usize {
 
 test "planNotifications: low crossing fires once, latched afterwards" {
     var latch = [2]bool{ false, false };
+    var last_notified_ms: ?i64 = null;
     const snap = reading(15, .discharging, 80, .discharging);
 
-    const first = planNotifications(&latch, false, false, snap, .{ false, false });
+    const first = planNotifications(&latch, false, false, snap, .{ false, false }, 0, &last_notified_ms);
     try std.testing.expectEqual(@as(usize, 1), countEvents(first));
     try std.testing.expectEqual(NotifyEvent{ .kind = .low_battery, .side = 0, .level = 15, .warning = true }, first.events[0].?);
     try std.testing.expect(latch[0]);
 
     // Same low reading again: latched, no re-fire.
-    const second = planNotifications(&latch, false, false, snap, .{ false, false });
+    const second = planNotifications(&latch, false, false, snap, .{ false, false }, 0, &last_notified_ms);
     try std.testing.expectEqual(@as(usize, 0), countEvents(second));
 }
 
 test "planNotifications: recovery above threshold resets the latch" {
     var latch = [2]bool{ true, false };
-    const plan = planNotifications(&latch, false, false, reading(50, .discharging, 90, .discharging), .{ false, false });
+    var last_notified_ms: ?i64 = null;
+    const plan = planNotifications(&latch, false, false, reading(50, .discharging, 90, .discharging), .{ false, false }, 0, &last_notified_ms);
     try std.testing.expectEqual(@as(usize, 0), countEvents(plan));
     try std.testing.expect(!latch[0]); // latch cleared, so a later drop fires again
 
-    const again = planNotifications(&latch, false, false, reading(10, .discharging, 90, .discharging), .{ false, false });
+    const again = planNotifications(&latch, false, false, reading(10, .discharging, 90, .discharging), .{ false, false }, 0, &last_notified_ms);
     try std.testing.expectEqual(@as(usize, 1), countEvents(again));
 }
 
 test "planNotifications: charging side never warns and resets the latch" {
     var latch = [2]bool{ true, true };
-    const plan = planNotifications(&latch, false, false, reading(5, .charging, 8, .charging), .{ false, false });
+    var last_notified_ms: ?i64 = null;
+    const plan = planNotifications(&latch, false, false, reading(5, .charging, 8, .charging), .{ false, false }, 0, &last_notified_ms);
     try std.testing.expectEqual(@as(usize, 0), countEvents(plan));
     try std.testing.expect(!latch[0]);
     try std.testing.expect(!latch[1]);
@@ -956,7 +995,8 @@ test "planNotifications: charged (full) side never warns either" {
     // `.charged` (firmware code 2) means the cable is still connected, so a low
     // reading paired with it is the same inaccurate-on-cable case as charging.
     var latch = [2]bool{ true, true };
-    const plan = planNotifications(&latch, false, false, reading(5, .charged, 8, .charged), .{ false, false });
+    var last_notified_ms: ?i64 = null;
+    const plan = planNotifications(&latch, false, false, reading(5, .charged, 8, .charged), .{ false, false }, 0, &last_notified_ms);
     try std.testing.expectEqual(@as(usize, 0), countEvents(plan));
     try std.testing.expect(!latch[0]);
     try std.testing.expect(!latch[1]);
@@ -964,7 +1004,8 @@ test "planNotifications: charged (full) side never warns either" {
 
 test "planNotifications: a low charged side does not warn the connect announcement" {
     var latch = [2]bool{ false, false };
-    const plan = planNotifications(&latch, true, true, reading(5, .charged, 90, .discharging), .{ false, false });
+    var last_notified_ms: ?i64 = null;
+    const plan = planNotifications(&latch, true, true, reading(5, .charged, 90, .discharging), .{ false, false }, 0, &last_notified_ms);
     try std.testing.expect(plan.events[0].?.kind == .connect_status);
     try std.testing.expect(!plan.events[0].?.warning); // charged side skipped by hasLowBattery
     try std.testing.expect(!latch[0]);
@@ -972,7 +1013,8 @@ test "planNotifications: a low charged side does not warn the connect announceme
 
 test "planNotifications: both low sides fire two events" {
     var latch = [2]bool{ false, false };
-    const plan = planNotifications(&latch, false, false, reading(10, .discharging, 19, .discharging), .{ false, false });
+    var last_notified_ms: ?i64 = null;
+    const plan = planNotifications(&latch, false, false, reading(10, .discharging, 19, .discharging), .{ false, false }, 0, &last_notified_ms);
     try std.testing.expectEqual(@as(usize, 2), countEvents(plan));
     try std.testing.expectEqual(@as(u1, 0), plan.events[0].?.side.?);
     try std.testing.expectEqual(@as(u1, 1), plan.events[1].?.side.?);
@@ -980,7 +1022,8 @@ test "planNotifications: both low sides fire two events" {
 
 test "planNotifications: announce with both sides known emits status and latches lows" {
     var latch = [2]bool{ false, false };
-    const plan = planNotifications(&latch, true, true, reading(15, .discharging, 90, .discharging), .{ false, false });
+    var last_notified_ms: ?i64 = null;
+    const plan = planNotifications(&latch, true, true, reading(15, .discharging, 90, .discharging), .{ false, false }, 0, &last_notified_ms);
     try std.testing.expectEqual(@as(usize, 1), countEvents(plan));
     try std.testing.expect(plan.events[0].?.kind == .connect_status);
     try std.testing.expect(plan.events[0].?.warning); // a side is low
@@ -991,7 +1034,8 @@ test "planNotifications: announce with both sides known emits status and latches
 
 test "planNotifications: announce with a healthy pair is not a warning" {
     var latch = [2]bool{ false, false };
-    const plan = planNotifications(&latch, true, true, reading(80, .discharging, 90, .charging), .{ false, false });
+    var last_notified_ms: ?i64 = null;
+    const plan = planNotifications(&latch, true, true, reading(80, .discharging, 90, .charging), .{ false, false }, 0, &last_notified_ms);
     try std.testing.expect(plan.events[0].?.kind == .connect_status);
     try std.testing.expect(!plan.events[0].?.warning);
     try std.testing.expect(plan.consumed_announce);
@@ -999,7 +1043,8 @@ test "planNotifications: announce with a healthy pair is not a warning" {
 
 test "planNotifications: announce with a side unknown emits nothing and stays pending" {
     var latch = [2]bool{ false, false };
-    const plan = planNotifications(&latch, true, false, reading(null, .unknown, 90, .discharging), .{ false, false });
+    var last_notified_ms: ?i64 = null;
+    const plan = planNotifications(&latch, true, false, reading(null, .unknown, 90, .discharging), .{ false, false }, 0, &last_notified_ms);
     try std.testing.expectEqual(@as(usize, 0), countEvents(plan));
     try std.testing.expect(!plan.consumed_announce);
 }
@@ -1008,10 +1053,41 @@ test "planNotifications: announce gates on raw readiness, not the merged snapsho
     // Merged snapshot has both levels (a stale side survived a reconnect), but
     // the raw reading isn't ready yet: the announcement must stay pending.
     var latch = [2]bool{ false, false };
+    var last_notified_ms: ?i64 = null;
     const merged = reading(50, .discharging, 80, .discharging);
-    const plan = planNotifications(&latch, true, false, merged, .{ false, false });
+    const plan = planNotifications(&latch, true, false, merged, .{ false, false }, 0, &last_notified_ms);
     try std.testing.expectEqual(@as(usize, 0), countEvents(plan));
     try std.testing.expect(!plan.consumed_announce);
+}
+
+test "planNotifications: cooldown drops a second crossing fired too soon" {
+    // Left crosses low at t=0 and fires. Right crosses low at t=1s (within the
+    // 10s cooldown): it must latch (so it never re-fires later either) but the
+    // event itself is dropped, not queued.
+    var latch = [2]bool{ false, false };
+    var last_notified_ms: ?i64 = null;
+    const first = planNotifications(&latch, false, false, reading(15, .discharging, 90, .discharging), .{ false, false }, 0, &last_notified_ms);
+    try std.testing.expectEqual(@as(usize, 1), countEvents(first));
+    try std.testing.expect(latch[0]);
+
+    const dropped = planNotifications(&latch, false, false, reading(15, .discharging, 15, .discharging), .{ false, false }, 1_000, &last_notified_ms);
+    try std.testing.expectEqual(@as(usize, 0), countEvents(dropped));
+    try std.testing.expect(latch[1]); // latched immediately — dropped, not deferred
+
+    // Well past the cooldown window: the crossing already latched, so it does
+    // not resurface even though nothing was ever shown for it.
+    const still_silent = planNotifications(&latch, false, false, reading(15, .discharging, 15, .discharging), .{ false, false }, 60_000, &last_notified_ms);
+    try std.testing.expectEqual(@as(usize, 0), countEvents(still_silent));
+}
+
+test "planNotifications: cooldown drops a connect announcement fired too soon" {
+    var latch = [2]bool{ false, false };
+    var last_notified_ms: ?i64 = 0; // a notification "just" fired at t=0
+    const dropped = planNotifications(&latch, true, true, reading(80, .discharging, 90, .discharging), .{ false, false }, 5_000, &last_notified_ms);
+    try std.testing.expectEqual(@as(usize, 0), countEvents(dropped));
+    // Consumed anyway: the caller clears announce_pending, so a dropped
+    // announcement is not retried on the next poll either.
+    try std.testing.expect(dropped.consumed_announce);
 }
 
 test "levelsKnown: 2-sided and null models need both sides, 1-sided needs left only" {
@@ -1107,22 +1183,24 @@ test "WakeDetector: suspend gap at the threshold does not fire" {
 
 test "planNotifications: unverified side fires nothing and leaves the latch untouched" {
     var latch = [2]bool{ false, false };
+    var last_notified_ms: ?i64 = null;
     const snap = reading(15, .discharging, 80, .discharging);
-    const muted = planNotifications(&latch, false, false, snap, .{ true, false });
+    const muted = planNotifications(&latch, false, false, snap, .{ true, false }, 0, &last_notified_ms);
     try std.testing.expectEqual(@as(usize, 0), countEvents(muted));
     try std.testing.expect(!latch[0]);
 
     // Verification clears and the low is genuine: fires exactly once.
-    const fired = planNotifications(&latch, false, false, snap, .{ false, false });
+    const fired = planNotifications(&latch, false, false, snap, .{ false, false }, 0, &last_notified_ms);
     try std.testing.expectEqual(@as(usize, 1), countEvents(fired));
     try std.testing.expect(latch[0]);
-    const again = planNotifications(&latch, false, false, snap, .{ false, false });
+    const again = planNotifications(&latch, false, false, snap, .{ false, false }, 0, &last_notified_ms);
     try std.testing.expectEqual(@as(usize, 0), countEvents(again));
 }
 
 test "planNotifications: announce latches an unverified side like a null level" {
     var latch = [2]bool{ false, false };
-    const plan = planNotifications(&latch, true, true, reading(15, .discharging, 90, .discharging), .{ true, false });
+    var last_notified_ms: ?i64 = null;
+    const plan = planNotifications(&latch, true, true, reading(15, .discharging, 90, .discharging), .{ true, false }, 0, &last_notified_ms);
     try std.testing.expect(plan.consumed_announce);
     try std.testing.expect(!latch[0]);
 }

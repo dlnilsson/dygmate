@@ -532,7 +532,7 @@ fn rebuildAndNotify(app: *App) void {
         // stale last-known value surviving a reconnect must not fire the
         // announcement early.
         const announce_ready = tray_common.levelsKnown(model, r);
-        const plan = tray_common.planNotifications(&app.state.notified_low, announce_pending, announce_ready, snapshot, unverified);
+        const plan = tray_common.planNotifications(&app.state.notified_low, announce_pending, announce_ready, snapshot, unverified, tray_common.nowMs(app.io), &app.state.last_notified_ms);
         for (plan.events) |ev_opt| {
             if (ev_opt) |ev| sendNotification(app, ev, display);
         }

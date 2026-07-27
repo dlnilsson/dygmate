@@ -841,7 +841,7 @@ fn updateTray() void {
         // matches the pre-refactor behavior and avoids announcing early off a
         // stale last-known value.
         const announce_ready = common.levelsKnown(model, r);
-        const plan = common.planNotifications(&g_state.notified_low, announce_pending, announce_ready, snapshot, unverified);
+        const plan = common.planNotifications(&g_state.notified_low, announce_pending, announce_ready, snapshot, unverified, common.nowMs(g_io), &g_state.last_notified_ms);
         for (plan.events) |ev_opt| {
             if (ev_opt) |ev| showEvent(ev, model, display);
         }
