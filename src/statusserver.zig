@@ -51,6 +51,14 @@ const Snapshot = struct {
     model: ?device.Model = null,
     left: battery.SideReading = .{ .level = null, .status = .unknown },
     right: battery.SideReading = .{ .level = null, .status = .unknown },
+    /// Fresh (current-poll) status per side, refreshed every publish and
+    /// dropped to `.unknown` on an empty read — mirrors LastKnown.left_now/
+    /// right_now. Backs the per-side display (status + text) so a stale
+    /// "disconnected"/"charging" suffix never clings to a level reading fine
+    /// again, while the sticky `left`/`right.status` above still drive the "?"
+    /// aggregate and the low gate.
+    left_now: battery.Status = .unknown,
+    right_now: battery.Status = .unknown,
     /// Per side (0=left, 1=right): the value awaits authoritative
     /// verification and renders hidden, mirroring the tray's "?" display.
     hide: [2]bool = .{ false, false },
@@ -163,11 +171,17 @@ fn nowMillis(io: std.Io) i64 {
 // ---------------------------------------------------------------------------
 /// Publish an accepted (plausibility-gated) reading. Merges per field like
 /// the tray's LastKnown: a half-asleep side keeps its last real value.
+/// `left`/`right` carry the sticky last-known level+status (kept for the "?"
+/// aggregate and the low gate); `left_now`/`right_now` are the fresh per-poll
+/// status (dropped to `.unknown` on an empty read) that back the per-side
+/// display, exactly like LastKnown.left_now/right_now.
 pub fn publishReading(
     io: std.Io,
     model: ?device.Model,
     left: battery.SideReading,
     right: battery.SideReading,
+    left_now: battery.Status,
+    right_now: battery.Status,
     hide: [2]bool,
 ) void {
     mu.lockUncancelable(io);
@@ -176,6 +190,8 @@ pub fn publishReading(
     snap.model = model;
     mergeSide(&snap.left, left);
     mergeSide(&snap.right, right);
+    snap.left_now = left_now;
+    snap.right_now = right_now;
     snap.hide = hide;
     snap.updated = nowSeconds(io);
     json_len = render(&json_buf, snap).len;
@@ -627,8 +643,12 @@ fn render(out: []u8, s: Snapshot) []const u8 {
     var tbuf: [8]u8 = undefined;
 
     const sides: u8 = if (s.model) |m| m.sides() else 2;
-    const left = displaySide(&lbuf, s.left, s.hide[0]);
-    const right = displaySide(&rbuf, s.right, s.hide[1]);
+    // Per-side display uses the FRESH status (sticky level + `*_now`), mirroring
+    // LastKnown.leftText/rightText: a stale "disconnected"/"charging" suffix is
+    // dropped the moment a poll's status comes back empty. The sticky
+    // `s.left/right.status` still drive `all_disconnected` and `isLow` below.
+    const left = displaySide(&lbuf, .{ .level = s.left.level, .status = s.left_now }, s.hide[0]);
+    const right = displaySide(&rbuf, .{ .level = s.right.level, .status = s.right_now }, s.hide[1]);
 
     // Both battery-reporting halves explicitly disconnected (firmware code "4")
     // while connected: their last-known levels are stale cache, so the aggregate
@@ -811,6 +831,8 @@ test "render: connected two-sided snapshot" {
         .model = .defy_wireless,
         .left = side(80, .discharging),
         .right = side(75, .charging),
+        .left_now = .discharging,
+        .right_now = .charging,
         .updated = 1752669000,
     });
     try std.testing.expectEqualStrings(
@@ -864,6 +886,8 @@ test "render: hidden (unverified) side is excluded from the min and reads null" 
         .model = .defy_wireless,
         .left = side(90, .discharging),
         .right = side(15, .discharging),
+        .left_now = .discharging,
+        .right_now = .discharging,
         .hide = .{ false, true },
     });
     // The hidden low right side neither drives the min nor the low flag.
@@ -914,6 +938,10 @@ test "render: both sides disconnected while connected reads '?' aggregate" {
         // Last-known levels survive per side; the aggregate goes to "?".
         .left = side(80, .disconnected),
         .right = side(75, .disconnected),
+        // Both explicitly disconnected on THIS poll — the fresh status carries
+        // the "4" too, so each side keeps its "(disconnected)" suffix.
+        .left_now = .disconnected,
+        .right_now = .disconnected,
     });
     try std.testing.expect(std.mem.indexOf(u8, out, "\"level\":null") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"text\":\"?\"") != null);
@@ -944,6 +972,27 @@ test "render: one side disconnected keeps the other's level" {
     });
     try std.testing.expect(std.mem.indexOf(u8, out, "\"level\":75") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"text\":\"75%\"") != null);
+}
+
+test "render: a stale disconnect drops the per-side suffix" {
+    // The reported bug: the right half went "disconnected" once (sticky status
+    // still 4), but the latest poll read its level back with an EMPTY status
+    // (right_now = unknown). The tray menu shows "50%", so the feed must too —
+    // not "50% (disconnected)". The left half is live, so the aggregate stays a
+    // real number rather than "?".
+    var buf: [json_cap]u8 = undefined;
+    const out = render(&buf, .{
+        .state = .connected,
+        .model = .defy_wireless,
+        .left = side(40, .discharging),
+        .right = side(50, .disconnected),
+        .left_now = .discharging,
+        .right_now = .unknown,
+    });
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"right\":{\"level\":50,\"status\":\"?\",\"text\":\"50%\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"left\":{\"level\":40,\"status\":\"discharging\",\"text\":\"40% (discharging)\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"level\":40") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"text\":\"40%\"") != null);
 }
 
 test "render: both disconnected but not connected keeps last-known number" {

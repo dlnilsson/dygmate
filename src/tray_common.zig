@@ -670,8 +670,11 @@ pub fn runPollLoop(
                 announce_next_read = false;
                 st.mutex.unlock(io);
                 // Feed the external status IPC (yasb/waybar) the same
-                // accepted snapshot the UI renders.
-                statusserver.publishReading(io, found.model, merged.left, merged.right, hiddenSides(res.needs_verification));
+                // accepted snapshot the UI renders: the sticky merged levels
+                // plus the fresh per-poll status (known.merge just set
+                // left_now/right_now), so the feed drops a stale disconnected
+                // suffix exactly like the menu/tooltip.
+                statusserver.publishReading(io, found.model, merged.left, merged.right, known.left_now, known.right_now, hiddenSides(res.needs_verification));
                 // Arm the forceRead verification loop on the transition into
                 // needing it (re-arming every poll would reset the backoff
                 // and hammer RF); clear it once nothing needs verifying.
