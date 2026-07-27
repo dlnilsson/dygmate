@@ -121,6 +121,21 @@ pub fn renderIcon(out: *IconBuf, text: []const u8, color: tray_common.Rgb) void 
     }
 }
 
+/// Fill `out` with `color`, then draw the shared filled battery glyph in white.
+/// Used in place of the number while the keyboard is on the cable (blue icon):
+/// the gauge level is unreliable there, so a battery symbol is clearer than a
+/// misleading percentage.
+pub fn renderBattery(out: *IconBuf, color: tray_common.Rgb) void {
+    var y: usize = 0;
+    while (y < icon_px) : (y += 1) {
+        var x: usize = 0;
+        while (x < icon_px) : (x += 1) {
+            const c = if (tray_common.batteryMask(icon_px, x, y)) tray_common.palette.text else color;
+            putPixel(out, x, y, c);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Application state.
 // ---------------------------------------------------------------------------
@@ -547,9 +562,15 @@ fn rebuildAndNotify(app: *App) void {
         // cache, so show "?" (gray) rather than a misleading number.
         renderIcon(&app.icon_buf, "?", tray_common.palette.gray);
     } else if (disp.level) |lvl| {
-        var num_buf: [4]u8 = undefined;
-        const txt = std.fmt.bufPrint(&num_buf, "{d}", .{lvl}) catch "--";
-        renderIcon(&app.icon_buf, txt, tray_common.iconColor(live, lvl, disp.status));
+        const color = tray_common.iconColor(live, lvl, disp.status);
+        if (live and disp.status.onCable()) {
+            // On the cable: a battery glyph instead of the unreliable percentage.
+            renderBattery(&app.icon_buf, color);
+        } else {
+            var num_buf: [4]u8 = undefined;
+            const txt = std.fmt.bufPrint(&num_buf, "{d}", .{lvl}) catch "--";
+            renderIcon(&app.icon_buf, txt, color);
+        }
     } else {
         renderIcon(&app.icon_buf, "--", tray_common.palette.gray);
     }

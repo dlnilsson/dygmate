@@ -176,6 +176,7 @@ extern "gdi32" fn SelectObject(hdc: HDC, h: HGDIOBJ) callconv(.winapi) ?HGDIOBJ;
 extern "gdi32" fn DeleteObject(ho: HGDIOBJ) callconv(.winapi) BOOL;
 extern "gdi32" fn SetBkMode(hdc: HDC, mode: i32) callconv(.winapi) i32;
 extern "gdi32" fn SetTextColor(hdc: HDC, color: COLORREF) callconv(.winapi) COLORREF;
+extern "gdi32" fn SetPixelV(hdc: HDC, x: i32, y: i32, color: COLORREF) callconv(.winapi) BOOL;
 extern "gdi32" fn CreateSolidBrush(color: COLORREF) callconv(.winapi) ?HBRUSH;
 extern "gdi32" fn CreatePen(iStyle: i32, cWidth: i32, color: COLORREF) callconv(.winapi) ?HPEN;
 extern "gdi32" fn RoundRect(hdc: HDC, left: i32, top: i32, right: i32, bottom: i32, width: i32, height: i32) callconv(.winapi) BOOL;
@@ -626,7 +627,7 @@ pub fn main(init: std.process.Init) void {
     g_nid.uID = 1;
     g_nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
     g_nid.uCallbackMessage = WM_TRAYICON;
-    g_nid.hIcon = makeTextIcon("?", col_gray);
+    g_nid.hIcon = makeTextIcon("?", col_gray, false);
     setUtf16(g_nid.szTip[0..], "No keyboard discovered - last known:\nLeft: no reading yet\nRight: no reading yet");
     _ = Shell_NotifyIconW(NIM_ADD, &g_nid);
     g_nid.uVersion = NOTIFYICON_VERSION_4;
@@ -811,6 +812,7 @@ fn updateTray() void {
     var icon_text: []const u8 = "--";
     var color: COLORREF = col_gray;
     var num_buf: [4]u8 = undefined;
+    var draw_battery = false;
 
     // Refresh each side's last-known snapshot from a live reading, and run the
     // notification logic. Tooltip + icon below render from the snapshots, so
@@ -884,11 +886,16 @@ fn updateTray() void {
         // cache, so show "?" (gray) rather than a misleading number.
         icon_text = "?";
     } else if (disp.level) |lvl| {
-        icon_text = std.fmt.bufPrint(&num_buf, "{d}", .{lvl}) catch "?";
         color = toColorRef(common.iconColor(live, lvl, disp.status));
+        if (live and disp.status.onCable()) {
+            // On the cable: a battery glyph instead of the unreliable percentage.
+            draw_battery = true;
+        } else {
+            icon_text = std.fmt.bufPrint(&num_buf, "{d}", .{lvl}) catch "?";
+        }
     }
 
-    const new_icon = makeTextIcon(icon_text, color);
+    const new_icon = makeTextIcon(icon_text, color, draw_battery);
     const old_icon = g_nid.hIcon;
     g_nid.hIcon = new_icon;
     g_nid.uFlags = NIF_ICON | NIF_TIP | NIF_SHOWTIP;
@@ -1037,7 +1044,7 @@ fn paintOsd(hwnd: HWND) void {
 
 /// Render `text` centered on a solid `color` 16x16 icon. Caller owns the
 /// returned HICON (DestroyIcon). Returns null on any GDI failure.
-fn makeTextIcon(text: []const u8, color: COLORREF) ?HICON {
+fn makeTextIcon(text: []const u8, color: COLORREF, draw_battery: bool) ?HICON {
     const screen = GetDC(null) orelse return null;
     defer _ = ReleaseDC(null, screen);
     const mdc = CreateCompatibleDC(screen) orelse return null;
@@ -1058,18 +1065,31 @@ fn makeTextIcon(text: []const u8, color: COLORREF) ?HICON {
         _ = DeleteObject(@ptrCast(brush));
     }
 
-    const font = CreateFontW(-13, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, 0, 0, null);
-    const prev_font = if (font) |f| SelectObject(mdc, @ptrCast(f)) else null;
-    _ = SetBkMode(mdc, TRANSPARENT);
-    _ = SetTextColor(mdc, col_text);
+    if (draw_battery) {
+        // Draw the shared battery glyph pixel-by-pixel (256 px) so it matches
+        // the Linux tray exactly; GDI text can't render the 🔋 emoji.
+        const n: usize = @intCast(icon_size);
+        var yy: usize = 0;
+        while (yy < n) : (yy += 1) {
+            var xx: usize = 0;
+            while (xx < n) : (xx += 1) {
+                if (common.batteryMask(n, xx, yy)) _ = SetPixelV(mdc, @intCast(xx), @intCast(yy), col_text);
+            }
+        }
+    } else {
+        const font = CreateFontW(-13, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, 0, 0, null);
+        const prev_font = if (font) |f| SelectObject(mdc, @ptrCast(f)) else null;
+        _ = SetBkMode(mdc, TRANSPARENT);
+        _ = SetTextColor(mdc, col_text);
 
-    var wbuf: [8]u16 = undefined;
-    const wn = std.unicode.utf8ToUtf16Le(wbuf[0..7], text) catch 0;
-    _ = DrawTextW(mdc, &wbuf, @intCast(wn), &rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOCLIP);
+        var wbuf: [8]u16 = undefined;
+        const wn = std.unicode.utf8ToUtf16Le(wbuf[0..7], text) catch 0;
+        _ = DrawTextW(mdc, &wbuf, @intCast(wn), &rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOCLIP);
 
-    if (font) |f| {
-        if (prev_font) |pf| _ = SelectObject(mdc, pf);
-        _ = DeleteObject(@ptrCast(f));
+        if (font) |f| {
+            if (prev_font) |pf| _ = SelectObject(mdc, pf);
+            _ = DeleteObject(@ptrCast(f));
+        }
     }
     _ = SelectObject(mdc, prev_bmp); // deselect color_bmp before CreateIconIndirect reads it
 

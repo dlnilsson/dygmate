@@ -116,6 +116,27 @@ pub fn iconColor(live: bool, level: u8, status: battery.Status) Rgb {
     return palette.red;
 }
 
+/// Whether pixel (x, y) on an n×n icon canvas belongs to the filled white
+/// battery glyph the tray draws while the keyboard is on the cable — a
+/// horizontal body with a terminal nub on the right, shown in place of the
+/// unreliable percentage. Filled (not a hollow outline) so it reads as
+/// "full/charged" rather than empty. Pure and resolution-independent so both
+/// trays (Windows 16px GDI bitmap, Linux 22px pixel buffer) share one geometry.
+/// The literal 🔋 emoji can't be used: Linux has no font engine (hand-coded
+/// bitmap glyphs) and Windows GDI can't render color emoji.
+pub fn batteryMask(n: usize, x: usize, y: usize) bool {
+    const bx0 = n * 14 / 100; // body left
+    const bx1 = n * 72 / 100; // body right (nub starts here)
+    const by0 = n * 30 / 100; // body top
+    const by1 = n * 70 / 100; // body bottom
+    const nub_x1 = n * 86 / 100; // nub right edge
+    const nub_y0 = n * 40 / 100;
+    const nub_y1 = n * 60 / 100;
+    const in_body = x >= bx0 and x < bx1 and y >= by0 and y < by1;
+    const in_nub = x >= bx1 and x < nub_x1 and y >= nub_y0 and y < nub_y1;
+    return in_body or in_nub;
+}
+
 // ---------------------------------------------------------------------------
 // Shared state between the UI thread and the polling thread.
 // ---------------------------------------------------------------------------
@@ -1150,6 +1171,25 @@ test "fmt helpers drop the status suffix when the level is known but status isn'
     try std.testing.expectEqualStrings("40% (discharging)", fmtSide(&buf, known));
     // No level at all keeps the "?% (status)" no-data form.
     try std.testing.expectEqualStrings("?% (?)", fmtSide(&buf, .{ .level = null, .status = .unknown }));
+}
+
+test "batteryMask: filled body plus a terminal nub, centered, on both icon sizes" {
+    for ([_]usize{ 16, 22 }) |n| {
+        // Center of the body is part of the glyph (filled, not hollow).
+        try std.testing.expect(batteryMask(n, n / 2, n / 2));
+        // The four corners of the canvas are background.
+        try std.testing.expect(!batteryMask(n, 0, 0));
+        try std.testing.expect(!batteryMask(n, n - 1, n - 1));
+        // A terminal nub exists to the right of the body, vertically centered,
+        // and stops short of the canvas edge.
+        try std.testing.expect(batteryMask(n, n * 74 / 100, n / 2));
+        try std.testing.expect(!batteryMask(n, n - 1, n / 2));
+        // Symmetric about the horizontal midline (body rows mirror).
+        try std.testing.expectEqual(
+            batteryMask(n, n / 3, n * 35 / 100),
+            batteryMask(n, n / 3, n * 65 / 100),
+        );
+    }
 }
 
 test "iconColor: on the cable is always blue, off-cable follows the level ladder" {
