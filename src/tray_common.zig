@@ -632,6 +632,30 @@ pub fn planNotifications(
     return plan;
 }
 
+const LayerTracker = struct {
+    last: ?u8 = null,
+    announce_on_next: bool = false,
+
+    fn feed(self: *LayerTracker, idx: u8) ?u8 {
+        defer self.last = idx;
+        if (self.announce_on_next) {
+            self.announce_on_next = false;
+            return idx;
+        }
+        const prev = self.last orelse return null;
+        return if (idx != prev) idx else null;
+    }
+
+    fn noteDisconnected(self: *LayerTracker) void {
+        if (self.last != null) self.announce_on_next = true;
+    }
+
+    fn noteDisabled(self: *LayerTracker) void {
+        self.last = null;
+        self.announce_on_next = false;
+    }
+};
+
 // ---------------------------------------------------------------------------
 // Background polling thread: owns the serial connection.
 // ---------------------------------------------------------------------------
@@ -664,6 +688,7 @@ pub fn runPollLoop(
     var verify_active = false;
     var verify_backoff_idx: usize = 0;
     var verify_wait_ms: u64 = 0;
+    var layer_tracker: LayerTracker = .{};
     while (!st.stop.load(.acquire)) {
         // A wake can land while disconnected or paused too: guard the sides
         // so the next connection's first reads need verification.
@@ -674,6 +699,7 @@ pub fn runPollLoop(
         // PAUSED: hold no port so Bazecor can use it; idle until resumed.
         if (st.paused.load(.acquire)) {
             const present = device.isDygmaPresent(io) catch false;
+            layer_tracker.noteDisconnected();
             resetLayerState(st);
             setStatus(Ctx, ctx, io, st, wake, offlineStatus(present));
             sleepMs(io, st, 300);
@@ -693,12 +719,14 @@ pub fn runPollLoop(
         st.mutex.unlock(io);
         if (!found.present) {
             if (found.port) |p| gpa.free(p);
+            layer_tracker.noteDisconnected();
             resetLayerState(st);
             setStatus(Ctx, ctx, io, st, wake, .missing);
             sleepMs(io, st, 3000);
             continue;
         }
         const path = found.port orelse {
+            layer_tracker.noteDisconnected();
             resetLayerState(st);
             setStatus(Ctx, ctx, io, st, wake, .available);
             sleepMs(io, st, 3000);
@@ -709,6 +737,7 @@ pub fn runPollLoop(
         // CONNECT
         var dev = focus.Focus.open(io, path) catch {
             const still_present = device.isDygmaPresent(io) catch true;
+            layer_tracker.noteDisconnected();
             resetLayerState(st);
             setStatus(Ctx, ctx, io, st, wake, offlineStatus(still_present));
             sleepMs(io, st, 3000);
@@ -718,7 +747,6 @@ pub fn runPollLoop(
         // A reconnect between a forceRead and its authoritative read must not
         // promote the new connection's first plain cache read to ground truth.
         next_read_authoritative = false;
-        var last_layer: ?u8 = null;
         // Per-connection last-known merge. On a plain read the neuron answers one
         // side at a time, so a single raw read almost never carries both levels;
         // merge across this connection so st.reading (and thus the connect
@@ -740,6 +768,7 @@ pub fn runPollLoop(
         while (!st.stop.load(.acquire)) {
             if (st.paused.load(.acquire)) {
                 const still_present = device.isDygmaPresent(io) catch true;
+                layer_tracker.noteDisconnected();
                 resetLayerState(st);
                 setStatus(Ctx, ctx, io, st, wake, offlineStatus(still_present));
                 break;
@@ -757,6 +786,7 @@ pub fn runPollLoop(
             if (battery_elapsed_ms >= battery_interval_ms) {
                 const raw = battery.read(&dev) catch {
                     const still_present = device.isDygmaPresent(io) catch false;
+                    layer_tracker.noteDisconnected();
                     resetLayerState(st);
                     setStatus(Ctx, ctx, io, st, wake, offlineStatus(still_present));
                     break;
@@ -821,21 +851,19 @@ pub fn runPollLoop(
             if (osd_enabled and st.osd_enabled.load(.acquire)) {
                 const active_layer = layer.readActive(&dev) catch {
                     const still_present = device.isDygmaPresent(io) catch false;
+                    layer_tracker.noteDisconnected();
                     resetLayerState(st);
                     setStatus(Ctx, ctx, io, st, wake, offlineStatus(still_present));
                     break;
                 };
                 if (active_layer) |idx| {
-                    if (last_layer) |prev| {
-                        if (idx != prev) {
-                            st.layer_change.store(idx, .release);
-                            should_post = true;
-                        }
+                    if (layer_tracker.feed(idx)) |changed| {
+                        st.layer_change.store(changed, .release);
+                        should_post = true;
                     }
-                    last_layer = idx;
                 }
             } else {
-                last_layer = null;
+                layer_tracker.noteDisabled();
             }
 
             if (should_post) wake(ctx);
@@ -861,6 +889,7 @@ pub fn runPollLoop(
                 battery.forceRead(&dev) catch |e| {
                     statusserver.emitForceRead("failed", @errorName(e));
                     const still_present = device.isDygmaPresent(io) catch false;
+                    layer_tracker.noteDisconnected();
                     resetLayerState(st);
                     setStatus(Ctx, ctx, io, st, wake, offlineStatus(still_present));
                     break;
@@ -954,6 +983,36 @@ fn countEvents(plan: NotifyPlan) usize {
         if (e != null) n += 1;
     }
     return n;
+}
+
+test "LayerTracker: startup baselines, changes announce, reconnect re-announces current layer" {
+    var tracker = LayerTracker{};
+
+    try std.testing.expectEqual(@as(?u8, null), tracker.feed(0));
+    try std.testing.expectEqual(@as(?u8, null), tracker.feed(0));
+    try std.testing.expectEqual(@as(?u8, 2), tracker.feed(2));
+
+    tracker.noteDisconnected();
+    try std.testing.expectEqual(@as(?u8, 2), tracker.feed(2));
+    try std.testing.expectEqual(@as(?u8, null), tracker.feed(2));
+    try std.testing.expectEqual(@as(?u8, 3), tracker.feed(3));
+}
+
+test "LayerTracker: disconnect before any layer does not announce initial connect" {
+    var tracker = LayerTracker{};
+
+    tracker.noteDisconnected();
+    try std.testing.expectEqual(@as(?u8, null), tracker.feed(1));
+}
+
+test "LayerTracker: disabling overlay clears reconnect announcement state" {
+    var tracker = LayerTracker{};
+
+    try std.testing.expectEqual(@as(?u8, null), tracker.feed(1));
+    tracker.noteDisconnected();
+    tracker.noteDisabled();
+    try std.testing.expectEqual(@as(?u8, null), tracker.feed(1));
+    try std.testing.expectEqual(@as(?u8, 2), tracker.feed(2));
 }
 
 test "planNotifications: low crossing fires once, latched afterwards" {
