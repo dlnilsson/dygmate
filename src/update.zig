@@ -204,3 +204,15 @@ test parseAndCompare {
     var out3 = Result{};
     try std.testing.expect(!parseAndCompare(gpa, "not json", "0.1.0", &out3));
 }
+
+test "release check recognizes a major-version update" {
+    const gpa = std.testing.allocator;
+    const body =
+        \\{"tag_name":"v1.0.0","html_url":"https://github.com/dlnilsson/dygmate/releases/tag/v1.0.0"}
+    ;
+    var out = Result{};
+
+    try std.testing.expect(parseAndCompare(gpa, body, "v0.1.5", &out));
+    try std.testing.expectEqualStrings("v1.0.0", out.tag());
+    try std.testing.expectEqualStrings("https://github.com/dlnilsson/dygmate/releases/tag/v1.0.0", out.url());
+}
