@@ -1,11 +1,5 @@
 const std = @import("std");
 
-/// Falls back to the package version plus a "-dirty" marker; GitHub release
-/// builds override it with the git tag via `-Dversion=<tag>` so `--version`
-/// reports the tagged release. The marker makes local/unofficial builds
-/// identifiable in the tray menu and `--version` output.
-const default_version = @import("build.zig.zon").version ++ "-dirty";
-
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -13,7 +7,11 @@ pub fn build(b: *std.Build) void {
     const serial_dep = b.dependency("serial", .{});
     const serial_mod = serial_dep.module("serial");
 
-    const version = b.option([]const u8, "version", "Version string reported by --version") orelse default_version;
+    // Development builds report the source revision with a "-dirty" marker
+    // rather than the package version. Release builds pass `-Dversion=<tag>`,
+    // avoiding the Git lookup and retaining the published semantic version.
+    const version = b.option([]const u8, "version", "Version string reported by --version") orelse
+        b.fmt("{s}-dirty", .{std.mem.trimEnd(u8, b.run(&.{ "git", "rev-parse", "--short=7", "HEAD" }), "\r\n")});
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", version);
     const build_options_mod = build_options.createModule();
