@@ -10,7 +10,7 @@ const serial = @import("serial");
 const windows = std.os.windows;
 const Io = std.Io;
 
-pub const Error = error{ Timeout, ResponseTooLong, PortError, InvalidCommand };
+pub const Error = error{ Timeout, ResponseTooLong, PortError, InvalidCommand, InvalidResponse };
 
 /// When true, every exchange is dumped to stderr (--debug).
 pub var debug = false;
@@ -61,16 +61,6 @@ pub const Focus = struct {
 
     pub fn close(self: *Focus) void {
         self.port.close(self.io);
-    }
-
-    /// Drop any buffered/late RX data and reset the line scanner. Used when an
-    /// optional read (battery status) is abandoned on error and we keep the
-    /// connection instead of reconnecting: it clears the abandoned command's
-    /// pending response so it can't answer — and desync — the next exchange.
-    /// Best-effort; a flush failure is ignored.
-    pub fn flushInput(self: *Focus) void {
-        serial.flushSerialPort(self.port, .input) catch {};
-        self.scanner.reset();
     }
 
     /// Send a bare Focus command and return its payload (lines joined by

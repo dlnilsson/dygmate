@@ -68,38 +68,33 @@ pub const force_read_settle_s: u64 = 4;
 /// immediately, each further attempt waits the next entry (last repeats).
 pub const verify_backoff_s = [_]u64{ 5, 15, 45, 120 };
 
-/// Issue the four battery read commands. The per-side level is the payload we
-/// need: a parse failure degrades to null, and a transport error propagates
-/// (the connection is gone — the caller reconnects, which flushes a desynced
-/// port). The status is optional/nice-to-have: it is read best-effort AFTER
-/// both levels (see `readStatus`), so a slow or failing status can never drop
-/// or delay a level in the same cycle. Reads the neuron's cached values —
-/// callers should use `read` for the disconnected-side retry.
+/// Issue the four battery read commands. Empty level/status payloads are
+/// routine "no cached value yet" answers and degrade to null/unknown, but
+/// command-shaped mismatches are fatal: if a status, layer, or forceRead reply
+/// answers a later battery command, the serial stream is desynced and the
+/// caller must reconnect. Status is still read AFTER both levels so it never
+/// sits between the two required level reads in a successful cycle. Reads the
+/// neuron's cached values — callers should use `read` for the disconnected-side
+/// retry.
 pub fn readAll(f: *focus.Focus) focus.Error!Reading {
     var buf: [256]u8 = undefined;
     // Both levels first (required, order matters — a status read is best-effort
     // and must not sit between the two level reads).
-    const left_level = parseLevel(try f.request("wireless.battery.left.level", &buf));
-    const right_level = parseLevel(try f.request("wireless.battery.right.level", &buf));
+    const left_level = try parseLevelStrict(try f.request("wireless.battery.left.level", &buf));
+    const right_level = try parseLevelStrict(try f.request("wireless.battery.right.level", &buf));
     return .{
-        .left = .{ .level = left_level, .status = readStatus(f, "wireless.battery.left.status", &buf) },
-        .right = .{ .level = right_level, .status = readStatus(f, "wireless.battery.right.status", &buf) },
+        .left = .{ .level = left_level, .status = try readStatus(f, "wireless.battery.left.status", &buf) },
+        .right = .{ .level = right_level, .status = try readStatus(f, "wireless.battery.right.status", &buf) },
     };
 }
 
-/// Read one side's status best-effort. Status is optional: a transport error
-/// (timeout / port error) yields `.unknown` instead of propagating, so it
-/// never fails or blocks the whole reading. On error the port's RX buffer is
-/// flushed so the abandoned command's late response can't desync the next
-/// read; any residual mis-read is contained by the Acceptor's plausibility
-/// gate. An empty payload already parses to `.unknown` without erroring, so the
-/// common neuron false-negative costs nothing here.
-fn readStatus(f: *focus.Focus, cmd: []const u8, buf: []u8) Status {
-    const resp = f.request(cmd, buf) catch {
-        f.flushInput();
-        return .unknown;
-    };
-    return parseStatus(resp);
+/// Read one side's status. The status value is optional, but the exchange is
+/// not: a timeout, port error, or response-shape mismatch means the abandoned
+/// reply can answer a later command (e.g. status "4" as a 4% level), so the
+/// caller reconnects instead of continuing on this stream. A clean empty
+/// payload still parses to `.unknown`.
+fn readStatus(f: *focus.Focus, cmd: []const u8, buf: []u8) focus.Error!Status {
+    return parseStatusStrict(try f.request(cmd, buf));
 }
 
 /// One poll of both halves, with Bazecor's single retry: if either side comes
@@ -144,7 +139,8 @@ fn mergeRetrySide(first: SideReading, second: SideReading) SideReading {
 /// the RX queue, desyncing every later exchange on this connection.
 pub fn forceRead(f: *focus.Focus) focus.Error!void {
     var buf: [64]u8 = undefined;
-    _ = try f.request("wireless.battery.forceRead", &buf);
+    const resp = try f.request("wireless.battery.forceRead", &buf);
+    if (std.mem.trim(u8, resp, " \t\r\n").len != 0) return error.InvalidResponse;
 }
 
 fn sleepMs(io: std.Io, ms: u64) void {
@@ -448,29 +444,51 @@ fn lowestLevel(r: Reading) ?u8 {
 }
 
 pub fn parseLevel(payload: []const u8) ?u8 {
+    return parseLevelStrict(payload) catch null;
+}
+
+fn parseLevelStrict(payload: []const u8) focus.Error!?u8 {
     const t = std.mem.trim(u8, payload, " \t\r\n");
+    if (t.len == 0) return null;
+    var it = std.mem.tokenizeAny(u8, t, " \t\r\n");
+    const tok = it.next() orelse return null;
+    if (it.next() != null) return error.InvalidResponse;
     // The firmware reports raw hex ("0x...") while a reading is invalid;
     // Bazecor treats those as no-value too.
-    if (std.mem.indexOf(u8, t, "0x") != null) return null;
-    const v = std.fmt.parseInt(u8, t, 10) catch return null;
+    if (std.mem.indexOf(u8, tok, "0x") != null) return null;
+    const v = std.fmt.parseInt(u8, tok, 10) catch return error.InvalidResponse;
     return if (v <= 100) v else null;
 }
 
 pub fn parseStatus(payload: []const u8) Status {
+    return parseStatusStrict(payload) catch .unknown;
+}
+
+fn parseStatusStrict(payload: []const u8) focus.Error!Status {
     const t = std.mem.trim(u8, payload, " \t\r\n");
-    // An empty (or otherwise unparseable) status response is `.unknown`, not a
-    // disconnect: the neuron intermittently returns nothing for a read even
-    // while both halves are connected and in use (a transient false negative /
-    // RF lag). `.unknown` is skipped by the last-known merges, so such a read
-    // holds the last real value instead of flipping the tray to "?". A genuine
-    // disconnect reports the explicit code "4".
-    const v = std.fmt.parseInt(u8, t, 10) catch return .unknown;
+    // An empty status response is `.unknown`, not a disconnect: the neuron
+    // intermittently returns nothing for a read even while both halves are
+    // connected and in use (a transient false negative / RF lag). `.unknown`
+    // is skipped by the last-known merges, so such a read holds the last real
+    // value instead of flipping the tray to "?". A genuine disconnect reports
+    // the explicit code "4".
+    if (t.len == 0) return .unknown;
+    var it = std.mem.tokenizeAny(u8, t, " \t\r\n");
+    const tok = it.next() orelse return .unknown;
+    // A second token is the same command-shape mismatch parseLevelStrict
+    // guards against (e.g. a bled-through layer.state line) — fatal.
+    if (it.next() != null) return error.InvalidResponse;
+    const v = std.fmt.parseInt(u8, tok, 10) catch return error.InvalidResponse;
     return switch (v) {
         0 => .discharging,
         1 => .charging,
         2 => .charged,
         3 => .fault,
         4 => .disconnected,
+        // An in-range but undefined code is a single well-shaped value, just
+        // like a level >100 — mirror parseLevelStrict and treat it as no
+        // information rather than fatal; there's no way to tell an unused
+        // firmware code from a genuine future one.
         else => .unknown,
     };
 }
@@ -488,6 +506,13 @@ test "parseLevel rejects invalid values" {
     try std.testing.expectEqual(@as(?u8, null), parseLevel("101"));
     try std.testing.expectEqual(@as(?u8, null), parseLevel("abc"));
     try std.testing.expectEqual(@as(?u8, null), parseLevel(""));
+}
+
+test "parseLevelStrict rejects cross-command payloads" {
+    try std.testing.expectEqual(@as(?u8, null), try parseLevelStrict(""));
+    try std.testing.expectEqual(@as(?u8, 4), try parseLevelStrict("4"));
+    try std.testing.expectEqual(@as(?u8, 100), try parseLevelStrict("100"));
+    try std.testing.expectError(error.InvalidResponse, parseLevelStrict("0 0 0 0"));
 }
 
 test "parseStatus maps firmware codes" {
@@ -512,6 +537,16 @@ test "parseStatus treats an empty/unparseable response as unknown" {
     try std.testing.expectEqual(Status.unknown, parseStatus(""));
     try std.testing.expectEqual(Status.unknown, parseStatus("   "));
     try std.testing.expectEqual(Status.unknown, parseStatus("\r\n"));
+}
+
+test "parseStatusStrict rejects cross-command shape but tolerates undefined codes" {
+    try std.testing.expectEqual(Status.unknown, try parseStatusStrict(""));
+    try std.testing.expectEqual(Status.discharging, try parseStatusStrict("0"));
+    try std.testing.expectEqual(Status.disconnected, try parseStatusStrict("4"));
+    // In-range and well-shaped, just an undefined code — same treatment as
+    // an out-of-range level, not a fatal shape mismatch.
+    try std.testing.expectEqual(Status.unknown, try parseStatusStrict("100"));
+    try std.testing.expectError(error.InvalidResponse, parseStatusStrict("0 0 0"));
 }
 
 test "suggestedPollIntervalSeconds: fast when suspect, unknown, or low" {

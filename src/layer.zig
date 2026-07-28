@@ -15,7 +15,7 @@ pub fn readActive(f: *focus.Focus) focus.Error!?u8 {
     // `layer.state` answers one line of 32 space-separated 0/1 flags
     // (~65 bytes); request() needs a byte of joining headroom on top.
     var buf: [128]u8 = undefined;
-    return parseActive(try f.request("layer.state", &buf));
+    return parseActiveStrict(try f.request("layer.state", &buf));
 }
 
 /// Parse a `layer.state` payload: one 0/1 flag per layer, whitespace
@@ -23,17 +23,26 @@ pub fn readActive(f: *focus.Focus) focus.Error!?u8 {
 /// shift/lock keys activate a layer on top of base, and key lookup goes
 /// top-down.
 pub fn parseActive(payload: []const u8) ?u8 {
+    return parseActiveStrict(payload) catch null;
+}
+
+fn parseActiveStrict(payload: []const u8) focus.Error!?u8 {
     var top: ?u8 = null;
-    var idx: u8 = 0;
+    var idx: usize = 0;
+    var seen = false;
     var it = std.mem.tokenizeAny(u8, payload, " \t\r\n");
     while (it.next()) |tok| {
-        const v = std.fmt.parseInt(u8, tok, 10) catch return null;
-        if (v != 0) top = idx;
-        if (idx == std.math.maxInt(u8)) return null;
+        seen = true;
+        const v = std.fmt.parseInt(u8, tok, 10) catch return error.InvalidResponse;
+        if (v > 1) return error.InvalidResponse;
+        if (v == 1) {
+            if (idx > max_layer_index) return null;
+            top = @intCast(idx);
+        }
         idx += 1;
     }
-    const t = top orelse return null;
-    return if (t <= max_layer_index) t else null;
+    if (!seen) return error.InvalidResponse;
+    return top;
 }
 
 pub fn displayNumber(index: u8) u8 {
@@ -58,10 +67,20 @@ test "parseActive rejects invalid payloads" {
     try std.testing.expectEqual(@as(?u8, null), parseActive("x"));
     try std.testing.expectEqual(@as(?u8, null), parseActive("1 0 x"));
     try std.testing.expectEqual(@as(?u8, null), parseActive("-1"));
+    try std.testing.expectEqual(@as(?u8, null), parseActive("4"));
+    try std.testing.expectEqual(@as(?u8, null), parseActive("100"));
     // No layer active at all.
     try std.testing.expectEqual(@as(?u8, null), parseActive("0 0 0 0 0 0 0 0 0 0"));
     // Active flag beyond the keyboard's 10 layers.
     try std.testing.expectEqual(@as(?u8, null), parseActive("1 0 0 0 0 0 0 0 0 0 1"));
+}
+
+test "parseActiveStrict rejects battery-shaped payloads" {
+    try std.testing.expectEqual(@as(?u8, 0), try parseActiveStrict("1 0 0"));
+    try std.testing.expectEqual(@as(?u8, null), try parseActiveStrict("0 0 0"));
+    try std.testing.expectError(error.InvalidResponse, parseActiveStrict(""));
+    try std.testing.expectError(error.InvalidResponse, parseActiveStrict("4"));
+    try std.testing.expectError(error.InvalidResponse, parseActiveStrict("100"));
 }
 
 test "displayNumber converts to user-facing layer number" {
