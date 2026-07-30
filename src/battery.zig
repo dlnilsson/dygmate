@@ -60,9 +60,6 @@ pub const low_level_fast_threshold: u8 = 20;
 pub const level_jump_tolerance: u8 = 3;
 /// Consecutive sightings before an implausible jump is accepted.
 pub const suspect_confirm_polls: u8 = 3;
-/// Consecutive sightings before an initial 100 (no baseline yet) is trusted —
-/// 100 is exactly what the post-wake bogus cache reports.
-pub const first_reading_confirm_polls: u8 = 2;
 pub const force_read_settle_s: u64 = 4;
 /// Automatic forceRead verification retry schedule; first attempt fires
 /// immediately, each further attempt waits the next entry (last repeats).
@@ -256,10 +253,10 @@ pub const Acceptor = struct {
             st.pending_count = 0;
             // Only a side that has ever reported gets guarded: with no
             // baseline there is nothing for a bogus cache to contradict (the
-            // no-baseline rules already hold an initial low for verification
-            // and confirm an initial 100 by repetition), and guarding it
-            // would keep the forceRead retry loop alive forever on models
-            // where that side never reports at all (Sonsei's right channel).
+            // no-baseline rules already hold an initial 100 or an initial low
+            // for authoritative verification), and guarding it would keep the
+            // forceRead retry loop alive forever on models where that side
+            // never reports at all (Sonsei's right channel).
             st.wake_guard = st.accepted != null;
         }
     }
@@ -318,11 +315,26 @@ pub const Acceptor = struct {
         // accept, no baseline, no streak advance.
         if (raw.status == .fault)
             return .{ .level = st.accepted, .status = raw.status };
-        // While disconnect-latched, a level with an empty status is the same
+        // While disconnect-latched, a level with an empty status is usually the
         // stale cache the explicit "4" just exposed (the neuron serves it
-        // persistently, mostly WITHOUT the status) — ignore it likewise.
-        if (raw.status == .unknown and st.disconnected)
-            return .{ .level = st.accepted, .status = raw.status };
+        // persistently, mostly WITHOUT the status). A value that MATCHES the
+        // accepted baseline (within tolerance) is that cache — hold it silently.
+        // A value that DIFFERS is not the cache the "4" exposed: the side may be
+        // back and peeking a real reading through a stale latch, so flag it
+        // suspect (fast-poll) rather than confidently showing the baseline as if
+        // it were still confirmed. It is never accepted by plain repetition
+        // (confirm=null) and, with a baseline present, never arms forceRead for
+        // a possibly-absent latched side — only an explicit live status resolves
+        // the latch. With no baseline there is nothing to differ from, so the
+        // read stays ignored like any other disconnect cache.
+        if (raw.status == .unknown and st.disconnected) {
+            const acc = st.accepted orelse
+                return .{ .level = st.accepted, .status = raw.status };
+            const diff = if (lvl > acc) lvl - acc else acc - lvl;
+            if (diff <= level_jump_tolerance)
+                return .{ .level = st.accepted, .status = raw.status };
+            return suspectSide(st, raw, null);
+        }
         if (raw.status.onCable()) {
             // A level at/above the low threshold (and any upward charging
             // progress) is trusted outright — the side really does gain charge
@@ -360,14 +372,18 @@ pub const Acceptor = struct {
                 return suspectSide(st, raw, null);
             return suspectSide(st, raw, suspect_confirm_polls);
         }
-        // No baseline to jump-gate against; an initial 100 matches the known
-        // bogus post-wake value (confirm by repetition), and an initial low
-        // may be a stale pre-sleep cache after an app restart following a
-        // wake — it must never fire a low-battery notification off plain
-        // reads, so hold it for authoritative verification. Take the rest at
-        // face value.
+        // No baseline to jump-gate against. A mid-range reading is taken at
+        // face value — like Bazecor, which shows the neuron's live plain read
+        // directly. The two suspicious ends are held for an authoritative
+        // forceRead read rather than trusted off plain reads: an initial 100 is
+        // exactly the bogus value the neuron serves for an asleep/absent side,
+        // and an initial low may be a stale pre-sleep cache after an app restart
+        // (it must never fire a low-battery notification off plain reads).
+        // Plain-read repetition of either is the same cache re-served and can
+        // never confirm it — sideNeedsVerification arms the forceRead loop for
+        // any pending value with no baseline, and a genuinely-awake keyboard
+        // settles in a single authoritative read.
         if (lvl >= low_level_fast_threshold and lvl < 100) return acceptSide(st, raw);
-        if (lvl >= 100) return suspectSide(st, raw, first_reading_confirm_polls);
         return suspectSide(st, raw, null);
     }
 
@@ -600,15 +616,24 @@ test "Acceptor: first reading below 100 accepted immediately" {
     try std.testing.expect(!res.suspect);
 }
 
-test "Acceptor: first reading of 100 needs confirmation unless charging" {
+test "Acceptor: an initial 100 is held for authoritative verification, never confirmed by repetition" {
     var a: Acceptor = .{};
-    var res = feedLeft(&a, 100, .discharging);
-    try std.testing.expectEqual(@as(?u8, null), res.reading.left.level);
-    try std.testing.expect(res.suspect);
-    res = feedLeft(&a, 100, .discharging);
+    // Plain-read repetition of the bogus asleep-cache 100 never confirms it —
+    // repetition of a cache adds no information, so it stays held and pending.
+    for (0..5) |_| {
+        const res = feedLeft(&a, 100, .discharging);
+        try std.testing.expectEqual(@as(?u8, null), res.reading.left.level);
+        try std.testing.expect(res.suspect);
+        try std.testing.expect(res.needs_verification[0]);
+    }
+    // A forceRead read settles it — a genuinely-charged awake keyboard really
+    // reads 100 — so the tray shows the value only once it's authoritative.
+    const res = a.feedAuthoritative(.{ .left = side(100, .discharging), .right = side(null, .unknown) });
     try std.testing.expectEqual(@as(?u8, 100), res.reading.left.level);
-    try std.testing.expect(!res.suspect);
+    try std.testing.expect(!res.anyVerification());
 
+    // Charging is trusted outright at/above the low threshold; the cable path
+    // is unchanged.
     var b: Acceptor = .{};
     const charged = feedLeft(&b, 100, .charged);
     try std.testing.expectEqual(@as(?u8, 100), charged.reading.left.level);
@@ -739,22 +764,47 @@ test "Acceptor: an explicit disconnect resets the pending streak" {
     try std.testing.expect(!res.suspect);
 }
 
-test "Acceptor: after a disconnect, unknown-status levels are distrusted" {
+test "Acceptor: after a disconnect, a matching cached level stays quiet but a differing one is flagged" {
     // The tail-log failure mode: the neuron reports "4" once, then keeps
-    // serving the bogus cached 100 with an EMPTY status on later polls —
-    // repetition of that cache must never confirm it.
+    // serving a cached level with an EMPTY status on later polls. A value that
+    // DIFFERS from the baseline is not the cache the "4" exposed (a stale cache
+    // repeats the accepted value) — it may be the side peeking a real reading
+    // through the latch, so it is flagged suspect while the last accepted value
+    // is still held for display. It is never accepted by plain repetition and
+    // never arms forceRead for a latched (possibly-absent) side.
     var a: Acceptor = .{};
     _ = feedLeft(&a, 40, .discharging);
     _ = feedLeft(&a, 100, .disconnected);
     for (0..5) |_| {
         const res = feedLeft(&a, 100, .unknown);
         try std.testing.expectEqual(@as(?u8, 40), res.reading.left.level);
-        try std.testing.expect(!res.suspect);
+        try std.testing.expect(res.suspect);
+        try std.testing.expect(!res.needs_verification[0]);
     }
     // An explicit live status clears the latch; normal gating resumes.
     const res = feedLeft(&a, 39, .discharging);
     try std.testing.expectEqual(@as(?u8, 39), res.reading.left.level);
     try std.testing.expect(!res.suspect);
+}
+
+test "Acceptor: a latched level matching the baseline stays quiet" {
+    // The ordinary disconnect case: a half drops RF and the neuron keeps
+    // serving its last real level. That matches the baseline, so it is the
+    // stale cache and must stay silent (no perpetual suspect on an off half).
+    var a: Acceptor = .{};
+    _ = feedLeft(&a, 90, .discharging);
+    _ = feedLeft(&a, 90, .disconnected); // latch on the true baseline
+    for (0..5) |_| {
+        const res = feedLeft(&a, 90, .unknown);
+        try std.testing.expectEqual(@as(?u8, 90), res.reading.left.level);
+        try std.testing.expect(!res.suspect);
+        try std.testing.expect(!res.needs_verification[0]);
+    }
+    // A differing value peeking through the latch: held, but flagged suspect.
+    const res = feedLeft(&a, 50, .unknown);
+    try std.testing.expectEqual(@as(?u8, 90), res.reading.left.level);
+    try std.testing.expect(res.suspect);
+    try std.testing.expect(!res.needs_verification[0]);
 }
 
 test "Acceptor: read-retry merge keeps the first read's disconnect evidence" {
