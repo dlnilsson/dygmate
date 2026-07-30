@@ -276,12 +276,19 @@ pub const Acceptor = struct {
     }
 
     /// A side needs an authoritative read when its pending value would newly
-    /// cross below the low threshold (never confirmable by cache repetition)
-    /// or while it is wake-guarded (guard clears only on an accepted level,
-    /// so a side that stays silent after a wake keeps the retry loop alive).
+    /// cross below the low threshold (never confirmable by cache repetition),
+    /// while it is wake-guarded (guard clears only on an accepted level, so a
+    /// side that stays silent after a wake keeps the retry loop alive), or
+    /// whenever it holds a pending value with no accepted baseline yet: there
+    /// is nothing to fall back to and plain-read repetition of that value is
+    /// just the same neuron cache re-served, so only a forceRead can settle it
+    /// (an initial 100 — the bogus asleep-cache value — or an initial low both
+    /// land here). A side that never reports a level never builds a pending
+    /// value, so this can't keep the retry loop alive on a silent channel.
     fn sideNeedsVerification(st: SideState) bool {
         if (st.wake_guard) return true;
         const p = st.pending orelse return false;
+        if (st.accepted == null) return true;
         return p < low_level_fast_threshold;
     }
 
