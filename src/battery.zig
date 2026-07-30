@@ -79,9 +79,27 @@ pub fn readAll(f: *focus.Focus) focus.Error!Reading {
     // and must not sit between the two level reads).
     const left_level = try parseLevelStrict(try f.request("wireless.battery.left.level", &buf));
     const right_level = try parseLevelStrict(try f.request("wireless.battery.right.level", &buf));
+    const left_status = try readStatus(f, "wireless.battery.left.status", &buf);
+    const right_status = try readStatus(f, "wireless.battery.right.status", &buf);
     return .{
-        .left = .{ .level = left_level, .status = try readStatus(f, "wireless.battery.left.status", &buf) },
-        .right = .{ .level = right_level, .status = try readStatus(f, "wireless.battery.right.status", &buf) },
+        .left = sideReading(left_level, left_status),
+        .right = sideReading(right_level, right_status),
+    };
+}
+
+/// Pair a level with its status, applying the Focus API invariant that a level
+/// read alongside `disconnected` (status 4) is meaningless: the half is
+/// physically off the RF board, so whatever level the neuron still has cached
+/// for it is stale garbage (the log shows it flipping "" -> "100" between reads
+/// while status stays 4). Drop it to null right here so the bogus level never
+/// enters the retry merge, the Acceptor, or the debug `raw` feed — rather than
+/// leaning on every downstream stage to re-dismiss it. The `disconnected`
+/// status itself is preserved: it's what drives the retry, the "?" icon, and
+/// the notification gate.
+fn sideReading(level: ?u8, status: Status) SideReading {
+    return .{
+        .level = if (status == .disconnected) null else level,
+        .status = status,
     };
 }
 
@@ -807,18 +825,33 @@ test "Acceptor: a latched level matching the baseline stays quiet" {
     try std.testing.expect(!res.needs_verification[0]);
 }
 
+test "readAll invariant: a disconnected side carries no level" {
+    // Focus API: a level read alongside status 4 is meaningless (the half is
+    // physically off the RF board). `sideReading` — the shape `readAll` builds
+    // each side with — drops it to null so the bogus value never reaches the
+    // retry merge, the Acceptor, or the debug feed. The exact tail-log case:
+    // level "100" arriving with status "4".
+    try std.testing.expectEqual(@as(?u8, null), sideReading(100, .disconnected).level);
+    try std.testing.expectEqual(Status.disconnected, sideReading(100, .disconnected).status);
+    // Every other status keeps its level untouched.
+    try std.testing.expectEqual(@as(?u8, 100), sideReading(100, .discharging).level);
+    try std.testing.expectEqual(@as(?u8, 42), sideReading(42, .charging).level);
+    try std.testing.expectEqual(@as(?u8, null), sideReading(null, .unknown).level);
+}
+
 test "Acceptor: read-retry merge keeps the first read's disconnect evidence" {
-    // The 500ms retry often answers with all-empty fields; the merged reading
-    // must still carry the first attempt's "4" (and its level for context).
+    // A disconnected side has a null level (readAll dropped it), but the 500ms
+    // retry often answers with all-empty fields — the merged reading must still
+    // carry the first attempt's "4" so the Acceptor learns the side is down.
     const merged = mergeRetrySide(
-        side(100, .disconnected),
+        side(null, .disconnected),
         side(null, .unknown),
     );
-    try std.testing.expectEqual(@as(?u8, 100), merged.level);
+    try std.testing.expectEqual(@as(?u8, null), merged.level);
     try std.testing.expectEqual(Status.disconnected, merged.status);
-    // A retry that recovered wins with its fresh fields.
+    // A retry that recovered wins with its fresh live fields.
     const recovered = mergeRetrySide(
-        side(100, .disconnected),
+        side(null, .disconnected),
         side(42, .discharging),
     );
     try std.testing.expectEqual(@as(?u8, 42), recovered.level);
