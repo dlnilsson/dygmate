@@ -61,6 +61,12 @@ pub const level_jump_tolerance: u8 = 3;
 /// Consecutive sightings before an implausible jump is accepted.
 pub const suspect_confirm_polls: u8 = 3;
 pub const force_read_settle_s: u64 = 4;
+/// Pause before the single disconnect retry in `read`. A momentary RF drop can
+/// take a beat to recover, and the neuron keeps serving the stale off-RF cache
+/// until it does — a sub-second retry lands squarely in that window and just
+/// re-reads the same "4"/cached-100. A few seconds gives a genuinely transient
+/// drop time to come back before we latch the side disconnected.
+pub const disconnect_retry_sleep_ms: u64 = 4000;
 /// Automatic forceRead verification retry schedule; first attempt fires
 /// immediately, each further attempt waits the next entry (last repeats).
 pub const verify_backoff_s = [_]u64{ 5, 15, 45, 120 };
@@ -114,7 +120,8 @@ fn readStatus(f: *focus.Focus, cmd: []const u8, buf: []u8) focus.Error!Status {
 
 /// One poll of both halves, with Bazecor's single retry: if either side comes
 /// back "disconnected" (status 4) the RF link to that half briefly dropped, so
-/// wait 500ms and read once more. Deliberately NO forceRead here — the neuron
+/// wait `disconnect_retry_sleep_ms` and read once more. Deliberately NO
+/// forceRead here — the neuron
 /// serves cached values on a plain read, and forcing a re-poll every cycle
 /// blanks those values mid-refresh (empty responses) and hammers the sleeping
 /// sides' RF link. Mirrors battery.Read in the Go tray; forceRead is a manual,
@@ -122,7 +129,7 @@ fn readStatus(f: *focus.Focus, cmd: []const u8, buf: []u8) focus.Error!Status {
 pub fn read(f: *focus.Focus) focus.Error!Reading {
     const first = try readAll(f);
     if (first.left.status != .disconnected and first.right.status != .disconnected) return first;
-    sleepMs(f.io, 500);
+    sleepMs(f.io, disconnect_retry_sleep_ms);
     // A transport error mid-retry poisons the stream: the abandoned command's
     // response arrives later and answers the NEXT command, shifting every
     // response after it by one (a status "2" then parses as a 2% level).
@@ -140,9 +147,17 @@ pub fn read(f: *focus.Focus) focus.Error!Reading {
 /// explicit "4", or the Acceptor never learns the side is disconnected and
 /// accepts the stale cached level that "4" just exposed.
 fn mergeRetrySide(first: SideReading, second: SideReading) SideReading {
+    const status = if (second.status == .unknown) first.status else second.status;
+    // Preserve `sideReading`'s invariant across the merge: a disconnected side
+    // carries no level. The retry routinely pairs the neuron's stale cached
+    // level (served with an EMPTY status on the second read, so `sideReading`
+    // never dropped it) with the first read's explicit "4" — exactly the
+    // tail-log case (`100` then `""`). That 100 is the same off-RF cache the
+    // "4" already exposed, so it must not ride back in on the merged reading
+    // and reach the raw debug feed or the Acceptor's disconnect branch.
     return .{
-        .level = second.level orelse first.level,
-        .status = if (second.status == .unknown) first.status else second.status,
+        .level = if (status == .disconnected) null else second.level orelse first.level,
+        .status = status,
     };
 }
 
@@ -232,6 +247,13 @@ pub const Acceptor = struct {
         /// by an authoritative post-forceRead read — callers should run the
         /// forceRead verification loop until it clears.
         needs_verification: [2]bool,
+        /// Per side (0=left, 1=right): the side is latched disconnected — an
+        /// explicit status 4 was seen and no live status has cleared it yet.
+        /// Its level is off-RF stale cache, so callers must not report it
+        /// (render "?", drop it from the icon's min). Unlike the raw per-poll
+        /// status — which only carries the "4" intermittently — this latch
+        /// stays set across the empty-status polls in between.
+        disconnected: [2]bool,
 
         pub fn anyVerification(self: Result) bool {
             return self.needs_verification[0] or self.needs_verification[1];
@@ -287,6 +309,7 @@ pub const Acceptor = struct {
                 sideNeedsVerification(self.left),
                 sideNeedsVerification(self.right),
             },
+            .disconnected = .{ self.left.disconnected, self.right.disconnected },
         };
     }
 
@@ -751,6 +774,22 @@ test "Acceptor: disconnected 100 is never accepted, however often it repeats" {
     }
 }
 
+test "Acceptor: Result.disconnected latches across empty polls until a live status" {
+    var a: Acceptor = .{};
+    _ = feedLeft(&a, 62, .discharging);
+    // An explicit "4" latches the side; the flag rides through the empty-status
+    // polls that follow (the "4" only peeks through intermittently) so display
+    // code can suppress the stale level the whole time it's off the RF board.
+    try std.testing.expect(feedLeft(&a, null, .disconnected).disconnected[0]);
+    for (0..5) |_| {
+        try std.testing.expect(feedLeft(&a, 100, .unknown).disconnected[0]);
+    }
+    // A live status clears it; the right side never latched.
+    const res = feedLeft(&a, 61, .discharging);
+    try std.testing.expect(!res.disconnected[0]);
+    try std.testing.expect(!res.disconnected[1]);
+}
+
 test "Acceptor: disconnected reading establishes no baseline" {
     var a: Acceptor = .{};
     var res = feedLeft(&a, 100, .disconnected);
@@ -840,8 +879,8 @@ test "readAll invariant: a disconnected side carries no level" {
 }
 
 test "Acceptor: read-retry merge keeps the first read's disconnect evidence" {
-    // A disconnected side has a null level (readAll dropped it), but the 500ms
-    // retry often answers with all-empty fields — the merged reading must still
+    // A disconnected side has a null level (readAll dropped it), but the
+    // disconnect retry often answers with all-empty fields — the merged reading must still
     // carry the first attempt's "4" so the Acceptor learns the side is down.
     const merged = mergeRetrySide(
         side(null, .disconnected),
@@ -856,6 +895,17 @@ test "Acceptor: read-retry merge keeps the first read's disconnect evidence" {
     );
     try std.testing.expectEqual(@as(?u8, 42), recovered.level);
     try std.testing.expectEqual(Status.discharging, recovered.status);
+    // The exact tail-log case: the first read latched "4" (level already
+    // dropped), the disconnect retry served the stale cached "100" with an EMPTY
+    // status. The merged status stays disconnected, so the invariant holds and
+    // that off-RF cache level must NOT ride back in — it stays null rather than
+    // reaching the raw debug feed as a disconnected side carrying 100.
+    const stale = mergeRetrySide(
+        side(null, .disconnected),
+        side(100, .unknown),
+    );
+    try std.testing.expectEqual(@as(?u8, null), stale.level);
+    try std.testing.expectEqual(Status.disconnected, stale.status);
 }
 
 test "Acceptor: feedAuthoritative holds a disconnected side's cached level" {

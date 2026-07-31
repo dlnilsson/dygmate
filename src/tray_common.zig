@@ -185,6 +185,10 @@ pub const State = struct {
     /// `reading` under the mutex; marks the last accepted value as uncertain
     /// and mutes low-battery notifications for that side.
     unverified: [2]bool = .{ false, false },
+    /// Per side (0=left, 1=right): the side is latched disconnected (status 4).
+    /// Written with `reading` under the mutex; its off-RF stale level must not
+    /// be reported, so the tray renders it "?" and skips it in the icon min.
+    disconnected: [2]bool = .{ false, false },
     status: DeviceStatus = .missing,
     /// Detected keyboard model; null while absent. Written by the poll
     /// thread on every discovery pass (mutex-protected, like `reading`).
@@ -332,9 +336,14 @@ pub const LastKnown = struct {
 pub const UnverifiedDisplay = enum { na, last_known };
 pub const unverified_display: UnverifiedDisplay = .last_known;
 
-/// Sides the icon's min-of-sides pick must skip for the configured mode.
-pub fn hiddenSides(unverified: [2]bool) [2]bool {
-    return hiddenSidesMode(unverified, unverified_display);
+/// Sides the icon's min-of-sides pick and the level display must skip:
+/// unverified sides (only in `.na` mode) plus any side latched disconnected
+/// (status 4). A disconnected half's level is off-RF stale cache, so it is
+/// never reported regardless of the unverified display mode — showing a stale
+/// "100%" next to a "4" is exactly the reading we must not surface.
+pub fn hiddenSides(unverified: [2]bool, disconnected: [2]bool) [2]bool {
+    const base = hiddenSidesMode(unverified, unverified_display);
+    return .{ base[0] or disconnected[0], base[1] or disconnected[1] };
 }
 
 fn hiddenSidesMode(unverified: [2]bool, mode: UnverifiedDisplay) [2]bool {
@@ -364,11 +373,14 @@ fn statusHasWord(st: battery.Status) bool {
 /// but the status isn't (the neuron often answers the level and leaves the
 /// status empty), the status suffix is dropped entirely — "{d}%" — rather than
 /// showing a meaningless "(?)".
-pub fn fmtMenuSide(buf: []u8, s: battery.SideReading, unverified: bool) []const u8 {
-    return fmtMenuSideMode(buf, s, unverified, unverified_display);
+pub fn fmtMenuSide(buf: []u8, s: battery.SideReading, unverified: bool, disconnected: bool) []const u8 {
+    return fmtMenuSideMode(buf, s, unverified, disconnected, unverified_display);
 }
 
-fn fmtMenuSideMode(buf: []u8, s: battery.SideReading, unverified: bool, mode: UnverifiedDisplay) []const u8 {
+fn fmtMenuSideMode(buf: []u8, s: battery.SideReading, unverified: bool, disconnected: bool, mode: UnverifiedDisplay) []const u8 {
+    // A disconnected half is off the RF board; its cached level is stale and
+    // must not be reported, so show "?" regardless of the unverified mode.
+    if (disconnected) return "?";
     // A full (charged) side shows just "Full" — the percentage is unreliable on
     // the cable (FOCUS_API) and "{d}% (Full)" is self-contradictory.
     if (s.status == .charged) return "Full";
@@ -408,11 +420,14 @@ pub fn fmtSide(buf: []u8, s: battery.SideReading) []const u8 {
 /// Tooltip form of a last-known side snapshot: the real value if the side has
 /// ever reported, else a plain "no reading yet"; an unverified side renders
 /// per `unverified_display`.
-pub fn fmtKnownSide(buf: []u8, s: battery.SideReading, unverified: bool) []const u8 {
-    return fmtKnownSideMode(buf, s, unverified, unverified_display);
+pub fn fmtKnownSide(buf: []u8, s: battery.SideReading, unverified: bool, disconnected: bool) []const u8 {
+    return fmtKnownSideMode(buf, s, unverified, disconnected, unverified_display);
 }
 
-fn fmtKnownSideMode(buf: []u8, s: battery.SideReading, unverified: bool, mode: UnverifiedDisplay) []const u8 {
+fn fmtKnownSideMode(buf: []u8, s: battery.SideReading, unverified: bool, disconnected: bool, mode: UnverifiedDisplay) []const u8 {
+    // A disconnected half is off the RF board; its cached level is stale and
+    // must not be reported, so show "?" regardless of the unverified mode.
+    if (disconnected) return "?";
     if (s.status == .charged) return s.status.label(); // "full", no percentage
     if (unverified and mode == .na) {
         const word: []const u8 = if (statusHasWord(s.status)) s.status.label() else "?";
@@ -637,8 +652,21 @@ pub fn planNotifications(
 const LayerTracker = struct {
     last: ?u8 = null,
     announce_on_next: bool = false,
+    // `layer.state` is served by the USB-powered neuron, not directly by a
+    // keyboard half. When every reporting half is explicitly out of RF
+    // contact, some firmware instead serves its base-layer fallback. Do not
+    // turn that fallback into a spurious "Layer 1" OSD; retain the last real
+    // layer until a live battery status or a non-base layer proves otherwise.
+    suppress_base_while_unavailable: bool = false,
 
     fn feed(self: *LayerTracker, idx: u8) ?u8 {
+        if (self.suppress_base_while_unavailable) {
+            if (idx == 0) return null;
+            // The fallback is specifically layer 1. A non-base active layer
+            // can only be the keyboard's actual state, so it is sufficient to
+            // resume normal tracking even before the next battery poll.
+            self.suppress_base_while_unavailable = false;
+        }
         defer self.last = idx;
         if (self.announce_on_next) {
             self.announce_on_next = false;
@@ -655,8 +683,40 @@ const LayerTracker = struct {
     fn noteDisabled(self: *LayerTracker) void {
         self.last = null;
         self.announce_on_next = false;
+        self.suppress_base_while_unavailable = false;
+    }
+
+    fn noteWirelessUnavailable(self: *LayerTracker) void {
+        self.suppress_base_while_unavailable = true;
+    }
+
+    fn noteWirelessLive(self: *LayerTracker) void {
+        self.suppress_base_while_unavailable = false;
     }
 };
+
+/// The Focus protocol has no current deep-sleep state. Status 4 is the one
+/// useful runtime hint: it means a side is physically disconnected from the RF
+/// board. Require it for every battery-reporting side, so a transient loss of
+/// one half cannot silence legitimate layer changes from the other.
+fn allReportingSidesUnavailable(model: ?device.Model, r: battery.Reading) bool {
+    const m = model orelse return false;
+    if (r.left.status != .disconnected) return false;
+    return m.sides() == 1 or r.right.status == .disconnected;
+}
+
+/// An explicit live status is enough to lift the conservative base-layer
+/// suppression. Empty and fault statuses deliberately preserve it: neither
+/// establishes that a sleeping half has returned.
+fn anyReportingSideLive(model: ?device.Model, r: battery.Reading) bool {
+    const m = model orelse return false;
+    if (isLiveStatus(r.left.status)) return true;
+    return m.sides() == 2 and isLiveStatus(r.right.status);
+}
+
+fn isLiveStatus(status: battery.Status) bool {
+    return status == .discharging or status == .charging or status == .charged;
+}
 
 // ---------------------------------------------------------------------------
 // Background polling thread: owns the serial connection.
@@ -793,6 +853,11 @@ pub fn runPollLoop(
                     setStatus(Ctx, ctx, io, st, wake, offlineStatus(still_present));
                     break;
                 };
+                if (allReportingSidesUnavailable(found.model, raw)) {
+                    layer_tracker.noteWirelessUnavailable();
+                } else if (anyReportingSideLive(found.model, raw)) {
+                    layer_tracker.noteWirelessLive();
+                }
                 const authoritative_read = next_read_authoritative;
                 const res = if (next_read_authoritative)
                     acceptor.feedAuthoritative(raw)
@@ -814,6 +879,7 @@ pub fn runPollLoop(
                 const announce_connection = st.status != .connected;
                 st.reading = merged;
                 st.unverified = res.needs_verification;
+                st.disconnected = res.disconnected;
                 st.status = .connected;
                 if (announce_connection or announce_next_read) st.announce_connection = true;
                 announce_next_read = false;
@@ -823,7 +889,7 @@ pub fn runPollLoop(
                 // plus the fresh per-poll status (known.merge just set
                 // left_now/right_now), so the feed drops a stale disconnected
                 // suffix exactly like the menu/tooltip.
-                statusserver.publishReading(io, found.model, merged.left, merged.right, known.left_now, known.right_now, hiddenSides(res.needs_verification));
+                statusserver.publishReading(io, found.model, merged.left, merged.right, known.left_now, known.right_now, hiddenSides(res.needs_verification, res.disconnected));
                 // Arm the forceRead verification loop on the transition into
                 // needing it (re-arming every poll would reset the backoff
                 // and hammer RF); clear it once nothing needs verifying.
@@ -1015,6 +1081,35 @@ test "LayerTracker: disabling overlay clears reconnect announcement state" {
     tracker.noteDisabled();
     try std.testing.expectEqual(@as(?u8, null), tracker.feed(1));
     try std.testing.expectEqual(@as(?u8, 2), tracker.feed(2));
+}
+
+test "LayerTracker: unavailable wireless halves cannot announce the base-layer fallback" {
+    var tracker = LayerTracker{};
+
+    try std.testing.expectEqual(@as(?u8, null), tracker.feed(2));
+    tracker.noteWirelessUnavailable();
+    // A sleeping keyboard sometimes answers `layer.state` with its base-layer
+    // fallback. Hold the previous real layer rather than show "Layer 1".
+    try std.testing.expectEqual(@as(?u8, null), tracker.feed(0));
+    try std.testing.expectEqual(@as(?u8, null), tracker.feed(2));
+
+    tracker.noteWirelessUnavailable();
+    tracker.noteWirelessLive();
+    try std.testing.expectEqual(@as(?u8, 0), tracker.feed(0));
+}
+
+test "allReportingSidesUnavailable requires every active battery channel" {
+    const offline = reading(null, .disconnected, null, .disconnected);
+    try std.testing.expect(allReportingSidesUnavailable(.defy_wireless, offline));
+    try std.testing.expect(allReportingSidesUnavailable(.sonsei, offline));
+    try std.testing.expect(!allReportingSidesUnavailable(.defy_wireless, reading(null, .disconnected, 80, .discharging)));
+    try std.testing.expect(!allReportingSidesUnavailable(null, offline));
+}
+
+test "anyReportingSideLive accepts an explicit live reporting status" {
+    try std.testing.expect(anyReportingSideLive(.defy_wireless, reading(80, .discharging, null, .unknown)));
+    try std.testing.expect(!anyReportingSideLive(.sonsei, reading(null, .unknown, 80, .charging)));
+    try std.testing.expect(!anyReportingSideLive(.raise2, reading(null, .disconnected, null, .fault)));
 }
 
 test "planNotifications: low crossing fires once, latched afterwards" {
@@ -1318,22 +1413,43 @@ test "unverified display retains the accepted minimum for the tray icon" {
 
     // A pending left-side value must not hide the last accepted 45% and let
     // the right-side 100% value produce a green icon.
-    const disp = known.display(hiddenSides(.{ true, false }));
+    const disp = known.display(hiddenSides(.{ true, false }, .{ false, false }));
     try std.testing.expectEqual(@as(?u8, 45), disp.level);
 
     var buf: [48]u8 = undefined;
-    try std.testing.expectEqualStrings("45%? (discharging)", fmtKnownSide(&buf, known.leftText(), true));
+    try std.testing.expectEqualStrings("45%? (discharging)", fmtKnownSide(&buf, known.leftText(), true, false));
+}
+
+test "hiddenSides always hides a disconnected side, whatever the unverified mode" {
+    // The whole point of the disconnect suppression: a latched "4" hides the
+    // side even in .last_known mode, where unverified sides are NOT hidden.
+    try std.testing.expectEqual([2]bool{ true, false }, hiddenSides(.{ false, false }, .{ true, false }));
+    try std.testing.expectEqual([2]bool{ false, true }, hiddenSides(.{ false, false }, .{ false, true }));
+    // Combines with the unverified hide (both are OR'd).
+    try std.testing.expectEqual([2]bool{ false, false }, hiddenSides(.{ true, false }, .{ false, false }));
+}
+
+test "fmt helpers render a disconnected side as \"?\", never its stale level" {
+    var buf: [48]u8 = undefined;
+    // A half off the RF board keeps a cached level; it must not be reported.
+    const s: battery.SideReading = .{ .level = 100, .status = .disconnected };
+    try std.testing.expectEqualStrings("?", fmtKnownSide(&buf, s, false, true));
+    try std.testing.expectEqualStrings("?", fmtMenuSide(&buf, s, false, true));
+    // Disconnect wins over the unverified marker and the charged word alike.
+    try std.testing.expectEqualStrings("?", fmtKnownSide(&buf, s, true, true));
+    const full: battery.SideReading = .{ .level = 100, .status = .charged };
+    try std.testing.expectEqualStrings("?", fmtMenuSide(&buf, full, false, true));
 }
 
 test "fmt helpers render unverified sides per display mode" {
     var buf: [48]u8 = undefined;
     const s: battery.SideReading = .{ .level = 87, .status = .discharging };
-    try std.testing.expectEqualStrings("?% (discharging)", fmtKnownSideMode(&buf, s, true, .na));
-    try std.testing.expectEqualStrings("87%? (discharging)", fmtKnownSideMode(&buf, s, true, .last_known));
-    try std.testing.expectEqualStrings("87% (discharging)", fmtKnownSideMode(&buf, s, false, .na));
-    try std.testing.expectEqualStrings("verifying…", fmtMenuSideMode(&buf, s, true, .na));
-    try std.testing.expectEqualStrings("87%? (Discharging)", fmtMenuSideMode(&buf, s, true, .last_known));
-    try std.testing.expectEqualStrings("87% (Discharging)", fmtMenuSideMode(&buf, s, false, .na));
+    try std.testing.expectEqualStrings("?% (discharging)", fmtKnownSideMode(&buf, s, true, false, .na));
+    try std.testing.expectEqualStrings("87%? (discharging)", fmtKnownSideMode(&buf, s, true, false, .last_known));
+    try std.testing.expectEqualStrings("87% (discharging)", fmtKnownSideMode(&buf, s, false, false, .na));
+    try std.testing.expectEqualStrings("verifying…", fmtMenuSideMode(&buf, s, true, false, .na));
+    try std.testing.expectEqualStrings("87%? (Discharging)", fmtMenuSideMode(&buf, s, true, false, .last_known));
+    try std.testing.expectEqualStrings("87% (Discharging)", fmtMenuSideMode(&buf, s, false, false, .na));
 }
 
 test "fmt helpers drop the status suffix when the level is known but status isn't" {
@@ -1342,11 +1458,11 @@ test "fmt helpers drop the status suffix when the level is known but status isn'
     // (parsed as .unknown): show just "{d}%", never "{d}% (?)".
     const s: battery.SideReading = .{ .level = 40, .status = .unknown };
     try std.testing.expectEqualStrings("40%", fmtSide(&buf, s));
-    try std.testing.expectEqualStrings("40%", fmtKnownSideMode(&buf, s, false, .na));
-    try std.testing.expectEqualStrings("40%", fmtMenuSideMode(&buf, s, false, .na));
+    try std.testing.expectEqualStrings("40%", fmtKnownSideMode(&buf, s, false, false, .na));
+    try std.testing.expectEqualStrings("40%", fmtMenuSideMode(&buf, s, false, false, .na));
     // Unverified still carries its "?" marker, just without the status suffix.
-    try std.testing.expectEqualStrings("40%?", fmtKnownSideMode(&buf, s, true, .last_known));
-    try std.testing.expectEqualStrings("40%?", fmtMenuSideMode(&buf, s, true, .last_known));
+    try std.testing.expectEqualStrings("40%?", fmtKnownSideMode(&buf, s, true, false, .last_known));
+    try std.testing.expectEqualStrings("40%?", fmtMenuSideMode(&buf, s, true, false, .last_known));
     // A known status is unaffected.
     const known: battery.SideReading = .{ .level = 40, .status = .discharging };
     try std.testing.expectEqualStrings("40% (discharging)", fmtSide(&buf, known));
@@ -1432,13 +1548,13 @@ test "fmt helpers omit the percentage for a full (charged) side" {
     // "1% (full)" is self-contradictory — a full side shows just the word.
     const full: battery.SideReading = .{ .level = 1, .status = .charged };
     try std.testing.expectEqualStrings("full", fmtSide(&buf, full));
-    try std.testing.expectEqualStrings("full", fmtKnownSideMode(&buf, full, false, .na));
-    try std.testing.expectEqualStrings("Full", fmtMenuSideMode(&buf, full, false, .na));
+    try std.testing.expectEqualStrings("full", fmtKnownSideMode(&buf, full, false, false, .na));
+    try std.testing.expectEqualStrings("Full", fmtMenuSideMode(&buf, full, false, false, .na));
     // The word wins over the unverified marker and a null level alike.
-    try std.testing.expectEqualStrings("full", fmtKnownSideMode(&buf, full, true, .last_known));
+    try std.testing.expectEqualStrings("full", fmtKnownSideMode(&buf, full, true, false, .last_known));
     const full_null: battery.SideReading = .{ .level = null, .status = .charged };
     try std.testing.expectEqualStrings("full", fmtSide(&buf, full_null));
-    try std.testing.expectEqualStrings("Full", fmtMenuSideMode(&buf, full_null, false, .na));
+    try std.testing.expectEqualStrings("Full", fmtMenuSideMode(&buf, full_null, false, false, .na));
 }
 
 test "tooltipHeader keeps paused wording and missing wording distinct" {

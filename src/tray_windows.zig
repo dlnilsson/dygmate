@@ -459,6 +459,9 @@ var g_last: common.LastKnown = .{};
 /// Per side: awaiting authoritative forceRead verification (UI thread only;
 /// snapshotted from State by updateTray, read by the menu builder).
 var g_unverified: [2]bool = .{ false, false };
+/// Per side: latched disconnected (status 4) — its stale off-RF level must not
+/// be reported. Snapshotted from State by updateTray, read by the menu builder.
+var g_disconnected: [2]bool = .{ false, false };
 
 /// Write the version to the parent console's stdout. No-op-ish if launched
 /// without a console (e.g. from Explorer): AttachConsole simply fails and the
@@ -732,10 +735,10 @@ fn showMenu(hwnd: HWND) void {
     var sb: [24]u8 = undefined;
     appendMenuText(menu, MF_GRAYED, 0, conn_text);
     if (one_sided) {
-        appendMenuText(menu, MF_GRAYED, 0, std.fmt.bufPrint(&lb, "Battery: {s}", .{common.fmtMenuSide(&sb, g_last.leftText(), g_unverified[0])}) catch "Battery: ?");
+        appendMenuText(menu, MF_GRAYED, 0, std.fmt.bufPrint(&lb, "Battery: {s}", .{common.fmtMenuSide(&sb, g_last.leftText(), g_unverified[0], g_disconnected[0])}) catch "Battery: ?");
     } else {
-        appendMenuText(menu, MF_GRAYED, 0, std.fmt.bufPrint(&lb, "Left: {s}", .{common.fmtMenuSide(&sb, g_last.leftText(), g_unverified[0])}) catch "Left: ?");
-        appendMenuText(menu, MF_GRAYED, 0, std.fmt.bufPrint(&rb, "Right: {s}", .{common.fmtMenuSide(&sb, g_last.rightText(), g_unverified[1])}) catch "Right: ?");
+        appendMenuText(menu, MF_GRAYED, 0, std.fmt.bufPrint(&lb, "Left: {s}", .{common.fmtMenuSide(&sb, g_last.leftText(), g_unverified[0], g_disconnected[0])}) catch "Left: ?");
+        appendMenuText(menu, MF_GRAYED, 0, std.fmt.bufPrint(&rb, "Right: {s}", .{common.fmtMenuSide(&sb, g_last.rightText(), g_unverified[1], g_disconnected[1])}) catch "Right: ?");
     }
     _ = AppendMenuW(menu, MF_SEPARATOR, 0, null);
 
@@ -801,11 +804,13 @@ fn updateTray() void {
     g_state.mutex.lockUncancelable(g_io);
     const reading = g_state.reading;
     const unverified = g_state.unverified;
+    const disconnected = g_state.disconnected;
     const status = g_state.status;
     const model = g_state.model;
     const announce_pending = g_state.announce_connection and status == .connected and reading != null;
     g_state.mutex.unlock(g_io);
     g_unverified = unverified;
+    g_disconnected = disconnected;
     const paused = g_state.paused.load(.acquire);
     const one_sided = if (model) |m| m.sides() < 2 else false;
 
@@ -864,13 +869,13 @@ fn updateTray() void {
         const tip = if (one_sided)
             std.fmt.bufPrint(&tip_buf, "{s}Battery: {s}", .{
                 header,
-                common.fmtKnownSide(&lb, g_last.leftText(), unverified[0]),
+                common.fmtKnownSide(&lb, g_last.leftText(), unverified[0], disconnected[0]),
             }) catch "dygmate"
         else
             std.fmt.bufPrint(&tip_buf, "{s}Left: {s}\nRight: {s}", .{
                 header,
-                common.fmtKnownSide(&lb, g_last.leftText(), unverified[0]),
-                common.fmtKnownSide(&rb, g_last.rightText(), unverified[1]),
+                common.fmtKnownSide(&lb, g_last.leftText(), unverified[0], disconnected[0]),
+                common.fmtKnownSide(&rb, g_last.rightText(), unverified[1], disconnected[1]),
             }) catch "dygmate";
         setUtf16(g_nid.szTip[0..], tip);
     }
@@ -878,10 +883,12 @@ fn updateTray() void {
     // Icon: the lower of the two last-known side levels. Dim to gray while
     // offline or paused; "--" only before either side has ever reported.
     const live = common.isLive(status, paused);
-    const disp = g_last.display(common.hiddenSides(unverified));
+    const hide = common.hiddenSides(unverified, disconnected);
+    const any_hidden = hide[0] or hide[1];
+    const disp = g_last.display(hide);
     if (!paused and status == .missing) {
         icon_text = "?";
-    } else if (live and g_last.allSidesFull(model)) {
+    } else if (live and !any_hidden and g_last.allSidesFull(model)) {
         // Both sides topped off → the full 🔋 glyph, regardless of status.
         color = toColorRef(common.iconColor(live, 100, disp.status));
         battery_glyph = common.battery_full_rgba;
