@@ -182,8 +182,8 @@ pub const State = struct {
     reading: ?battery.Reading = null,
     /// Per side (0=left, 1=right): the side's value awaits authoritative
     /// forceRead verification (post-wake guard or pending low). Written with
-    /// `reading` under the mutex; drives "?" rendering and mutes low-battery
-    /// notifications for that side.
+    /// `reading` under the mutex; marks the last accepted value as uncertain
+    /// and mutes low-battery notifications for that side.
     unverified: [2]bool = .{ false, false },
     status: DeviceStatus = .missing,
     /// Detected keyboard model; null while absent. Written by the poll
@@ -326,9 +326,11 @@ pub const LastKnown = struct {
 
 /// How to render a side whose value awaits authoritative verification:
 /// `.na` hides it entirely ("?", like Bazecor's N/A); `.last_known` keeps
-/// showing the last accepted level with a "?" suffix.
+/// showing the last accepted level with a "?" suffix. Hiding an unverified
+/// side can make a healthy opposite half turn the icon green, so the tray
+/// always retains the accepted baseline until verification completes.
 pub const UnverifiedDisplay = enum { na, last_known };
-pub const unverified_display: UnverifiedDisplay = .na;
+pub const unverified_display: UnverifiedDisplay = .last_known;
 
 /// Sides the icon's min-of-sides pick must skip for the configured mode.
 pub fn hiddenSides(unverified: [2]bool) [2]bool {
@@ -1308,6 +1310,19 @@ test "LastKnown.leftText/rightText carry the level, never a disconnected word" {
 test "hiddenSides: only .na mode hides unverified sides" {
     try std.testing.expectEqual([2]bool{ true, false }, hiddenSidesMode(.{ true, false }, .na));
     try std.testing.expectEqual([2]bool{ false, false }, hiddenSidesMode(.{ true, false }, .last_known));
+}
+
+test "unverified display retains the accepted minimum for the tray icon" {
+    var known = LastKnown{};
+    known.merge(reading(45, .discharging, 100, .discharging));
+
+    // A pending left-side value must not hide the last accepted 45% and let
+    // the right-side 100% value produce a green icon.
+    const disp = known.display(hiddenSides(.{ true, false }));
+    try std.testing.expectEqual(@as(?u8, 45), disp.level);
+
+    var buf: [48]u8 = undefined;
+    try std.testing.expectEqualStrings("45%? (discharging)", fmtKnownSide(&buf, known.leftText(), true));
 }
 
 test "fmt helpers render unverified sides per display mode" {
