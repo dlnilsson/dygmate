@@ -185,10 +185,6 @@ pub const State = struct {
     /// `reading` under the mutex; marks the last accepted value as uncertain
     /// and mutes low-battery notifications for that side.
     unverified: [2]bool = .{ false, false },
-    /// Per side (0=left, 1=right): the side is latched disconnected (status 4).
-    /// Written with `reading` under the mutex; its off-RF stale level must not
-    /// be reported, so the tray renders it "?" and skips it in the icon min.
-    disconnected: [2]bool = .{ false, false },
     status: DeviceStatus = .missing,
     /// Detected keyboard model; null while absent. Written by the poll
     /// thread on every discovery pass (mutex-protected, like `reading`).
@@ -328,6 +324,45 @@ pub const LastKnown = struct {
     }
 };
 
+/// A short rolling window of one side's most recent accepted levels. The tray
+/// and the yasb feed display the LOWEST value in the window rather than the
+/// single latest reading. Around sleep/wake and RF drops the neuron can serve a
+/// transient high (a stale cached level that slips past the Acceptor for a poll
+/// or two), and `min` over the last few polls keeps that spike from inflating
+/// the shown level while a side is genuinely lower. It also means a side that
+/// stops reporting (disconnected/asleep) keeps showing the min of what it last
+/// held — no "?" and no grey icon — until fresh readings age the window out.
+/// Only accepted (non-null) levels are recorded, so held/empty polls neither
+/// grow nor bias the window.
+pub const LevelWindow = struct {
+    /// Ring of the last `capacity` accepted levels; `len` slots are valid.
+    buf: [capacity]u8 = undefined,
+    len: u8 = 0,
+    head: u8 = 0,
+
+    /// "last 5 known values"; small enough that a genuine drop still shows
+    /// within a few polls (min favours the lower, newer value immediately),
+    /// large enough to ride out an isolated bogus spike.
+    pub const capacity: u8 = 5;
+
+    pub fn push(self: *LevelWindow, level: u8) void {
+        self.buf[self.head] = level;
+        self.head = (self.head + 1) % capacity;
+        if (self.len < capacity) self.len += 1;
+    }
+
+    /// Lowest level currently in the window, or null before anything is
+    /// recorded (the side has never reported an accepted level).
+    pub fn min(self: LevelWindow) ?u8 {
+        if (self.len == 0) return null;
+        var lowest: u8 = 255;
+        for (self.buf[0..self.len]) |v| {
+            if (v < lowest) lowest = v;
+        }
+        return lowest;
+    }
+};
+
 /// How to render a side whose value awaits authoritative verification:
 /// `.na` hides it entirely ("?", like Bazecor's N/A); `.last_known` keeps
 /// showing the last accepted level with a "?" suffix. Hiding an unverified
@@ -336,14 +371,9 @@ pub const LastKnown = struct {
 pub const UnverifiedDisplay = enum { na, last_known };
 pub const unverified_display: UnverifiedDisplay = .last_known;
 
-/// Sides the icon's min-of-sides pick and the level display must skip:
-/// unverified sides (only in `.na` mode) plus any side latched disconnected
-/// (status 4). A disconnected half's level is off-RF stale cache, so it is
-/// never reported regardless of the unverified display mode — showing a stale
-/// "100%" next to a "4" is exactly the reading we must not surface.
-pub fn hiddenSides(unverified: [2]bool, disconnected: [2]bool) [2]bool {
-    const base = hiddenSidesMode(unverified, unverified_display);
-    return .{ base[0] or disconnected[0], base[1] or disconnected[1] };
+/// Sides the icon's min-of-sides pick must skip for the configured mode.
+pub fn hiddenSides(unverified: [2]bool) [2]bool {
+    return hiddenSidesMode(unverified, unverified_display);
 }
 
 fn hiddenSidesMode(unverified: [2]bool, mode: UnverifiedDisplay) [2]bool {
@@ -373,14 +403,11 @@ fn statusHasWord(st: battery.Status) bool {
 /// but the status isn't (the neuron often answers the level and leaves the
 /// status empty), the status suffix is dropped entirely — "{d}%" — rather than
 /// showing a meaningless "(?)".
-pub fn fmtMenuSide(buf: []u8, s: battery.SideReading, unverified: bool, disconnected: bool) []const u8 {
-    return fmtMenuSideMode(buf, s, unverified, disconnected, unverified_display);
+pub fn fmtMenuSide(buf: []u8, s: battery.SideReading, unverified: bool) []const u8 {
+    return fmtMenuSideMode(buf, s, unverified, unverified_display);
 }
 
-fn fmtMenuSideMode(buf: []u8, s: battery.SideReading, unverified: bool, disconnected: bool, mode: UnverifiedDisplay) []const u8 {
-    // A disconnected half is off the RF board; its cached level is stale and
-    // must not be reported, so show "?" regardless of the unverified mode.
-    if (disconnected) return "?";
+fn fmtMenuSideMode(buf: []u8, s: battery.SideReading, unverified: bool, mode: UnverifiedDisplay) []const u8 {
     // A full (charged) side shows just "Full" — the percentage is unreliable on
     // the cable (FOCUS_API) and "{d}% (Full)" is self-contradictory.
     if (s.status == .charged) return "Full";
@@ -420,14 +447,11 @@ pub fn fmtSide(buf: []u8, s: battery.SideReading) []const u8 {
 /// Tooltip form of a last-known side snapshot: the real value if the side has
 /// ever reported, else a plain "no reading yet"; an unverified side renders
 /// per `unverified_display`.
-pub fn fmtKnownSide(buf: []u8, s: battery.SideReading, unverified: bool, disconnected: bool) []const u8 {
-    return fmtKnownSideMode(buf, s, unverified, disconnected, unverified_display);
+pub fn fmtKnownSide(buf: []u8, s: battery.SideReading, unverified: bool) []const u8 {
+    return fmtKnownSideMode(buf, s, unverified, unverified_display);
 }
 
-fn fmtKnownSideMode(buf: []u8, s: battery.SideReading, unverified: bool, disconnected: bool, mode: UnverifiedDisplay) []const u8 {
-    // A disconnected half is off the RF board; its cached level is stale and
-    // must not be reported, so show "?" regardless of the unverified mode.
-    if (disconnected) return "?";
+fn fmtKnownSideMode(buf: []u8, s: battery.SideReading, unverified: bool, mode: UnverifiedDisplay) []const u8 {
     if (s.status == .charged) return s.status.label(); // "full", no percentage
     if (unverified and mode == .na) {
         const word: []const u8 = if (statusHasWord(s.status)) s.status.label() else "?";
@@ -740,6 +764,12 @@ pub fn runPollLoop(
     // baseline must survive reconnects. A genuinely different keyboard with a
     // higher battery just confirms over a few fast polls.
     var acceptor: battery.Acceptor = .{};
+    // Rolling window of each side's recent accepted levels; the displayed level
+    // is the window's minimum (see LevelWindow). Outside the connect loop like
+    // `acceptor` so the recent history — and thus the last-known value shown
+    // while a side is disconnected/asleep — survives reconnects.
+    var left_window: LevelWindow = .{};
+    var right_window: LevelWindow = .{};
     // Set after a forceRead: the next reading is ground truth and bypasses
     // the gate.
     var next_read_authoritative = false;
@@ -874,12 +904,19 @@ pub fn runPollLoop(
                     .authoritative = authoritative_read,
                 });
                 known.merge(res.reading);
-                const merged: battery.Reading = .{ .left = known.left, .right = known.right };
+                // Record this poll's accepted level and display the window's
+                // minimum instead of the single latest reading: a transient
+                // cached spike can't inflate the shown level, and a side that
+                // goes quiet keeps its last-known min rather than blanking.
+                if (res.reading.left.level) |lvl| left_window.push(lvl);
+                if (res.reading.right.level) |lvl| right_window.push(lvl);
+                var merged: battery.Reading = .{ .left = known.left, .right = known.right };
+                if (left_window.min()) |m| merged.left.level = m;
+                if (right_window.min()) |m| merged.right.level = m;
                 st.mutex.lockUncancelable(io);
                 const announce_connection = st.status != .connected;
                 st.reading = merged;
                 st.unverified = res.needs_verification;
-                st.disconnected = res.disconnected;
                 st.status = .connected;
                 if (announce_connection or announce_next_read) st.announce_connection = true;
                 announce_next_read = false;
@@ -889,7 +926,7 @@ pub fn runPollLoop(
                 // plus the fresh per-poll status (known.merge just set
                 // left_now/right_now), so the feed drops a stale disconnected
                 // suffix exactly like the menu/tooltip.
-                statusserver.publishReading(io, found.model, merged.left, merged.right, known.left_now, known.right_now, hiddenSides(res.needs_verification, res.disconnected));
+                statusserver.publishReading(io, found.model, merged.left, merged.right, known.left_now, known.right_now, hiddenSides(res.needs_verification));
                 // Arm the forceRead verification loop on the transition into
                 // needing it (re-arming every poll would reset the backoff
                 // and hammer RF); clear it once nothing needs verifying.
@@ -1413,43 +1450,22 @@ test "unverified display retains the accepted minimum for the tray icon" {
 
     // A pending left-side value must not hide the last accepted 45% and let
     // the right-side 100% value produce a green icon.
-    const disp = known.display(hiddenSides(.{ true, false }, .{ false, false }));
+    const disp = known.display(hiddenSides(.{ true, false }));
     try std.testing.expectEqual(@as(?u8, 45), disp.level);
 
     var buf: [48]u8 = undefined;
-    try std.testing.expectEqualStrings("45%? (discharging)", fmtKnownSide(&buf, known.leftText(), true, false));
-}
-
-test "hiddenSides always hides a disconnected side, whatever the unverified mode" {
-    // The whole point of the disconnect suppression: a latched "4" hides the
-    // side even in .last_known mode, where unverified sides are NOT hidden.
-    try std.testing.expectEqual([2]bool{ true, false }, hiddenSides(.{ false, false }, .{ true, false }));
-    try std.testing.expectEqual([2]bool{ false, true }, hiddenSides(.{ false, false }, .{ false, true }));
-    // Combines with the unverified hide (both are OR'd).
-    try std.testing.expectEqual([2]bool{ false, false }, hiddenSides(.{ true, false }, .{ false, false }));
-}
-
-test "fmt helpers render a disconnected side as \"?\", never its stale level" {
-    var buf: [48]u8 = undefined;
-    // A half off the RF board keeps a cached level; it must not be reported.
-    const s: battery.SideReading = .{ .level = 100, .status = .disconnected };
-    try std.testing.expectEqualStrings("?", fmtKnownSide(&buf, s, false, true));
-    try std.testing.expectEqualStrings("?", fmtMenuSide(&buf, s, false, true));
-    // Disconnect wins over the unverified marker and the charged word alike.
-    try std.testing.expectEqualStrings("?", fmtKnownSide(&buf, s, true, true));
-    const full: battery.SideReading = .{ .level = 100, .status = .charged };
-    try std.testing.expectEqualStrings("?", fmtMenuSide(&buf, full, false, true));
+    try std.testing.expectEqualStrings("45%? (discharging)", fmtKnownSide(&buf, known.leftText(), true));
 }
 
 test "fmt helpers render unverified sides per display mode" {
     var buf: [48]u8 = undefined;
     const s: battery.SideReading = .{ .level = 87, .status = .discharging };
-    try std.testing.expectEqualStrings("?% (discharging)", fmtKnownSideMode(&buf, s, true, false, .na));
-    try std.testing.expectEqualStrings("87%? (discharging)", fmtKnownSideMode(&buf, s, true, false, .last_known));
-    try std.testing.expectEqualStrings("87% (discharging)", fmtKnownSideMode(&buf, s, false, false, .na));
-    try std.testing.expectEqualStrings("verifying…", fmtMenuSideMode(&buf, s, true, false, .na));
-    try std.testing.expectEqualStrings("87%? (Discharging)", fmtMenuSideMode(&buf, s, true, false, .last_known));
-    try std.testing.expectEqualStrings("87% (Discharging)", fmtMenuSideMode(&buf, s, false, false, .na));
+    try std.testing.expectEqualStrings("?% (discharging)", fmtKnownSideMode(&buf, s, true, .na));
+    try std.testing.expectEqualStrings("87%? (discharging)", fmtKnownSideMode(&buf, s, true, .last_known));
+    try std.testing.expectEqualStrings("87% (discharging)", fmtKnownSideMode(&buf, s, false, .na));
+    try std.testing.expectEqualStrings("verifying…", fmtMenuSideMode(&buf, s, true, .na));
+    try std.testing.expectEqualStrings("87%? (Discharging)", fmtMenuSideMode(&buf, s, true, .last_known));
+    try std.testing.expectEqualStrings("87% (Discharging)", fmtMenuSideMode(&buf, s, false, .na));
 }
 
 test "fmt helpers drop the status suffix when the level is known but status isn't" {
@@ -1458,11 +1474,11 @@ test "fmt helpers drop the status suffix when the level is known but status isn'
     // (parsed as .unknown): show just "{d}%", never "{d}% (?)".
     const s: battery.SideReading = .{ .level = 40, .status = .unknown };
     try std.testing.expectEqualStrings("40%", fmtSide(&buf, s));
-    try std.testing.expectEqualStrings("40%", fmtKnownSideMode(&buf, s, false, false, .na));
-    try std.testing.expectEqualStrings("40%", fmtMenuSideMode(&buf, s, false, false, .na));
+    try std.testing.expectEqualStrings("40%", fmtKnownSideMode(&buf, s, false, .na));
+    try std.testing.expectEqualStrings("40%", fmtMenuSideMode(&buf, s, false, .na));
     // Unverified still carries its "?" marker, just without the status suffix.
-    try std.testing.expectEqualStrings("40%?", fmtKnownSideMode(&buf, s, true, false, .last_known));
-    try std.testing.expectEqualStrings("40%?", fmtMenuSideMode(&buf, s, true, false, .last_known));
+    try std.testing.expectEqualStrings("40%?", fmtKnownSideMode(&buf, s, true, .last_known));
+    try std.testing.expectEqualStrings("40%?", fmtMenuSideMode(&buf, s, true, .last_known));
     // A known status is unaffected.
     const known: battery.SideReading = .{ .level = 40, .status = .discharging };
     try std.testing.expectEqualStrings("40% (discharging)", fmtSide(&buf, known));
@@ -1548,13 +1564,45 @@ test "fmt helpers omit the percentage for a full (charged) side" {
     // "1% (full)" is self-contradictory — a full side shows just the word.
     const full: battery.SideReading = .{ .level = 1, .status = .charged };
     try std.testing.expectEqualStrings("full", fmtSide(&buf, full));
-    try std.testing.expectEqualStrings("full", fmtKnownSideMode(&buf, full, false, false, .na));
-    try std.testing.expectEqualStrings("Full", fmtMenuSideMode(&buf, full, false, false, .na));
+    try std.testing.expectEqualStrings("full", fmtKnownSideMode(&buf, full, false, .na));
+    try std.testing.expectEqualStrings("Full", fmtMenuSideMode(&buf, full, false, .na));
     // The word wins over the unverified marker and a null level alike.
-    try std.testing.expectEqualStrings("full", fmtKnownSideMode(&buf, full, true, false, .last_known));
+    try std.testing.expectEqualStrings("full", fmtKnownSideMode(&buf, full, true, .last_known));
     const full_null: battery.SideReading = .{ .level = null, .status = .charged };
     try std.testing.expectEqualStrings("full", fmtSide(&buf, full_null));
-    try std.testing.expectEqualStrings("Full", fmtMenuSideMode(&buf, full_null, false, false, .na));
+    try std.testing.expectEqualStrings("Full", fmtMenuSideMode(&buf, full_null, false, .na));
+}
+
+test "LevelWindow: min over the last 5 accepted levels" {
+    var w = LevelWindow{};
+    // Empty before anything is recorded.
+    try std.testing.expectEqual(@as(?u8, null), w.min());
+    // A single sample is its own min.
+    w.push(80);
+    try std.testing.expectEqual(@as(?u8, 80), w.min());
+    // A transient high spike does not raise the shown level.
+    w.push(100);
+    try std.testing.expectEqual(@as(?u8, 80), w.min());
+    // A genuine lower reading drops the min immediately.
+    w.push(60);
+    try std.testing.expectEqual(@as(?u8, 60), w.min());
+}
+
+test "LevelWindow: only the last 5 samples count" {
+    var w = LevelWindow{};
+    // A low value ages out once five newer samples have been pushed past it.
+    w.push(10);
+    for ([_]u8{ 50, 51, 52, 53, 54 }) |v| w.push(v);
+    // The 10 has been overwritten; the min is now the lowest of the last five.
+    try std.testing.expectEqual(@as(?u8, 50), w.min());
+}
+
+test "LevelWindow: a steady side reports its held level, never null" {
+    // The disconnect/asleep case: the same accepted level is pushed every poll,
+    // so the window stays full of it and keeps showing it — no "?", no grey.
+    var w = LevelWindow{};
+    for (0..8) |_| w.push(45);
+    try std.testing.expectEqual(@as(?u8, 45), w.min());
 }
 
 test "tooltipHeader keeps paused wording and missing wording distinct" {

@@ -247,13 +247,6 @@ pub const Acceptor = struct {
         /// by an authoritative post-forceRead read — callers should run the
         /// forceRead verification loop until it clears.
         needs_verification: [2]bool,
-        /// Per side (0=left, 1=right): the side is latched disconnected — an
-        /// explicit status 4 was seen and no live status has cleared it yet.
-        /// Its level is off-RF stale cache, so callers must not report it
-        /// (render "?", drop it from the icon's min). Unlike the raw per-poll
-        /// status — which only carries the "4" intermittently — this latch
-        /// stays set across the empty-status polls in between.
-        disconnected: [2]bool,
 
         pub fn anyVerification(self: Result) bool {
             return self.needs_verification[0] or self.needs_verification[1];
@@ -309,7 +302,6 @@ pub const Acceptor = struct {
                 sideNeedsVerification(self.left),
                 sideNeedsVerification(self.right),
             },
-            .disconnected = .{ self.left.disconnected, self.right.disconnected },
         };
     }
 
@@ -772,22 +764,6 @@ test "Acceptor: disconnected 100 is never accepted, however often it repeats" {
         try std.testing.expectEqual(Status.disconnected, res.reading.left.status);
         try std.testing.expect(!res.suspect);
     }
-}
-
-test "Acceptor: Result.disconnected latches across empty polls until a live status" {
-    var a: Acceptor = .{};
-    _ = feedLeft(&a, 62, .discharging);
-    // An explicit "4" latches the side; the flag rides through the empty-status
-    // polls that follow (the "4" only peeks through intermittently) so display
-    // code can suppress the stale level the whole time it's off the RF board.
-    try std.testing.expect(feedLeft(&a, null, .disconnected).disconnected[0]);
-    for (0..5) |_| {
-        try std.testing.expect(feedLeft(&a, 100, .unknown).disconnected[0]);
-    }
-    // A live status clears it; the right side never latched.
-    const res = feedLeft(&a, 61, .discharging);
-    try std.testing.expect(!res.disconnected[0]);
-    try std.testing.expect(!res.disconnected[1]);
 }
 
 test "Acceptor: disconnected reading establishes no baseline" {
