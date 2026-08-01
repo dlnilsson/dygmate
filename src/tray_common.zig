@@ -203,6 +203,9 @@ pub const State = struct {
     /// UI-thread-only: latched per side (0=left, 1=right) so a low-battery
     /// notification fires once per crossing, not every poll.
     notified_low: [2]bool = .{ false, false },
+    /// Independently latched so reaching 0% after an earlier low warning emits
+    /// one final, critical notification without repeating on every poll.
+    notified_empty: [2]bool = .{ false, false },
     /// UI-thread-only: wall-clock ms of the last notification actually fired,
     /// backing the `notify_cooldown_ms` sanity check in `planNotifications`.
     last_notified_ms: ?i64 = null,
@@ -494,14 +497,25 @@ pub fn notificationTitleLow(model: ?device.Model) []const u8 {
     };
 }
 
+pub fn notificationTitleEmpty(model: ?device.Model) []const u8 {
+    const m = model orelse return "Dygma battery empty";
+    return switch (m) {
+        .defy_wireless => "Dygma Defy battery empty",
+        .raise2 => "Dygma Raise 2 battery empty",
+        .sonsei => "Dygma Sonsei battery empty",
+    };
+}
+
 /// A single notification to render. `connect_status` carries both-sides detail
 /// (rendered from the snapshot); `low_battery` carries the offending side and
 /// its level. `warning` selects the warning urgency/icon.
 pub const NotifyEvent = struct {
-    kind: enum { connect_status, low_battery },
+    kind: enum { connect_status, low_battery, empty_battery },
     side: ?u1 = null, // low_battery only: 0 = left, 1 = right
     level: ?u8 = null, // low_battery only
     warning: bool = false,
+    /// Bit 0 = left, bit 1 = right. Used by the combined empty-battery event.
+    side_mask: u2 = 0,
 };
 
 pub const NotifyPlan = struct {
@@ -550,16 +564,28 @@ pub fn fmtStatusBody(buf: []u8, model: ?device.Model, r: battery.Reading) []cons
     }) catch buf[0..0];
 }
 
-/// Body of a low-battery notification: "{Left|Right} side at {d}%"; a 1-sided
-/// model has no side to name.
+/// Body of a low-battery notification: battery level followed by a charger
+/// prompt; a 1-sided model has no side to name.
 pub fn fmtLowBody(buf: []u8, model: ?device.Model, side: u1, level: u8) []const u8 {
     if (model) |m| {
         if (m.sides() < 2) {
-            return std.fmt.bufPrint(buf, "Battery at {d}%", .{level}) catch buf[0..0];
+            return std.fmt.bufPrint(buf, "Battery at {d}%\nPlease connect charger", .{level}) catch buf[0..0];
         }
     }
     const name: []const u8 = if (side == 0) "Left" else "Right";
-    return std.fmt.bufPrint(buf, "{s} side at {d}%", .{ name, level }) catch buf[0..0];
+    return std.fmt.bufPrint(buf, "{s} side at {d}%\nPlease connect charger", .{ name, level }) catch buf[0..0];
+}
+
+pub fn fmtEmptyBody(buf: []u8, model: ?device.Model, side_mask: u2) []const u8 {
+    if (model) |m| if (m.sides() < 2)
+        return std.fmt.bufPrint(buf, "Battery is at 0%\nConnect charger now", .{}) catch buf[0..0];
+    const subject: []const u8 = switch (side_mask) {
+        1 => "Left side is",
+        2 => "Right side is",
+        3 => "Both sides are",
+        else => "Battery is",
+    };
+    return std.fmt.bufPrint(buf, "{s} at 0%\nConnect charger now", .{subject}) catch buf[0..0];
 }
 
 /// Wall-clock milliseconds, for spacing `planNotifications` calls against
@@ -599,8 +625,9 @@ pub const notify_cooldown_ms: i64 = 10_000;
 /// - pending + ready: emit connect_status, latch the lows, report consumed.
 /// - pending + not ready: emit nothing, keep announce pending.
 /// - not pending: per-side low check against the latch (fires once per crossing).
-pub fn planNotifications(
+pub fn planNotificationsTracked(
     latch: *[2]bool,
+    empty_latch: *[2]bool,
     announce_pending: bool,
     announce_ready: bool,
     snapshot: battery.Reading,
@@ -626,17 +653,21 @@ pub fn planNotifications(
         for (sides, 0..) |s, i| {
             if (s.status.onCable()) {
                 latch[i] = false;
+                empty_latch[i] = false;
                 continue;
             }
             if (unverified[i]) {
                 latch[i] = false;
+                empty_latch[i] = false;
                 continue;
             }
             const lvl = s.level orelse {
                 latch[i] = false;
+                empty_latch[i] = false;
                 continue;
             };
             latch[i] = lvl < low_threshold;
+            empty_latch[i] = lvl == 0;
         }
         plan.consumed_announce = true;
         if (cooled_down) last_notified_ms.* = now_ms;
@@ -646,15 +677,23 @@ pub fn planNotifications(
     // Per-side low crossing: fire once when a side that's off the cable drops
     // below the threshold; reset the latch when it's on the cable or recovers.
     var idx: usize = 0;
+    var newly_empty: u2 = 0;
     for (sides, 0..) |s, i| {
         if (s.status.onCable()) {
             latch[i] = false;
+            empty_latch[i] = false;
             continue;
         }
         // Unverified: fire nothing and leave the latch untouched, so a later
         // verified genuine low still fires exactly once.
         if (unverified[i]) continue;
         const lvl = s.level orelse continue;
+        if (lvl == 0) {
+            if (!empty_latch[i]) newly_empty |= @as(u2, 1) << @intCast(i);
+            empty_latch[i] = true;
+        } else {
+            empty_latch[i] = false;
+        }
         if (lvl < low_threshold) {
             if (!latch[i]) {
                 // Latch regardless of the cooldown: a suppressed crossing is
@@ -669,8 +708,30 @@ pub fn planNotifications(
             latch[i] = false;
         }
     }
+    if (newly_empty != 0 and cooled_down) {
+        plan.events[idx] = .{ .kind = .empty_battery, .warning = true, .side_mask = newly_empty };
+        idx += 1;
+    }
     if (idx > 0) last_notified_ms.* = now_ms;
     return plan;
+}
+
+// Low-battery-only convenience used by the focused legacy planner tests.
+// Production callers retain `empty_latch` through planNotificationsTracked.
+fn planNotifications(
+    latch: *[2]bool,
+    announce_pending: bool,
+    announce_ready: bool,
+    snapshot: battery.Reading,
+    unverified: [2]bool,
+    now_ms: i64,
+    last_notified_ms: *?i64,
+) NotifyPlan {
+    var empty_latch = [2]bool{
+        snapshot.left.level == 0,
+        snapshot.right.level == 0,
+    };
+    return planNotificationsTracked(latch, &empty_latch, announce_pending, announce_ready, snapshot, unverified, now_ms, last_notified_ms);
 }
 
 const LayerTracker = struct {
@@ -1213,6 +1274,27 @@ test "planNotifications: both low sides fire two events" {
     try std.testing.expectEqual(@as(u1, 1), plan.events[1].?.side.?);
 }
 
+test "planNotificationsTracked: reaching zero emits one combined critical event" {
+    var low_latch = [2]bool{ true, true };
+    var empty_latch = [2]bool{ false, false };
+    var last_notified_ms: ?i64 = null;
+    const first = planNotificationsTracked(&low_latch, &empty_latch, false, false, reading(0, .discharging, 0, .discharging), .{ false, false }, 0, &last_notified_ms);
+    try std.testing.expectEqual(NotifyEvent{ .kind = .empty_battery, .warning = true, .side_mask = 3 }, first.events[0].?);
+
+    const repeated = planNotificationsTracked(&low_latch, &empty_latch, false, false, reading(0, .discharging, 0, .discharging), .{ false, false }, 60_000, &last_notified_ms);
+    try std.testing.expectEqual(@as(?NotifyEvent, null), repeated.events[0]);
+}
+
+test "planNotificationsTracked: each side can independently reach zero" {
+    var low_latch = [2]bool{ true, true };
+    var empty_latch = [2]bool{ false, false };
+    var last_notified_ms: ?i64 = null;
+    const left = planNotificationsTracked(&low_latch, &empty_latch, false, false, reading(0, .discharging, 5, .discharging), .{ false, false }, 0, &last_notified_ms);
+    try std.testing.expectEqual(@as(u2, 1), left.events[0].?.side_mask);
+    const right = planNotificationsTracked(&low_latch, &empty_latch, false, false, reading(0, .discharging, 0, .discharging), .{ false, false }, 10_000, &last_notified_ms);
+    try std.testing.expectEqual(@as(u2, 2), right.events[0].?.side_mask);
+}
+
 test "planNotifications: announce with both sides known emits status and latches lows" {
     var latch = [2]bool{ false, false };
     var last_notified_ms: ?i64 = null;
@@ -1314,9 +1396,9 @@ test "fmtStatusBody: 1-sided model renders a single battery line" {
 
 test "fmtLowBody: 1-sided model drops the side name" {
     var buf: [64]u8 = undefined;
-    try std.testing.expectEqualStrings("Battery at 15%", fmtLowBody(&buf, .sonsei, 0, 15));
-    try std.testing.expectEqualStrings("Left side at 15%", fmtLowBody(&buf, .raise2, 0, 15));
-    try std.testing.expectEqualStrings("Right side at 15%", fmtLowBody(&buf, null, 1, 15));
+    try std.testing.expectEqualStrings("Battery at 15%\nPlease connect charger", fmtLowBody(&buf, .sonsei, 0, 15));
+    try std.testing.expectEqualStrings("Left side at 15%\nPlease connect charger", fmtLowBody(&buf, .raise2, 0, 15));
+    try std.testing.expectEqualStrings("Right side at 15%\nPlease connect charger", fmtLowBody(&buf, null, 1, 15));
 }
 
 test "notification titles name the detected keyboard" {

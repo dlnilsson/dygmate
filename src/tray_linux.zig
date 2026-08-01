@@ -532,7 +532,7 @@ fn rebuildAndNotify(app: *App) void {
         // stale last-known value surviving a reconnect must not fire the
         // announcement early.
         const announce_ready = tray_common.levelsKnown(model, r);
-        const plan = tray_common.planNotifications(&app.state.notified_low, announce_pending, announce_ready, snapshot, unverified, tray_common.nowMs(app.io), &app.state.last_notified_ms);
+        const plan = tray_common.planNotificationsTracked(&app.state.notified_low, &app.state.notified_empty, announce_pending, announce_ready, snapshot, unverified, tray_common.nowMs(app.io), &app.state.last_notified_ms);
         for (plan.events) |ev_opt| {
             if (ev_opt) |ev| sendNotification(app, ev, display);
         }
@@ -543,6 +543,7 @@ fn rebuildAndNotify(app: *App) void {
         }
     } else {
         app.state.notified_low = .{ false, false };
+        app.state.notified_empty = .{ false, false };
     }
     app.status = status;
     app.paused = paused;
@@ -631,6 +632,10 @@ fn notifyInner(app: *App, ev: tray_common.NotifyEvent, snapshot: battery.Reading
         .low_battery => {
             title = tray_common.notificationTitleLow(app.model);
             text = tray_common.fmtLowBody(&body_buf, app.model, ev.side.?, ev.level.?);
+        },
+        .empty_battery => {
+            title = tray_common.notificationTitleEmpty(app.model);
+            text = tray_common.fmtEmptyBody(&body_buf, app.model, ev.side_mask);
         },
     }
     const app_icon: []const u8 = if (ev.warning) "battery-caution" else "battery";

@@ -328,6 +328,7 @@ const NIF_SHOWTIP: UINT = 0x80;
 const NOTIFYICON_VERSION_4: UINT = 4;
 const NIIF_INFO_ICON: DWORD = 0x01;
 const NIIF_WARNING: DWORD = 0x02;
+const NIIF_ERROR: DWORD = 0x03;
 
 const MF_STRING: UINT = 0x0000;
 const MF_GRAYED: UINT = 0x0001; // disabled + dimmed (non-selectable label)
@@ -841,7 +842,7 @@ fn updateTray() void {
         // matches the pre-refactor behavior and avoids announcing early off a
         // stale last-known value.
         const announce_ready = common.levelsKnown(model, r);
-        const plan = common.planNotifications(&g_state.notified_low, announce_pending, announce_ready, snapshot, unverified, common.nowMs(g_io), &g_state.last_notified_ms);
+        const plan = common.planNotificationsTracked(&g_state.notified_low, &g_state.notified_empty, announce_pending, announce_ready, snapshot, unverified, common.nowMs(g_io), &g_state.last_notified_ms);
         for (plan.events) |ev_opt| {
             if (ev_opt) |ev| showEvent(ev, model, display);
         }
@@ -852,6 +853,7 @@ fn updateTray() void {
         }
     } else {
         g_state.notified_low = .{ false, false };
+        g_state.notified_empty = .{ false, false };
     }
 
     // Tooltip: last-known value for each battery-reporting side, in every
@@ -944,6 +946,11 @@ fn showEvent(ev: common.NotifyEvent, model: ?device.Model, snapshot: battery.Rea
             var tb: [64]u8 = undefined;
             const text = common.fmtLowBody(&tb, model, ev.side.?, ev.level.?);
             showBalloon(common.notificationTitleLow(model), text, NIIF_WARNING);
+        },
+        .empty_battery => {
+            var tb: [64]u8 = undefined;
+            const text = common.fmtEmptyBody(&tb, model, ev.side_mask);
+            showBalloon(common.notificationTitleEmpty(model), text, NIIF_ERROR);
         },
     }
 }
