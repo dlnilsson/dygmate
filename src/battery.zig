@@ -189,8 +189,9 @@ fn sleepMs(io: std.Io, ms: u64) void {
 /// those reads (most carry an empty status), so an explicit "4" also latches
 /// the side (`SideState.disconnected`), drops its pending streak (any level
 /// repetition around a disconnect is cache repetition), and keeps
-/// unknown-status levels distrusted until an explicit live status returns. Around sleep/wake transitions the
-/// neuron also transiently serves 0 (its unpopulated cache value; Bazecor
+/// unknown-status levels distrusted until an explicit live status returns.
+/// Around sleep/wake transitions the neuron also transiently serves 0 (its
+/// unpopulated cache value; Bazecor
 /// refuses to render 0% for the same reason) and FOCUS_API documents status
 /// fault as "faulty or has some reading error", i.e. the level may be
 /// garbage — so fault levels and a 0 while not charging are ignored the
@@ -203,15 +204,33 @@ fn sleepMs(io: std.Io, ms: u64) void {
 /// repetition of a cache adds no information, so a value that would newly
 /// cross below the low threshold (or any out-of-tolerance value while a
 /// side is wake-guarded) is held until an authoritative post-forceRead read
-/// settles it. Charging/charged sides are trusted outright only at/above the
-/// low threshold (the sides really do charge over cable while the user is
-/// away); a sub-threshold charging level is the gauge's documented-inaccurate
-/// range and is held for verification like any low so it can't bake a false low
-/// into the baseline. Pure state machine:
+/// settles it. A simultaneous 0-1% / 100% pair is also held as a unit: empty
+/// replies and plain-read repetitions do not confirm the neuron's suspect
+/// cache, but a later authoritative repetition does. Charging/charged sides
+/// are trusted outright only at/above the low threshold (the sides really do
+/// charge over cable while the user is away); a sub-threshold charging level
+/// is in the gauge's documented-inaccurate range and is held for verification
+/// like any low so it can't bake a false low into the baseline. Pure state machine:
 /// no Io, no allocator, unit-testable without hardware.
 pub const Acceptor = struct {
     left: SideState = .{},
     right: SideState = .{},
+    /// A simultaneous 0-1% / 100% pair is a known neuron-cache failure. Keep
+    /// the orientation until a later forceRead returns the same complete pair;
+    /// plain repetitions and empty replies add no evidence. Once confirmed,
+    /// remember the orientation so each ordinary poll does not reopen it.
+    pair_state: PairState = .none,
+
+    const PairCandidate = enum {
+        left_empty,
+        right_empty,
+    };
+
+    const PairState = union(enum) {
+        none,
+        pending: PairCandidate,
+        confirmed: PairCandidate,
+    };
 
     pub const SideState = struct {
         /// Last accepted level; null until a side first passes the gate.
@@ -238,14 +257,17 @@ pub const Acceptor = struct {
     /// `needs_verification` is defense-in-depth.
     pub const Result = struct {
         /// Validated reading: rejected levels are replaced by the last
-        /// accepted level (or null). Statuses pass through untouched.
+        /// accepted level (or null). Statuses pass through untouched except
+        /// while a contradictory pair is held; those become unknown so a
+        /// suspect "charged" status cannot recolor the tray icon.
         reading: Reading,
         /// True while any side holds an unconfirmed suspect value — callers
         /// should poll fast until it resolves.
         suspect: bool,
         /// Per side (0=left, 1=right): the pending value can only be settled
-        /// by an authoritative post-forceRead read — callers should run the
-        /// forceRead verification loop until it clears.
+        /// by an authoritative post-forceRead read. A contradictory full/empty
+        /// pair marks both sides because neither value is trusted. Callers
+        /// should run the forceRead verification loop until it clears.
         needs_verification: [2]bool,
 
         pub fn anyVerification(self: Result) bool {
@@ -254,24 +276,17 @@ pub const Acceptor = struct {
     };
 
     pub fn feed(self: *Acceptor, raw: Reading) Result {
-        return self.result(.{
-            .left = feedSide(&self.left, raw.left),
-            .right = feedSide(&self.right, raw.right),
-        });
+        return self.feedReading(raw, false);
     }
 
     /// Post-forceRead: the neuron just re-polled the sides over RF, so a
-    /// numeric level is ground truth — accept it outright and clear pending.
-    /// Refusing it for several polls would make an explicit user refresh
-    /// appear broken. Exceptions: a side that still answers "disconnected"
-    /// or "fault" was NOT (reliably) reached by the re-poll, and a 0 is the
-    /// blanked cache the forceRead itself just cleared — both are held like
-    /// any other untrusted reading.
+    /// numeric level is normally ground truth and clears per-side pending.
+    /// The first contradictory full/empty pair is still held because the
+    /// neuron itself can produce that pair; a later authoritative repetition
+    /// confirms it. A side that answers "disconnected" or "fault" was not
+    /// reliably reached, and a 0 may be the cache forceRead just blanked.
     pub fn feedAuthoritative(self: *Acceptor, raw: Reading) Result {
-        return self.result(.{
-            .left = acceptAuthoritativeSide(&self.left, raw.left),
-            .right = acceptAuthoritativeSide(&self.right, raw.right),
-        });
+        return self.feedReading(raw, true);
     }
 
     /// The machine just woke from sleep/hibernation: the neuron's cache may
@@ -281,6 +296,7 @@ pub const Acceptor = struct {
     /// accepted level is still the best guess (that's why the Acceptor lives
     /// outside the reconnect loop).
     pub fn noteWake(self: *Acceptor) void {
+        self.pair_state = .none;
         for ([_]*SideState{ &self.left, &self.right }) |st| {
             st.pending = null;
             st.pending_count = 0;
@@ -295,14 +311,106 @@ pub const Acceptor = struct {
     }
 
     fn result(self: *const Acceptor, reading: Reading) Result {
+        const pair_unverified = self.pendingPair() != null;
         return .{
             .reading = reading,
-            .suspect = self.left.pending != null or self.right.pending != null,
-            .needs_verification = .{
-                sideNeedsVerification(self.left),
-                sideNeedsVerification(self.right),
-            },
+            .suspect = pair_unverified or self.left.pending != null or self.right.pending != null,
+            .needs_verification = if (pair_unverified)
+                .{ true, true }
+            else
+                .{
+                    sideNeedsVerification(self.left),
+                    sideNeedsVerification(self.right),
+                },
         };
+    }
+
+    fn feedReading(self: *Acceptor, raw: Reading, authoritative: bool) Result {
+        if (contradictoryPair(raw)) |candidate| {
+            if (self.confirmedPair() == candidate)
+                return self.result(self.feedSides(raw, authoritative));
+            // A matching candidate only counts when forceRead produced it. A
+            // plain poll can repeat the same stale neuron cache indefinitely.
+            if (authoritative and self.pendingPair() == candidate) {
+                self.pair_state = .{ .confirmed = candidate };
+                return self.result(self.feedSides(raw, true));
+            }
+            self.pair_state = .{ .pending = candidate };
+            return self.result(self.heldPair());
+        }
+
+        if (self.pendingPair() != null) {
+            // Explicit failure statuses disprove a live numeric pair and must
+            // reach the normal side state machines. Empty and partial replies
+            // say nothing, so keep waiting for two numeric levels.
+            if (pairHasFailureStatus(raw)) {
+                self.pair_state = .none;
+            } else if (!hasBothLevels(raw)) {
+                return self.result(self.heldPair());
+            } else {
+                // A complete ordinary pair disproves the cached candidate.
+                self.pair_state = .none;
+            }
+        } else if (hasBothLevels(raw) or pairHasFailureStatus(raw)) {
+            // A complete different pair, or an explicit failure status, ends
+            // the exemption for a previously confirmed orientation.
+            self.pair_state = .none;
+        }
+
+        return self.result(self.feedSides(raw, authoritative));
+    }
+
+    fn pendingPair(self: *const Acceptor) ?PairCandidate {
+        return switch (self.pair_state) {
+            .pending => |candidate| candidate,
+            else => null,
+        };
+    }
+
+    fn confirmedPair(self: *const Acceptor) ?PairCandidate {
+        return switch (self.pair_state) {
+            .confirmed => |candidate| candidate,
+            else => null,
+        };
+    }
+
+    fn feedSides(self: *Acceptor, raw: Reading, authoritative: bool) Reading {
+        if (authoritative) return .{
+            .left = acceptAuthoritativeSide(&self.left, raw.left),
+            .right = acceptAuthoritativeSide(&self.right, raw.right),
+        };
+        return .{
+            .left = feedSide(&self.left, raw.left),
+            .right = feedSide(&self.right, raw.right),
+        };
+    }
+
+    fn heldPair(self: *const Acceptor) Reading {
+        return .{
+            .left = .{ .level = self.left.accepted, .status = .unknown },
+            .right = .{ .level = self.right.accepted, .status = .unknown },
+        };
+    }
+
+    fn contradictoryPair(raw: Reading) ?PairCandidate {
+        if (pairHasFailureStatus(raw)) return null;
+        const left = raw.left.level orelse return null;
+        const right = raw.right.level orelse return null;
+        if (left <= 1 and right == 100) return .left_empty;
+        if (right <= 1 and left == 100) return .right_empty;
+        return null;
+    }
+
+    fn hasBothLevels(raw: Reading) bool {
+        return raw.left.level != null and raw.right.level != null;
+    }
+
+    fn pairHasFailureStatus(raw: Reading) bool {
+        return statusInvalidatesPair(raw.left.status) or statusInvalidatesPair(raw.right.status);
+    }
+
+    fn statusInvalidatesPair(status: Status) bool {
+        return status == .disconnected or status == .fault;
     }
 
     /// A side needs an authoritative read when its pending value would newly
@@ -1287,4 +1395,112 @@ test "Acceptor: needs_verification is per-side" {
     });
     try std.testing.expect(res.needs_verification[0]);
     try std.testing.expect(!res.needs_verification[1]);
+}
+
+test "Acceptor: full-empty pair is held through plain and empty polls" {
+    var a: Acceptor = .{};
+    _ = a.feed(.{
+        .left = side(55, .discharging),
+        .right = side(65, .discharging),
+    });
+
+    var res = a.feed(.{
+        .left = side(1, .discharging),
+        .right = side(100, .discharging),
+    });
+    try std.testing.expectEqual(@as(?u8, 55), res.reading.left.level);
+    try std.testing.expectEqual(@as(?u8, 65), res.reading.right.level);
+    try std.testing.expect(res.suspect);
+    try std.testing.expectEqual([2]bool{ true, true }, res.needs_verification);
+
+    // Empty Focus replies contain no new evidence. They must not clear or
+    // advance verification, however many polls return them.
+    for (0..3) |_| {
+        res = a.feed(.{
+            .left = side(null, .unknown),
+            .right = side(null, .unknown),
+        });
+        try std.testing.expectEqual(@as(?u8, 55), res.reading.left.level);
+        try std.testing.expectEqual(@as(?u8, 65), res.reading.right.level);
+        try std.testing.expect(res.suspect);
+        try std.testing.expectEqual([2]bool{ true, true }, res.needs_verification);
+    }
+
+    res = a.feed(.{
+        .left = side(40, .discharging),
+        .right = side(null, .unknown),
+    });
+    try std.testing.expectEqual(@as(?u8, 55), res.reading.left.level);
+    try std.testing.expectEqual(@as(?u8, 65), res.reading.right.level);
+    try std.testing.expect(res.suspect);
+    try std.testing.expectEqual([2]bool{ true, true }, res.needs_verification);
+
+    // Repeating the neuron's plain-read cache is not confirmation either.
+    res = a.feed(.{
+        .left = side(1, .discharging),
+        .right = side(100, .discharging),
+    });
+    try std.testing.expectEqual(@as(?u8, 55), res.reading.left.level);
+    try std.testing.expectEqual(@as(?u8, 65), res.reading.right.level);
+    try std.testing.expect(res.suspect);
+}
+
+test "Acceptor: authoritative repeat confirms a full-empty pair" {
+    var a: Acceptor = .{};
+    _ = a.feed(.{
+        .left = side(55, .discharging),
+        .right = side(65, .discharging),
+    });
+    _ = a.feed(.{
+        .left = side(1, .discharging),
+        .right = side(100, .discharging),
+    });
+
+    var res = a.feedAuthoritative(.{
+        .left = side(1, .discharging),
+        .right = side(100, .discharging),
+    });
+    try std.testing.expectEqual(@as(?u8, 1), res.reading.left.level);
+    try std.testing.expectEqual(@as(?u8, 100), res.reading.right.level);
+    try std.testing.expect(!res.suspect);
+    try std.testing.expectEqual([2]bool{ false, false }, res.needs_verification);
+
+    // Once confirmed, the same genuine pair must not restart verification on
+    // every ordinary poll.
+    res = a.feed(.{
+        .left = side(1, .discharging),
+        .right = side(100, .discharging),
+    });
+    try std.testing.expectEqual(@as(?u8, 1), res.reading.left.level);
+    try std.testing.expectEqual(@as(?u8, 100), res.reading.right.level);
+    try std.testing.expect(!res.suspect);
+    try std.testing.expectEqual([2]bool{ false, false }, res.needs_verification);
+}
+
+test "Acceptor: first authoritative full-empty pair still needs a repeat" {
+    var a: Acceptor = .{};
+    _ = a.feed(.{
+        .left = side(55, .discharging),
+        .right = side(65, .discharging),
+    });
+
+    var res = a.feedAuthoritative(.{
+        .left = side(100, .charged),
+        .right = side(0, .discharging),
+    });
+    try std.testing.expectEqual(@as(?u8, 55), res.reading.left.level);
+    try std.testing.expectEqual(@as(?u8, 65), res.reading.right.level);
+    try std.testing.expect(res.suspect);
+    try std.testing.expectEqual([2]bool{ true, true }, res.needs_verification);
+
+    // A complete, ordinary authoritative pair disproves the candidate and is
+    // accepted through the existing authoritative path.
+    res = a.feedAuthoritative(.{
+        .left = side(99, .charging),
+        .right = side(2, .discharging),
+    });
+    try std.testing.expectEqual(@as(?u8, 99), res.reading.left.level);
+    try std.testing.expectEqual(@as(?u8, 2), res.reading.right.level);
+    try std.testing.expect(!res.suspect);
+    try std.testing.expectEqual([2]bool{ false, false }, res.needs_verification);
 }

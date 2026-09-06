@@ -183,7 +183,8 @@ pub const State = struct {
     /// Per side (0=left, 1=right): the side's value awaits authoritative
     /// forceRead verification (post-wake guard or pending low). Written with
     /// `reading` under the mutex; marks the last accepted value as uncertain
-    /// and mutes low-battery notifications for that side.
+    /// and mutes low-battery notifications for that side. Any uncertain side
+    /// also delays the whole-pair connection announcement.
     unverified: [2]bool = .{ false, false },
     status: DeviceStatus = .missing,
     /// Detected keyboard model; null while absent. Written by the poll
@@ -534,6 +535,12 @@ pub fn levelsKnown(model: ?device.Model, r: battery.Reading) bool {
     return m.sides() < 2 or r.right.level != null;
 }
 
+fn takeAuthoritativeRead(pending: *bool, model: ?device.Model, raw: battery.Reading) bool {
+    if (!pending.* or !levelsKnown(model, raw)) return false;
+    pending.* = false;
+    return true;
+}
+
 /// Any off-cable side below the low threshold — drives warning urgency on
 /// the connect announcement. Charging/charged sides are skipped: FOCUS_API
 /// marks the gauge inaccurate on the cable.
@@ -607,14 +614,16 @@ pub const notify_cooldown_ms: i64 = 10_000;
 /// platform calls. Mirrors the Windows updateTray decision flow exactly.
 ///
 /// `announce_pending` is the pending connect-announcement flag.
-/// `announce_ready` gates the announcement — it must be computed from the *raw*
+/// `announce_ready` gates the announcement. It must be computed from the *raw*
 /// reading (both raw levels present), not the merged snapshot, so a stale
-/// last-known value can't fire the announcement early after a reconnect. The
-/// announcement body and latch still render from the merged `snapshot`.
+/// last-known value can't fire the announcement early after a reconnect. Every
+/// side must also be verified. The announcement body and latch still render
+/// from the merged `snapshot`.
 ///
-/// `unverified` mutes a side that awaits authoritative verification. This is
-/// an invariant backstop: the acceptor never puts an unverified low into the
-/// snapshot in the first place.
+/// `unverified` mutes a side that awaits authoritative verification. A connect
+/// announcement waits until every side verifies, because it describes the
+/// pair as a whole. This is also an invariant backstop: the acceptor never puts
+/// an unverified low into the snapshot in the first place.
 ///
 /// `now_ms`/`last_notified_ms` back the `notify_cooldown_ms` sanity check: no
 /// event fires within `notify_cooldown_ms` of the last one that did — a
@@ -622,8 +631,8 @@ pub const notify_cooldown_ms: i64 = 10_000;
 /// events in the same call (e.g. two sides crossing low together) still fire
 /// together — the cooldown is evaluated once per call, not per event.
 ///
-/// - pending + ready: emit connect_status, latch the lows, report consumed.
-/// - pending + not ready: emit nothing, keep announce pending.
+/// - pending + ready + verified: emit connect_status, latch lows, report consumed.
+/// - pending + not ready/unverified: emit nothing, keep announce pending.
 /// - not pending: per-side low check against the latch (fires once per crossing).
 pub fn planNotificationsTracked(
     latch: *[2]bool,
@@ -640,23 +649,18 @@ pub fn planNotificationsTracked(
     const cooled_down = if (last_notified_ms.*) |last| now_ms - last >= notify_cooldown_ms else true;
 
     if (announce_pending) {
-        // A side hasn't reported a fresh level yet: stay pending, fire nothing.
-        if (!announce_ready) return plan;
+        // A side has no fresh level or is still being verified: stay pending
+        // and fire nothing. The status announcement describes the whole pair.
+        if (!announce_ready or unverified[0] or unverified[1]) return plan;
 
         // Cooldown backstop: the latch still advances as though the
         // announcement fired, so a suppressed announcement is dropped
         // outright rather than retried on the next poll.
         if (cooled_down) plan.events[0] = .{ .kind = .connect_status, .warning = hasLowBattery(snapshot) };
         // Latch every side to its current low state so the announcement doesn't
-        // double as a fresh low crossing on the next poll. An unverified side
-        // latches like a null level: its value isn't evidence yet.
+        // double as a fresh low crossing on the next poll.
         for (sides, 0..) |s, i| {
             if (s.status.onCable()) {
-                latch[i] = false;
-                empty_latch[i] = false;
-                continue;
-            }
-            if (unverified[i]) {
                 latch[i] = false;
                 empty_latch[i] = false;
                 continue;
@@ -831,8 +835,9 @@ pub fn runPollLoop(
     // while a side is disconnected/asleep — survives reconnects.
     var left_window: LevelWindow = .{};
     var right_window: LevelWindow = .{};
-    // Set after a forceRead: the next reading is ground truth and bypasses
-    // the gate.
+    // Set after a forceRead: the first complete numeric reading is ground truth
+    // and bypasses the gate. Empty and partial replies leave this armed because
+    // forceRead routinely blanks the neuron's cache longer than the settle wait.
     var next_read_authoritative = false;
     // Wake detection + forceRead verification state. Outside the connect
     // loop like `acceptor`: a forceRead failure breaks to reconnect, and the
@@ -949,12 +954,11 @@ pub fn runPollLoop(
                 } else if (anyReportingSideLive(found.model, raw)) {
                     layer_tracker.noteWirelessLive();
                 }
-                const authoritative_read = next_read_authoritative;
-                const res = if (next_read_authoritative)
+                const authoritative_read = takeAuthoritativeRead(&next_read_authoritative, found.model, raw);
+                const res = if (authoritative_read)
                     acceptor.feedAuthoritative(raw)
                 else
                     acceptor.feed(raw);
-                next_read_authoritative = false;
                 // Expose the raw wire reading, the gated result, and the
                 // verdict on the debug events channel.
                 statusserver.emitReading(.{
@@ -1380,6 +1384,47 @@ test "levelsKnown: 2-sided and null models need both sides, 1-sided needs left o
     try std.testing.expect(levelsKnown(null, both));
 }
 
+test "force-read authority waits for the first complete numeric reading" {
+    var pending = true;
+    const empty = reading(null, .unknown, null, .unknown);
+    const left_only = reading(100, .discharging, null, .unknown);
+    const complete = reading(100, .unknown, 100, .unknown);
+
+    try std.testing.expect(!takeAuthoritativeRead(&pending, .defy_wireless, empty));
+    try std.testing.expect(pending);
+    try std.testing.expect(!takeAuthoritativeRead(&pending, .defy_wireless, left_only));
+    try std.testing.expect(pending);
+    try std.testing.expect(takeAuthoritativeRead(&pending, .defy_wireless, complete));
+    try std.testing.expect(!pending);
+    try std.testing.expect(!takeAuthoritativeRead(&pending, .defy_wireless, complete));
+
+    pending = true;
+    try std.testing.expect(takeAuthoritativeRead(&pending, .sonsei, left_only));
+    try std.testing.expect(!pending);
+}
+
+test "post-force empty poll does not strand an initial 100 percent reading" {
+    const complete = reading(100, .unknown, 100, .unknown);
+    const empty = reading(null, .unknown, null, .unknown);
+    var acceptor: battery.Acceptor = .{};
+
+    var result = acceptor.feed(complete);
+    try std.testing.expect(result.anyVerification());
+
+    var pending_authoritative = true;
+    var authoritative = takeAuthoritativeRead(&pending_authoritative, .defy_wireless, empty);
+    result = if (authoritative) acceptor.feedAuthoritative(empty) else acceptor.feed(empty);
+    try std.testing.expect(result.anyVerification());
+    try std.testing.expect(pending_authoritative);
+
+    authoritative = takeAuthoritativeRead(&pending_authoritative, .defy_wireless, complete);
+    result = if (authoritative) acceptor.feedAuthoritative(complete) else acceptor.feed(complete);
+    try std.testing.expectEqual(@as(?u8, 100), result.reading.left.level);
+    try std.testing.expectEqual(@as(?u8, 100), result.reading.right.level);
+    try std.testing.expect(!result.anyVerification());
+    try std.testing.expect(!pending_authoritative);
+}
+
 test "fmtStatusBody: 1-sided model renders a single battery line" {
     var buf: [96]u8 = undefined;
     const r = reading(42, .discharging, null, .unknown);
@@ -1472,11 +1517,12 @@ test "planNotifications: unverified side fires nothing and leaves the latch unto
     try std.testing.expectEqual(@as(usize, 0), countEvents(again));
 }
 
-test "planNotifications: announce latches an unverified side like a null level" {
+test "planNotifications: announcement waits for every side to verify" {
     var latch = [2]bool{ false, false };
     var last_notified_ms: ?i64 = null;
     const plan = planNotifications(&latch, true, true, reading(15, .discharging, 90, .discharging), .{ true, false }, 0, &last_notified_ms);
-    try std.testing.expect(plan.consumed_announce);
+    try std.testing.expectEqual(@as(usize, 0), countEvents(plan));
+    try std.testing.expect(!plan.consumed_announce);
     try std.testing.expect(!latch[0]);
 }
 
@@ -1537,6 +1583,32 @@ test "unverified display retains the accepted minimum for the tray icon" {
 
     var buf: [48]u8 = undefined;
     try std.testing.expectEqualStrings("45%? (discharging)", fmtKnownSide(&buf, known.leftText(), true));
+}
+
+test "full-empty suspect keeps the prior tray value and mutes notifications" {
+    var acceptor: battery.Acceptor = .{};
+    const baseline = acceptor.feedAuthoritative(reading(55, .discharging, 80, .discharging));
+    var known = LastKnown{};
+    known.merge(baseline.reading);
+
+    const suspect = acceptor.feed(reading(100, .charged, 1, .discharging));
+    known.merge(suspect.reading);
+    try std.testing.expectEqual([2]bool{ true, true }, suspect.needs_verification);
+
+    // The icon keeps the accepted value and status. The suspect charged status
+    // must not turn a previously green icon blue.
+    const disp = known.display(hiddenSides(suspect.needs_verification));
+    try std.testing.expectEqual(@as(?u8, 55), disp.level);
+    try std.testing.expectEqual(battery.Status.discharging, disp.status);
+    try std.testing.expectEqual(palette.green, iconColor(true, disp.level.?, disp.status));
+
+    var latch = [2]bool{ false, false };
+    var last_notified_ms: ?i64 = null;
+    const snapshot = reading(known.left.level, known.left.status, known.right.level, known.right.status);
+    const plan = planNotifications(&latch, true, true, snapshot, suspect.needs_verification, 0, &last_notified_ms);
+    try std.testing.expectEqual(@as(usize, 0), countEvents(plan));
+    try std.testing.expect(!plan.consumed_announce);
+    try std.testing.expectEqual([2]bool{ false, false }, latch);
 }
 
 test "fmt helpers render unverified sides per display mode" {
