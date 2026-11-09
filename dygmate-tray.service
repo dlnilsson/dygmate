@@ -1,8 +1,14 @@
 [Unit]
 Description=Dygmate battery tray indicator
+# Run only inside a graphical session while a Dygma keyboard is plugged in.
+# Requisite= (not Requires=) so a keyboard present before login never pulls
+# graphical-session.target up early; the session target starts us later.
 PartOf=graphical-session.target
-Requires=graphical-session.target
+Requisite=graphical-session.target
 After=graphical-session.target
+# /dev/dygma and dev-dygma.device come from 99-dygmate.rules.
+ConditionPathExists=/dev/dygma
+StopPropagatedFrom=dev-dygma.device
 
 [Service]
 ExecStart=/usr/bin/dygmate-tray
@@ -13,4 +19,6 @@ StandardError=journal
 SyslogIdentifier=dygmate
 
 [Install]
-WantedBy=graphical-session.target
+# graphical-session.target: start at login if the keyboard is already present.
+# dev-dygma.device: start when the keyboard is plugged in later.
+WantedBy=graphical-session.target dev-dygma.device

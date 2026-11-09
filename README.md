@@ -63,6 +63,11 @@ keyboard and enable the service:
 systemctl --user enable --now dygmate-tray.service
 ```
 
+The service runs only while the keyboard is plugged in: it starts when the
+keyboard is connected and stops when it is unplugged. If you enabled the
+service before this behavior existed, run
+`systemctl --user reenable dygmate-tray.service` once to pick it up.
+
 ## Build
 
 Requires [Zig 0.16.0](https://ziglang.org/download/).
@@ -228,6 +233,12 @@ user service:
 systemctl --user enable --now dygmate-tray.service
 ```
 
+With the [udev rule](#serial-port-permissions) installed, the service runs
+only while the keyboard is plugged in: it starts on connect (or at login if
+the keyboard is already there) and stops on unplug. Without the rule, the
+service does not start. Run `systemctl --user reenable dygmate-tray.service`
+once if you enabled it before this behavior existed.
+
 The service uses the user manager's session D-Bus and device permissions. If
 you want the optional layer-shell OSD on Wayland, make sure the user manager
 also receives the Wayland environment. Run this from your compositor's
@@ -272,15 +283,17 @@ skip this step. Manual install:
 
 ```sh
 printf '%s\n' \
-  'SUBSYSTEM=="tty", ATTRS{idVendor}=="35ef", ATTRS{idProduct}=="0012", TAG+="uaccess"' \
-  'SUBSYSTEM=="tty", ATTRS{idVendor}=="35ef", ATTRS{idProduct}=="0021", TAG+="uaccess"' \
-  'SUBSYSTEM=="tty", ATTRS{idVendor}=="35ef", ATTRS{idProduct}=="0031", TAG+="uaccess"' \
+  'SUBSYSTEM=="tty", ATTRS{idVendor}=="35ef", ATTRS{idProduct}=="0012", TAG+="uaccess", TAG+="systemd", SYMLINK+="dygma"' \
+  'SUBSYSTEM=="tty", ATTRS{idVendor}=="35ef", ATTRS{idProduct}=="0021", TAG+="uaccess", TAG+="systemd", SYMLINK+="dygma"' \
+  'SUBSYSTEM=="tty", ATTRS{idVendor}=="35ef", ATTRS{idProduct}=="0031", TAG+="uaccess", TAG+="systemd", SYMLINK+="dygma"' \
   | sudo tee /etc/udev/rules.d/99-dygmate.rules
 sudo udevadm control --reload-rules && sudo udevadm trigger
 ```
 
 `TAG+="uaccess"` grants access to the user of the active login session, so no
-group membership is needed and it works for the tray too. Replug the keyboard
+group membership is needed and it works for the tray too. `TAG+="systemd"`
+and `SYMLINK+="dygma"` expose the keyboard as `dev-dygma.device`, which the
+user service uses to start and stop with the keyboard. Replug the keyboard
 after adding or changing the rule.
 
 Close [Bazecor](https://github.com/Dygmalab/Bazecor) before running dygmate either way — the serial port is exclusive.

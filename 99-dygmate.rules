@@ -1,5 +1,9 @@
 # Let the active local user access a Dygma keyboard's CDC-ACM serial
 # interface (Defy wireless, Raise 2, Sonsei).
-SUBSYSTEM=="tty", ATTRS{idVendor}=="35ef", ATTRS{idProduct}=="0012", TAG+="uaccess"
-SUBSYSTEM=="tty", ATTRS{idVendor}=="35ef", ATTRS{idProduct}=="0021", TAG+="uaccess"
-SUBSYSTEM=="tty", ATTRS{idVendor}=="35ef", ATTRS{idProduct}=="0031", TAG+="uaccess"
+#
+# TAG+="systemd" + SYMLINK+="dygma" expose the port as dev-dygma.device, so the
+# dygmate-tray user service (when enabled) starts when the keyboard is plugged
+# in and stops when it is unplugged.
+SUBSYSTEM=="tty", ATTRS{idVendor}=="35ef", ATTRS{idProduct}=="0012", TAG+="uaccess", TAG+="systemd", SYMLINK+="dygma"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="35ef", ATTRS{idProduct}=="0021", TAG+="uaccess", TAG+="systemd", SYMLINK+="dygma"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="35ef", ATTRS{idProduct}=="0031", TAG+="uaccess", TAG+="systemd", SYMLINK+="dygma"
