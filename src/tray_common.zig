@@ -210,6 +210,9 @@ pub const State = struct {
     /// UI-thread-only: wall-clock ms of the last notification actually fired,
     /// backing the `notify_cooldown_ms` sanity check in `planNotifications`.
     last_notified_ms: ?i64 = null,
+    /// UI-thread-only: wall-clock ms of the last connect announcement actually
+    /// fired, backing `announce_cooldown_ms`.
+    last_announced_ms: ?i64 = null,
 };
 
 pub const DeviceStatus = enum {
@@ -610,6 +613,24 @@ pub fn nowMs(io: std.Io) i64 {
 /// clears.
 pub const notify_cooldown_ms: i64 = 10_000;
 
+/// Connect announcements (startup, Refresh, long-outage reconnect) never fire
+/// more often than this. Separate from `notify_cooldown_ms` so low/empty
+/// warnings are never swallowed by a recent announcement. Same drop-not-queue
+/// semantics.
+pub const announce_cooldown_ms: i64 = 5 * 60 * 1000;
+
+/// A reconnect only re-announces once the link has been down at least this
+/// long; short drops (sleep/wake, USB power-saving, serial hiccups) stay silent.
+pub const reconnect_announce_min_down_ms: i64 = 10 * 60 * 1000;
+
+/// Should a fresh connection's first reading arm the connect announcement?
+/// `last_live_ms` is the wall-clock time of the last reading published on any
+/// earlier connection, null before the first one (startup always announces).
+pub fn reconnectAnnounces(last_live_ms: ?i64, now_ms: i64) bool {
+    const last = last_live_ms orelse return true;
+    return now_ms - last >= reconnect_announce_min_down_ms;
+}
+
 /// Decide which notifications to fire and mutate the per-side latch. Pure: no
 /// platform calls. Mirrors the Windows updateTray decision flow exactly.
 ///
@@ -630,6 +651,8 @@ pub const notify_cooldown_ms: i64 = 10_000;
 /// crossing/announcement inside the window is dropped, not queued. Both
 /// events in the same call (e.g. two sides crossing low together) still fire
 /// together — the cooldown is evaluated once per call, not per event.
+/// `last_announced_ms` additionally holds connect announcements to
+/// `announce_cooldown_ms`; it never delays low/empty warnings.
 ///
 /// - pending + ready + verified: emit connect_status, latch lows, report consumed.
 /// - pending + not ready/unverified: emit nothing, keep announce pending.
@@ -643,6 +666,7 @@ pub fn planNotificationsTracked(
     unverified: [2]bool,
     now_ms: i64,
     last_notified_ms: *?i64,
+    last_announced_ms: *?i64,
 ) NotifyPlan {
     var plan = NotifyPlan{};
     const sides = [_]battery.SideReading{ snapshot.left, snapshot.right };
@@ -656,7 +680,9 @@ pub fn planNotificationsTracked(
         // Cooldown backstop: the latch still advances as though the
         // announcement fired, so a suppressed announcement is dropped
         // outright rather than retried on the next poll.
-        if (cooled_down) plan.events[0] = .{ .kind = .connect_status, .warning = hasLowBattery(snapshot) };
+        const announce_cooled = if (last_announced_ms.*) |last| now_ms - last >= announce_cooldown_ms else true;
+        const fire = cooled_down and announce_cooled;
+        if (fire) plan.events[0] = .{ .kind = .connect_status, .warning = hasLowBattery(snapshot) };
         // Latch every side to its current low state so the announcement doesn't
         // double as a fresh low crossing on the next poll.
         for (sides, 0..) |s, i| {
@@ -674,7 +700,10 @@ pub fn planNotificationsTracked(
             empty_latch[i] = lvl == 0;
         }
         plan.consumed_announce = true;
-        if (cooled_down) last_notified_ms.* = now_ms;
+        if (fire) {
+            last_notified_ms.* = now_ms;
+            last_announced_ms.* = now_ms;
+        }
         return plan;
     }
 
@@ -735,7 +764,8 @@ fn planNotifications(
         snapshot.left.level == 0,
         snapshot.right.level == 0,
     };
-    return planNotificationsTracked(latch, &empty_latch, announce_pending, announce_ready, snapshot, unverified, now_ms, last_notified_ms);
+    var last_announced_ms: ?i64 = null;
+    return planNotificationsTracked(latch, &empty_latch, announce_pending, announce_ready, snapshot, unverified, now_ms, last_notified_ms, &last_announced_ms);
 }
 
 const LayerTracker = struct {
@@ -847,6 +877,9 @@ pub fn runPollLoop(
     var verify_backoff_idx: usize = 0;
     var verify_wait_ms: u64 = 0;
     var layer_tracker: LayerTracker = .{};
+    // Wall-clock time of the last published reading, across connections:
+    // a reconnect announces only after a long outage (reconnectAnnounces).
+    var last_live_ms: ?i64 = null;
     while (!st.stop.load(.acquire)) {
         // A wake can land while disconnected or paused too: guard the sides
         // so the next connection's first reads need verification.
@@ -978,8 +1011,10 @@ pub fn runPollLoop(
                 var merged: battery.Reading = .{ .left = known.left, .right = known.right };
                 if (left_window.min()) |m| merged.left.level = m;
                 if (right_window.min()) |m| merged.right.level = m;
+                const now_ms = nowMs(io);
                 st.mutex.lockUncancelable(io);
-                const announce_connection = st.status != .connected;
+                const announce_connection = st.status != .connected and reconnectAnnounces(last_live_ms, now_ms);
+                last_live_ms = now_ms;
                 st.reading = merged;
                 st.unverified = res.needs_verification;
                 st.status = .connected;
@@ -1282,10 +1317,11 @@ test "planNotificationsTracked: reaching zero emits one combined critical event"
     var low_latch = [2]bool{ true, true };
     var empty_latch = [2]bool{ false, false };
     var last_notified_ms: ?i64 = null;
-    const first = planNotificationsTracked(&low_latch, &empty_latch, false, false, reading(0, .discharging, 0, .discharging), .{ false, false }, 0, &last_notified_ms);
+    var last_announced_ms: ?i64 = null;
+    const first = planNotificationsTracked(&low_latch, &empty_latch, false, false, reading(0, .discharging, 0, .discharging), .{ false, false }, 0, &last_notified_ms, &last_announced_ms);
     try std.testing.expectEqual(NotifyEvent{ .kind = .empty_battery, .warning = true, .side_mask = 3 }, first.events[0].?);
 
-    const repeated = planNotificationsTracked(&low_latch, &empty_latch, false, false, reading(0, .discharging, 0, .discharging), .{ false, false }, 60_000, &last_notified_ms);
+    const repeated = planNotificationsTracked(&low_latch, &empty_latch, false, false, reading(0, .discharging, 0, .discharging), .{ false, false }, 60_000, &last_notified_ms, &last_announced_ms);
     try std.testing.expectEqual(@as(?NotifyEvent, null), repeated.events[0]);
 }
 
@@ -1293,9 +1329,10 @@ test "planNotificationsTracked: each side can independently reach zero" {
     var low_latch = [2]bool{ true, true };
     var empty_latch = [2]bool{ false, false };
     var last_notified_ms: ?i64 = null;
-    const left = planNotificationsTracked(&low_latch, &empty_latch, false, false, reading(0, .discharging, 5, .discharging), .{ false, false }, 0, &last_notified_ms);
+    var last_announced_ms: ?i64 = null;
+    const left = planNotificationsTracked(&low_latch, &empty_latch, false, false, reading(0, .discharging, 5, .discharging), .{ false, false }, 0, &last_notified_ms, &last_announced_ms);
     try std.testing.expectEqual(@as(u2, 1), left.events[0].?.side_mask);
-    const right = planNotificationsTracked(&low_latch, &empty_latch, false, false, reading(0, .discharging, 0, .discharging), .{ false, false }, 10_000, &last_notified_ms);
+    const right = planNotificationsTracked(&low_latch, &empty_latch, false, false, reading(0, .discharging, 0, .discharging), .{ false, false }, 10_000, &last_notified_ms, &last_announced_ms);
     try std.testing.expectEqual(@as(u2, 2), right.events[0].?.side_mask);
 }
 
@@ -1309,6 +1346,39 @@ test "planNotifications: announce with both sides known emits status and latches
     try std.testing.expect(plan.consumed_announce);
     try std.testing.expect(latch[0]); // low side latched by the announcement
     try std.testing.expect(!latch[1]);
+}
+
+test "reconnectAnnounces: startup always, reconnect only after a long outage" {
+    try std.testing.expect(reconnectAnnounces(null, 0));
+    try std.testing.expect(!reconnectAnnounces(0, reconnect_announce_min_down_ms - 1));
+    try std.testing.expect(reconnectAnnounces(0, reconnect_announce_min_down_ms));
+}
+
+test "planNotificationsTracked: announcements are held to announce_cooldown_ms" {
+    var low_latch = [2]bool{ false, false };
+    var empty_latch = [2]bool{ false, false };
+    var last_notified_ms: ?i64 = null;
+    var last_announced_ms: ?i64 = null;
+    const healthy = reading(80, .discharging, 90, .discharging);
+    const first = planNotificationsTracked(&low_latch, &empty_latch, true, true, healthy, .{ false, false }, 0, &last_notified_ms, &last_announced_ms);
+    try std.testing.expectEqual(@as(usize, 1), countEvents(first));
+    // Past the global cooldown but inside the announcement one: dropped, yet consumed.
+    const early = planNotificationsTracked(&low_latch, &empty_latch, true, true, healthy, .{ false, false }, 60_000, &last_notified_ms, &last_announced_ms);
+    try std.testing.expectEqual(@as(usize, 0), countEvents(early));
+    try std.testing.expect(early.consumed_announce);
+    const later = planNotificationsTracked(&low_latch, &empty_latch, true, true, healthy, .{ false, false }, announce_cooldown_ms, &last_notified_ms, &last_announced_ms);
+    try std.testing.expectEqual(@as(usize, 1), countEvents(later));
+}
+
+test "planNotificationsTracked: announcement cooldown never delays a low warning" {
+    var low_latch = [2]bool{ false, false };
+    var empty_latch = [2]bool{ false, false };
+    var last_notified_ms: ?i64 = null;
+    var last_announced_ms: ?i64 = null;
+    _ = planNotificationsTracked(&low_latch, &empty_latch, true, true, reading(80, .discharging, 90, .discharging), .{ false, false }, 0, &last_notified_ms, &last_announced_ms);
+    const low = planNotificationsTracked(&low_latch, &empty_latch, false, false, reading(15, .discharging, 90, .discharging), .{ false, false }, notify_cooldown_ms, &last_notified_ms, &last_announced_ms);
+    try std.testing.expectEqual(@as(usize, 1), countEvents(low));
+    try std.testing.expect(low.events[0].?.kind == .low_battery);
 }
 
 test "planNotifications: announce with a healthy pair is not a warning" {

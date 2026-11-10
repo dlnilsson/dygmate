@@ -532,7 +532,7 @@ fn rebuildAndNotify(app: *App) void {
         // stale last-known value surviving a reconnect must not fire the
         // announcement early.
         const announce_ready = tray_common.levelsKnown(model, r);
-        const plan = tray_common.planNotificationsTracked(&app.state.notified_low, &app.state.notified_empty, announce_pending, announce_ready, snapshot, unverified, tray_common.nowMs(app.io), &app.state.last_notified_ms);
+        const plan = tray_common.planNotificationsTracked(&app.state.notified_low, &app.state.notified_empty, announce_pending, announce_ready, snapshot, unverified, tray_common.nowMs(app.io), &app.state.last_notified_ms, &app.state.last_announced_ms);
         for (plan.events) |ev_opt| {
             if (ev_opt) |ev| sendNotification(app, ev, display);
         }
@@ -541,10 +541,11 @@ fn rebuildAndNotify(app: *App) void {
             app.state.announce_connection = false;
             app.state.mutex.unlock(app.io);
         }
-    } else {
-        app.state.notified_low = .{ false, false };
-        app.state.notified_empty = .{ false, false };
     }
+    // Low/empty latches deliberately survive disconnects and pauses: a short
+    // reconnect no longer re-announces, so clearing them here would re-fire
+    // the same low warning on every reconnect. They still reset on cable or
+    // recovery once a live reading arrives.
     app.status = status;
     app.paused = paused;
     dlog("update: status={s} paused={} left={?d}% right={?d}%", .{

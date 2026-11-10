@@ -842,7 +842,7 @@ fn updateTray() void {
         // matches the pre-refactor behavior and avoids announcing early off a
         // stale last-known value.
         const announce_ready = common.levelsKnown(model, r);
-        const plan = common.planNotificationsTracked(&g_state.notified_low, &g_state.notified_empty, announce_pending, announce_ready, snapshot, unverified, common.nowMs(g_io), &g_state.last_notified_ms);
+        const plan = common.planNotificationsTracked(&g_state.notified_low, &g_state.notified_empty, announce_pending, announce_ready, snapshot, unverified, common.nowMs(g_io), &g_state.last_notified_ms, &g_state.last_announced_ms);
         for (plan.events) |ev_opt| {
             if (ev_opt) |ev| showEvent(ev, model, display);
         }
@@ -851,10 +851,11 @@ fn updateTray() void {
             g_state.announce_connection = false;
             g_state.mutex.unlock(g_io);
         }
-    } else {
-        g_state.notified_low = .{ false, false };
-        g_state.notified_empty = .{ false, false };
     }
+    // Low/empty latches deliberately survive disconnects and pauses: a short
+    // reconnect no longer re-announces, so clearing them here would re-fire
+    // the same low warning on every reconnect. They still reset on cable or
+    // recovery once a live reading arrives.
 
     // Tooltip: last-known value for each battery-reporting side, in every
     // state, with a short header when the reading isn't live.
