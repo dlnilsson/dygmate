@@ -32,7 +32,7 @@ jobs:
           stage="dygmate-${ver}-x86_64"
           mkdir "${stage}"
           cp zig-out/linux/dygmate zig-out/linux/dygmate-tray "${stage}/"
-          cp dygmate-tray.service 99-dygmate.rules LICENSE "${stage}/"
+          cp dygmate-tray.service 70-dygmate.rules LICENSE "${stage}/"
           tar -C "${stage}" -czf "${stage}.tar.gz" .
 
           # Windows zip (winget's NestedInstallerFiles expect the exes at the

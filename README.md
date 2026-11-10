@@ -286,7 +286,7 @@ printf '%s\n' \
   'SUBSYSTEM=="tty", ATTRS{idVendor}=="35ef", ATTRS{idProduct}=="0012", TAG+="uaccess", TAG+="systemd", SYMLINK+="dygma"' \
   'SUBSYSTEM=="tty", ATTRS{idVendor}=="35ef", ATTRS{idProduct}=="0021", TAG+="uaccess", TAG+="systemd", SYMLINK+="dygma"' \
   'SUBSYSTEM=="tty", ATTRS{idVendor}=="35ef", ATTRS{idProduct}=="0031", TAG+="uaccess", TAG+="systemd", SYMLINK+="dygma"' \
-  | sudo tee /etc/udev/rules.d/99-dygmate.rules
+  | sudo tee /etc/udev/rules.d/70-dygmate.rules
 sudo udevadm control --reload-rules && sudo udevadm trigger
 ```
 
@@ -294,6 +294,8 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 group membership is needed and it works for the tray too. `TAG+="systemd"`
 and `SYMLINK+="dygma"` expose the keyboard as `dev-dygma.device`, which the
 user service uses to start and stop with the keyboard. Replug the keyboard
-after adding or changing the rule.
+after adding or changing the rule. The rule file must sort before
+`73-seat-late.rules`, which applies `uaccess`; if you installed an older
+`99-dygmate.rules`, delete it.
 
 Close [Bazecor](https://github.com/Dygmalab/Bazecor) before running dygmate either way — the serial port is exclusive.

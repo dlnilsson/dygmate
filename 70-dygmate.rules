@@ -4,6 +4,9 @@
 # TAG+="systemd" + SYMLINK+="dygma" expose the port as dev-dygma.device, so the
 # dygmate-tray user service (when enabled) starts when the keyboard is plugged
 # in and stops when it is unplugged.
+#
+# The number must stay below 73: 73-seat-late.rules applies uaccess ACLs, so a
+# uaccess tag added by a later rule is ignored on hotplug.
 SUBSYSTEM=="tty", ATTRS{idVendor}=="35ef", ATTRS{idProduct}=="0012", TAG+="uaccess", TAG+="systemd", SYMLINK+="dygma"
 SUBSYSTEM=="tty", ATTRS{idVendor}=="35ef", ATTRS{idProduct}=="0021", TAG+="uaccess", TAG+="systemd", SYMLINK+="dygma"
 SUBSYSTEM=="tty", ATTRS{idVendor}=="35ef", ATTRS{idProduct}=="0031", TAG+="uaccess", TAG+="systemd", SYMLINK+="dygma"

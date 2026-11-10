@@ -6,7 +6,7 @@ Description=Dygmate battery tray indicator
 PartOf=graphical-session.target
 Requisite=graphical-session.target
 After=graphical-session.target
-# /dev/dygma and dev-dygma.device come from 99-dygmate.rules.
+# /dev/dygma and dev-dygma.device come from 70-dygmate.rules.
 ConditionPathExists=/dev/dygma
 StopPropagatedFrom=dev-dygma.device
 
