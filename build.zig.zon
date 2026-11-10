@@ -2,7 +2,7 @@
     .name = .dygmate,
     .version = "0.1.0",
     .fingerprint = 0x1378e7301a1c844a,
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.1",
     .dependencies = .{
         .serial = .{
             .url = "https://github.com/ZigEmbeddedGroup/serial/archive/refs/heads/master.tar.gz",

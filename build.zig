@@ -23,7 +23,7 @@ pub fn build(b: *std.Build) void {
 
     const run_cmd = b.addRunArtifact(bins.cli);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_cmd.addArgs(args);
+    run_cmd.addPassthruArgs();
     b.step("run", "Run dygmate").dependOn(&run_cmd.step);
 
     if (bins.tray) |tray| {
@@ -113,7 +113,7 @@ fn addBinaries(
         });
         if (target.result.os.tag == .windows) {
             // GUI subsystem (no console) + the Win32 GUI libraries.
-            t.subsystem = .Windows;
+            t.subsystem = .windows;
             t.root_module.linkSystemLibrary("user32", .{});
             t.root_module.linkSystemLibrary("shell32", .{});
             t.root_module.linkSystemLibrary("gdi32", .{});

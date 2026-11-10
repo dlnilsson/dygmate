@@ -1,7 +1,7 @@
 # AGENTS.md
 
 Battery status for Dygma wireless keyboards (Defy, Raise 2, Sonsei) in the
-system tray, over the Focus serial protocol. Windows + Linux. Zig 0.16.0.
+system tray, over the Focus serial protocol. Windows + Linux. Zig 0.17.1.
 Two binaries: `dygmate` (CLI, `src/main.zig`) and `dygmate-tray`
 (`src/tray_windows.zig` / `src/tray_linux.zig`).
 
@@ -66,7 +66,7 @@ dependencies — that is the established style here.
   these updated — they are the primary architecture docs.
 - Platform-specific code branches on `builtin.os.tag`; macOS has no port
   enumeration (users pass `--port`), don't assume it does.
-- This uses Zig 0.16 idioms: `std.Io` interface (`io` parameter threaded
+- This uses Zig 0.17 idioms: `std.Io` interface (`io` parameter threaded
   through), `std.process.Init` main signature. Match them.
 - Cross-cutting behavior changes must land in `tray_common.zig`, not be
   duplicated per platform.

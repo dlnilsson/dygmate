@@ -18,7 +18,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.1
 
       - name: Build (ReleaseSmall, Windows + Linux)
         run: zig build release -Dversion="${GITHUB_REF_NAME#v}"

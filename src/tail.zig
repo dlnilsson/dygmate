@@ -105,7 +105,7 @@ fn runPosix(io: Io, gpa: std.mem.Allocator, environ: *EnvMap, lines: *LineReader
     var buf: [4096]u8 = undefined;
     while (true) {
         var vec = [_][]u8{&buf};
-        const n = io.vtable.netRead(io.userdata, stream.socket.handle, &vec) catch break;
+        const n = stream.read(io, &vec) catch break;
         if (n == 0) break; // server closed
         lines.feed(buf[0..n]);
     }

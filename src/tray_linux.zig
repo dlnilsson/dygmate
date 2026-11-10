@@ -416,7 +416,7 @@ fn showOsdNow(app: *App) void {
 // ---------------------------------------------------------------------------
 fn acquireSingleton(runtime_dir: []const u8) ?i32 {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, "{s}/dygmate-tray.lock", .{runtime_dir}) catch return null;
+    const path = std.mem.printSentinel(&path_buf, "{s}/dygmate-tray.lock", .{runtime_dir}, 0) catch return null;
     const rc = linux.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true }, 0o600);
     if (@as(isize, @bitCast(rc)) < 0) return null;
     const fd: i32 = @intCast(rc);

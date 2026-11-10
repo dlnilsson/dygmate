@@ -70,7 +70,7 @@ service before this behavior existed, run
 
 ## Build
 
-Requires [Zig 0.16.0](https://ziglang.org/download/).
+Requires [Zig 0.17.1](https://ziglang.org/download/).
 
 Build for the host (produces the CLI `dygmate` and the tray `dygmate-tray`):
 

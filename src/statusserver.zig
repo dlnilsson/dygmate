@@ -94,7 +94,7 @@ const EvSlot = struct {
 };
 
 var ev_mu: std.Io.Mutex = .init;
-var ev_ring = [_]EvSlot{.{}} ** ev_ring_len;
+var ev_ring: [ev_ring_len]EvSlot = @splat(.{});
 /// Next sequence number to assign; also the count of events ever emitted.
 var ev_head: u64 = 0;
 var events_enabled: std.atomic.Value(bool) = .init(false);
@@ -465,8 +465,11 @@ fn serveLinux(gpa: std.mem.Allocator) void {
 fn writeAll(io: std.Io, stream: std.Io.net.Stream, bytes: []const u8) !void {
     var off: usize = 0;
     while (off < bytes.len) {
-        const empty: []const u8 = &.{};
-        const n = try io.vtable.netWrite(io.userdata, stream.socket.handle, bytes[off..], (&empty)[0..1], 0);
+        const n = try (try io.operate(.{ .net_write = .{
+            .socket_handle = stream.socket.handle,
+            .header = bytes[off..],
+            .data = &.{""},
+        } })).net_write;
         if (n == 0) return error.ConnectionClosed;
         off += n;
     }

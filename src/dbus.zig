@@ -487,8 +487,11 @@ pub const Connection = struct {
     fn writeAll(self: *Connection, bytes: []const u8) !void {
         var off: usize = 0;
         while (off < bytes.len) {
-            const empty: []const u8 = &.{};
-            const n = try self.io.vtable.netWrite(self.io.userdata, self.stream.socket.handle, bytes[off..], (&empty)[0..1], 0);
+            const n = try (try self.io.operate(.{ .net_write = .{
+                .socket_handle = self.stream.socket.handle,
+                .header = bytes[off..],
+                .data = &.{""},
+            } })).net_write;
             if (n == 0) return error.ConnectionClosed;
             off += n;
         }
@@ -498,7 +501,7 @@ pub const Connection = struct {
         var off: usize = 0;
         while (off < buf.len) {
             var vec = [_][]u8{buf[off..]};
-            const n = try self.io.vtable.netRead(self.io.userdata, self.stream.socket.handle, &vec);
+            const n = try self.stream.read(self.io, &vec);
             if (n == 0) return error.ConnectionClosed;
             off += n;
         }

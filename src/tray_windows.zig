@@ -438,7 +438,7 @@ const PollCtx = struct {
 var g_state: State = .{};
 var g_nid: NOTIFYICONDATAW = undefined;
 var g_osd_hwnd: ?HWND = null;
-var g_osd_text: [32]u16 = [_]u16{0} ** 32;
+var g_osd_text: [32]u16 = @splat(0);
 var g_osd_text_len: usize = 0;
 /// The process Io, shared by the UI and polling threads (Threaded io is
 /// thread-safe). Stashed globally so the UI thread can lock the state mutex.
@@ -1060,7 +1060,7 @@ fn makeTextIcon(text: []const u8, color: COLORREF, battery_glyph: ?[]const u8) ?
     const color_bmp = CreateCompatibleBitmap(screen, icon_size, icon_size) orelse return null;
     defer _ = DeleteObject(@ptrCast(color_bmp));
     // Monochrome AND mask, all zero == fully opaque color icon.
-    const mask_bits = [_]u8{0} ** 32;
+    const mask_bits: [32]u8 = @splat(0);
     const mask_bmp = CreateBitmap(icon_size, icon_size, 1, 1, &mask_bits) orelse return null;
     defer _ = DeleteObject(@ptrCast(mask_bmp));
 
