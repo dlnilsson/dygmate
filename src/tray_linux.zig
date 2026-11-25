@@ -25,6 +25,7 @@ const watcher_name = "org.kde.StatusNotifierWatcher";
 const watcher_path = "/StatusNotifierWatcher";
 const item_iface = "org.kde.StatusNotifierItem";
 const item_path = "/StatusNotifierItem";
+const app_name = "dygmate";
 const menu_iface = "com.canonical.dbusmenu";
 const menu_path = "/MenuBar";
 const props_iface = "org.freedesktop.DBus.Properties";
@@ -791,9 +792,9 @@ fn writeItemProp(app: *App, w: *dbus.Writer, name: []const u8) !bool {
     if (std.mem.eql(u8, name, "Category")) {
         try vStr(w, "Hardware");
     } else if (std.mem.eql(u8, name, "Id")) {
-        try vStr(w, "dygmate");
+        try vStr(w, app_name);
     } else if (std.mem.eql(u8, name, "Title")) {
-        try vStr(w, "dygmate");
+        try vStr(w, app_name);
     } else if (std.mem.eql(u8, name, "Status")) {
         try vStr(w, "Active");
     } else if (std.mem.eql(u8, name, "IconName")) {
@@ -801,7 +802,9 @@ fn writeItemProp(app: *App, w: *dbus.Writer, name: []const u8) !bool {
     } else if (std.mem.eql(u8, name, "IconPixmap")) {
         try vPixmap(w, app.icon_buf[0..]);
     } else if (std.mem.eql(u8, name, "ToolTip")) {
-        try vToolTip(w, "dygmate", app.tipBody());
+        var buf: [app_name.len + 1 + app.tip_body.len]u8 = undefined;
+        const title = std.fmt.bufPrint(&buf, "{s}\n{s}", .{ app_name, app.tipBody() }) catch unreachable;
+        try vToolTip(w, title);
     } else if (std.mem.eql(u8, name, "ItemIsMenu")) {
         try vBool(w, false);
     } else if (std.mem.eql(u8, name, "Menu")) {
@@ -846,14 +849,16 @@ fn vPixmap(w: *dbus.Writer, buf: []const u8) !void {
     w.endArray(inner);
     w.endArray(outer);
 }
-fn vToolTip(w: *dbus.Writer, title: []const u8, body: []const u8) !void {
+fn vToolTip(w: *dbus.Writer, title: []const u8) !void {
     try w.signature("(sa(iiay)ss)");
     try w.beginStruct();
     try w.string(""); // icon name
     const px = try w.beginArray(8); // empty pixmap array
     w.endArray(px);
+    // A self-contained title keeps the line breaks in hosts such as Noctalia
+    // that would otherwise combine the item name and description with a dash.
     try w.string(title);
-    try w.string(body);
+    try w.string(""); // description
 }
 
 // ---------------------------------------------------------------------------
@@ -1248,6 +1253,26 @@ test {
     _ = @import("osd_linux.zig");
     _ = @import("update.zig");
     _ = @import("statusserver.zig");
+}
+
+test "tray tooltip publishes the app name and battery readings on separate lines" {
+    const readings = "Left: 50%\nRight: 50%";
+    var app: App = undefined;
+    @memcpy(app.tip_body[0..readings.len], readings);
+    app.tip_body_len = readings.len;
+
+    var body = std.ArrayList(u8).empty;
+    defer body.deinit(std.testing.allocator);
+    var writer = dbus.Writer.init(&body, std.testing.allocator);
+    try std.testing.expect(try writeItemProp(&app, &writer, "ToolTip"));
+
+    var reader: dbus.Reader = .{ .data = body.items };
+    try std.testing.expectEqualStrings("(sa(iiay)ss)", try reader.signature());
+    reader.readAlign(8);
+    try std.testing.expectEqualStrings("", try reader.string());
+    reader.pos = try reader.arrayEnd(8);
+    try std.testing.expectEqualStrings("dygmate\nLeft: 50%\nRight: 50%", try reader.string());
+    try std.testing.expectEqualStrings("", try reader.string());
 }
 
 test "renderIcon fills background color at a corner pixel" {
