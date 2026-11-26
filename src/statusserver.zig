@@ -266,21 +266,18 @@ pub fn start(io: std.Io, gpa: std.mem.Allocator, opts: StartOptions) void {
     events_enabled.store(true, .release);
 }
 
-/// Stop and join the server threads. Windows unblocks a blocking
-/// ConnectNamedPipe with a throwaway client connection; Linux wakes from its
-/// bounded accept/serve polls within 500ms on its own.
+/// Stop and join the server threads. Windows cancels synchronous pipe I/O;
+/// Linux wakes from its bounded accept/serve polls on its own.
 pub fn stop() void {
     events_enabled.store(false, .release);
     stop_flag.store(true, .release);
-    if (comptime builtin.os.tag == .windows) {
-        if (server_thread != null) unblockConnect(win.pipe_name);
-        if (ev_server_thread != null) unblockConnect(win.events_pipe_name);
-    }
     if (server_thread) |t| {
+        if (comptime builtin.os.tag == .windows) cancelPipeIo(t);
         t.join();
         server_thread = null;
     }
     if (ev_server_thread) |t| {
+        if (comptime builtin.os.tag == .windows) cancelPipeIo(t);
         t.join();
         ev_server_thread = null;
     }
@@ -327,8 +324,8 @@ const win = if (builtin.os.tag == .windows) struct {
     const PIPE_REJECT_REMOTE_CLIENTS: DWORD = 0x00000008;
     const PIPE_UNLIMITED_INSTANCES: DWORD = 255;
     const ERROR_PIPE_CONNECTED: DWORD = 535;
-    const GENERIC_READ: DWORD = 0x80000000;
-    const OPEN_EXISTING: DWORD = 3;
+    const WAIT_OBJECT_0: DWORD = 0;
+    const WAIT_TIMEOUT: DWORD = 258;
 
     extern "kernel32" fn CreateNamedPipeW(
         lpName: [*:0]const u16,
@@ -344,10 +341,9 @@ const win = if (builtin.os.tag == .windows) struct {
     extern "kernel32" fn DisconnectNamedPipe(hNamedPipe: HANDLE) callconv(.winapi) BOOL;
     extern "kernel32" fn FlushFileBuffers(hFile: HANDLE) callconv(.winapi) BOOL;
     extern "kernel32" fn WriteFile(hFile: HANDLE, lpBuffer: [*]const u8, nNumberOfBytesToWrite: DWORD, lpNumberOfBytesWritten: ?*DWORD, lpOverlapped: ?*anyopaque) callconv(.winapi) BOOL;
-    extern "kernel32" fn ReadFile(hFile: HANDLE, lpBuffer: [*]u8, nNumberOfBytesToRead: DWORD, lpNumberOfBytesRead: ?*DWORD, lpOverlapped: ?*anyopaque) callconv(.winapi) BOOL;
-    extern "kernel32" fn CreateFileW(lpFileName: [*:0]const u16, dwDesiredAccess: DWORD, dwShareMode: DWORD, lpSecurityAttributes: ?*anyopaque, dwCreationDisposition: DWORD, dwFlagsAndAttributes: DWORD, hTemplateFile: ?HANDLE) callconv(.winapi) HANDLE;
     extern "kernel32" fn GetLastError() callconv(.winapi) DWORD;
-    extern "kernel32" fn Sleep(dwMilliseconds: DWORD) callconv(.winapi) void;
+    extern "kernel32" fn CancelSynchronousIo(hThread: HANDLE) callconv(.winapi) BOOL;
+    extern "kernel32" fn WaitForSingleObject(hHandle: HANDLE, dwMilliseconds: DWORD) callconv(.winapi) DWORD;
 } else struct {};
 
 fn serveWindows(gpa: std.mem.Allocator) void {
@@ -379,8 +375,7 @@ fn serveWindows(gpa: std.mem.Allocator) void {
         // A client that connected before this call reports
         // ERROR_PIPE_CONNECTED — that is success, not failure.
         const ok = win.ConnectNamedPipe(h, null).toBool() or win.GetLastError() == win.ERROR_PIPE_CONNECTED;
-        // The defer above closes the connected instance on shutdown, which
-        // also unblocks the throwaway client's read.
+        // The defer above closes the connected instance on shutdown.
         if (stop_flag.load(.acquire)) break;
         // Re-arm before serving; a failed create self-heals next iteration.
         const nh = win.CreateNamedPipeW(win.pipe_name, win.PIPE_ACCESS_OUTBOUND, win.PIPE_REJECT_REMOTE_CLIENTS, win.PIPE_UNLIMITED_INSTANCES, json_cap, 0, 0, null);
@@ -401,25 +396,17 @@ fn serveWindows(gpa: std.mem.Allocator) void {
     }
 }
 
-/// Unblock a server's ConnectNamedPipe by connecting as a throwaway client and
-/// draining whatever it sends. The bounded retry covers the window where the
-/// server sits between CloseHandle and the next CreateNamedPipeW; if the server
-/// is in its error backoff instead, it re-checks stop_flag within a second on
-/// its own and join() returns then. Works for both the one-shot snapshot pipe
-/// and the streaming events pipe: once stop_flag is set the served loop returns
-/// promptly, and reading here drains any bytes it wrote on the way out.
-fn unblockConnect(pipe_name: [*:0]const u16) void {
-    var attempts: usize = 0;
-    while (attempts < 20) : (attempts += 1) {
-        const h = win.CreateFileW(pipe_name, win.GENERIC_READ, 0, null, win.OPEN_EXISTING, 0, null);
-        if (h != std.os.windows.INVALID_HANDLE_VALUE) {
-            var buf: [ev_slot_cap]u8 = undefined;
-            var n: win.DWORD = 0;
-            while (win.ReadFile(h, &buf, buf.len, &n, null).toBool() and n != 0) {}
-            std.os.windows.CloseHandle(h);
-            return;
+/// Cancellation can race with a worker entering its next pipe operation. Keep
+/// cancelling until the thread exits, then let join release its thread handle.
+fn cancelPipeIo(thread: std.Thread) void {
+    const handle = thread.getHandle();
+    while (true) {
+        _ = win.CancelSynchronousIo(handle);
+        switch (win.WaitForSingleObject(handle, 50)) {
+            win.WAIT_OBJECT_0 => return,
+            win.WAIT_TIMEOUT => {},
+            else => unreachable,
         }
-        win.Sleep(25);
     }
 }
 
