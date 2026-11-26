@@ -14,6 +14,7 @@ StopPropagatedFrom=dev-dygma.device
 ExecStart=/usr/bin/dygmate-tray
 Restart=on-failure
 RestartSec=3s
+TimeoutStopSec=5s
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=dygmate
