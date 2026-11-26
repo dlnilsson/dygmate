@@ -71,6 +71,23 @@ dependencies — that is the established style here.
 - Cross-cutting behavior changes must land in `tray_common.zig`, not be
   duplicated per platform.
 
+### Zig Zen
+
+- Communicate intent precisely.
+- Edge cases matter.
+- Favor reading code over writing code.
+- There is an idiomatic way to do it.
+- Runtime crashes are better than bugs.
+- Compile errors are better than runtime crashes.
+- Incremental improvements.
+- Avoid local maximums.
+- Reduce the amount one must remember.
+- Focus on logic, not style.
+- Resource allocation may fail.
+- Resource deallocation must succeed.
+
+Together, we serve the users!
+
 ## Releases
 
 - Version source of truth: `.version` in `build.zig.zon`. Release builds
